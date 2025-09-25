@@ -243,14 +243,35 @@ echo "----------------------------------"
 # 隔离并安装 TUNNEL4 (HTTP payload)
 # =============================
 echo "==== 尝试安装 TUNNEL4 (HTTP payload) ===="
-echo "注: 此模块的远程脚本先前有已知错误，现已隔离，允许主脚本继续运行。"
-# 使用子shell和 || true 隔离潜在的错误，防止远程脚本的set -e干扰主脚本
-(
-    # 在子shell中执行远程脚本，并将错误输出重定向到标准错误
-    bash <(curl -Ls https://raw.githubusercontent.com/xiaoguiday/http-payload/refs/heads/main/http-payload.sh) $TUNNEL4_PORT 2>&1
-) || {
-    echo "警告：TUNNEL4 (HTTP payload) 安装失败或报错，已被隔离，主程序继续执行。" >&2
-}
+
+# 定义一个标志文件路径
+TUNNEL4_INSTALLED_FLAG="/var/lib/tunnel4_installed.flag"
+
+if [ -f "$TUNNEL4_INSTALLED_FLAG" ]; then
+    echo "✅ TUNNEL4 (HTTP payload) 标志文件已存在。跳过重复安装。"
+    echo "监听端口: $TUNNEL4_PORT"
+else
+    echo "注: 此模块的远程脚本先前有已知错误，现已隔离，允许主脚本继续运行。"
+    
+    # 使用子shell和 || true 隔离潜在的错误
+    (
+        echo "正在执行远程安装脚本..."
+        # 尝试执行远程脚本，并将所有输出和错误重定向到标准错误，便于调试
+        bash <(curl -Ls https://raw.githubusercontent.com/xiaoguiday/http-payload/refs/heads/main/http-payload.sh) $TUNNEL4_PORT 2>&1
+    )
+    
+    # 检查上一个命令的退出状态。虽然远程脚本可能报错，但我们假设它启动了服务。
+    # 只有当远程脚本运行完毕后，才创建标志文件。
+    if [ $? -eq 0 ]; then
+        echo "远程脚本执行完成，假设 TUNNEL4 已启动。"
+        # 创建标志文件
+        sudo touch "$TUNNEL4_INSTALLED_FLAG"
+        echo "🎉 已创建标志文件，后续运行将跳过此安装步骤。"
+    else
+        echo "⚠️ 警告：TUNNEL4 远程脚本执行失败 (退出状态非0)。未创建标志文件。" >&2
+        echo "如果你确定服务已启动，可以手动运行: sudo touch $TUNNEL4_INSTALLED_FLAG" >&2
+    fi
+fi
 
 echo "TUNNEL4 模块执行完毕。"
 echo "----------------------------------"
