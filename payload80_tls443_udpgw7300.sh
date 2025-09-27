@@ -4,25 +4,26 @@ set -e
 # =============================
 # 提示端口
 # =============================
-read -p "请输入 SSH 监听端口（内网转发目标，默认为41816）：" SSH_PORT
+echo "==== 端口配置 (请根据需要输入或使用默认值) ===="
+read -p "1. SSH 监听端口（内部转发目标，默认为41816）：" SSH_PORT
 SSH_PORT=${SSH_PORT:-41816}
 
-read -p "请输入 WSS 监听端口（面向公网，默认80）：" WSS_PORT
+read -p "2. WSS 监听端口（面向公网/HTTP Payload，默认80）：" WSS_PORT
 WSS_PORT=${WSS_PORT:-80}
 
-read -p "请输入 Stunnel4 端口（面向公网，默认443）：" STUNNEL_PORT
+read -p "3. Stunnel4 端口（面向公网/SSH-TLS，默认443）：" STUNNEL_PORT
 STUNNEL_PORT=${STUNNEL_PORT:-443}
 
-read -p "请输入 UDPGW 端口（仅本地监听，默认7300）：" UDPGW_PORT
+read -p "4. UDPGW 端口（仅本地监听，默认7300）：" UDPGW_PORT
 UDPGW_PORT=${UDPGW_PORT:-7300}
+echo "------------------------------------------------"
 
 # =============================
-# 权限管理：创建非特权用户
+# 权限管理与依赖安装
 # =============================
 TUNNEL_USER="tunneluser"
 echo "==== 配置非特权用户 $TUNNEL_USER ===="
 if ! id "$TUNNEL_USER" &>/dev/null; then
-    # -r: 系统用户, -s /sbin/nologin: 禁止登录
     sudo useradd -r -s /sbin/nologin "$TUNNEL_USER"
     echo "创建非特权用户 $TUNNEL_USER 成功."
 else
@@ -30,25 +31,21 @@ else
 fi
 echo "----------------------------------"
 
-# =============================
-# 系统更新与依赖安装
-# =============================
 echo "==== 更新系统并安装依赖 ===="
 sudo apt update -y
-# 依赖 net-tools 只是为了检查，可精简。
 sudo apt install -y python3 python3-pip wget curl git cmake build-essential openssl stunnel4
 echo "依赖安装完成"
 echo "----------------------------------"
 
 # =============================
-# 安装 WSS 脚本 (/usr/local/bin/wss)
+# 1. 安装 WSS 脚本 (已修复 EOF 错误)
 # 
-# 关键更改: DEFAULT_HOST 修改为 127.0.0.1:$SSH_PORT
+# 策略: 使用单引号HereDoc防止Bash解析内部Python语法，再用sed注入变量。
 # =============================
 echo "==== 安装 WSS 脚本 ===="
 
-# 使用 heredoc 注入 $SSH_PORT 变量
-WSS_SCRIPT=$(cat <<EOF
+# 使用单引号HereDoc，阻止Bash解析内部括号和特殊字符
+sudo tee /usr/local/bin/wss_temp > /dev/null <<'EOF'
 #!/usr/bin/python3
 # Python Proxy (WSS/HTTP Simulation) - Author: Zink
 import socket, threading, select, sys, time
@@ -59,8 +56,8 @@ LISTENING_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 80
 PASS = ''
 BUFLEN = 4096 * 4
 TIMEOUT = 60
-DEFAULT_HOST = '127.0.0.1:$SSH_PORT' # <--- 更改目标端口
-RESPONSE = 'HTTP/1.1 101 Switching Protocols\\r\\nConnection: Upgrade\\r\\nUpgrade: websocket\\r\\nContent-Length: 104857600000\\r\\n\\r\\n'
+DEFAULT_HOST = '127.0.0.1:__SSH_PORT__' # 占位符，将被sed替换
+RESPONSE = 'HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nContent-Length: 104857600000\r\n\r\n'
 
 class Server(threading.Thread):
     def __init__(self, host, port):
@@ -157,7 +154,7 @@ class ConnectionHandler(threading.Thread):
             
             passwd = self.findHeader(head, 'X-Pass')
             if len(PASS) != 0 and passwd != PASS:
-                self.client.send(b'HTTP/1.1 400 WrongPass!\\r\\n\\r\\n')
+                self.client.send(b'HTTP/1.1 400 WrongPass!\r\n\r\n')
                 return
 
             self.method_CONNECT(hostPort)
@@ -174,7 +171,7 @@ class ConnectionHandler(threading.Thread):
             return ''
         aux = head.find(':', aux)
         head = head[aux + 2:]
-        aux = head.find('\\r\\n')
+        aux = head.find('\r\n')
         if aux == -1:
             return ''
         return head[:aux].strip()
@@ -185,7 +182,6 @@ class ConnectionHandler(threading.Thread):
             port = int(host[i + 1:])
             host = host[:i]
         else:
-            # Fallback to the port in DEFAULT_HOST if client only sent IP
             port = int(DEFAULT_HOST.split(':')[-1]) 
 
         self.target = socket.create_connection((host, port), timeout=TIMEOUT)
@@ -235,8 +231,8 @@ def main():
         global LISTENING_PORT
         LISTENING_PORT = int(sys.argv[1])
     
-    print("\\n:-------PythonProxy WSS-------:")
-    print(f"Listening addr: {LISTENING_ADDR}, port: {LISTENING_PORT}, Default Target: {DEFAULT_HOST}\\n")
+    print("\n:-------PythonProxy WSS-------:")
+    print(f"Listening addr: {LISTENING_ADDR}, port: {LISTENING_PORT}, Default Target: {DEFAULT_HOST}\n")
     server = Server(LISTENING_ADDR, LISTENING_PORT)
     server.start()
     
@@ -251,7 +247,10 @@ def main():
 if __name__ == '__main__':
     main()
 EOF
-echo "$WSS_SCRIPT" | sudo tee /usr/local/bin/wss > /dev/null
+
+# 使用 sed 注入 $SSH_PORT 变量
+sudo sed "s/__SSH_PORT__/$SSH_PORT/g" /usr/local/bin/wss_temp | sudo tee /usr/local/bin/wss > /dev/null
+sudo rm /usr/local/bin/wss_temp
 
 sudo chmod +x /usr/local/bin/wss
 echo "WSS 脚本安装完成"
@@ -281,9 +280,7 @@ echo "WSS 已启动，端口 $WSS_PORT，转发目标端口 $SSH_PORT"
 echo "----------------------------------"
 
 # =============================
-# 安装 Stunnel4 并生成证书
-# 
-# 关键更改: connect 修改为 127.0.0.1:$SSH_PORT
+# 2. 安装 Stunnel4 并生成证书
 # =============================
 echo "==== 安装 Stunnel4 ===="
 # 证书信息
@@ -302,8 +299,6 @@ sudo openssl req -x509 -nodes -newkey rsa:2048 \
 
 sudo sh -c 'cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem'
 sudo chmod 600 /etc/stunnel/certs/stunnel.key
-sudo chmod 644 /etc/stunnel/certs/*.crt
-sudo chmod 644 /etc/stunnel/certs/*.pem
 echo "自签名证书生成完成"
 
 # Stunnel 配置
@@ -319,17 +314,16 @@ socket = r:TCP_NODELAY=1
 accept = 0.0.0.0:$STUNNEL_PORT
 cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.pem
-connect = 127.0.0.1:$SSH_PORT # <--- 更改目标端口
+connect = 127.0.0.1:$SSH_PORT # 更改目标端口
 EOF
 
-# 确保 stunnel4 服务启用并重启
 sudo systemctl enable stunnel4
 sudo systemctl restart stunnel4
 echo "Stunnel4 安装完成，端口 $STUNNEL_PORT，转发目标端口 $SSH_PORT"
 echo "----------------------------------"
 
 # =============================
-# 安装 UDPGW (Badvpn)
+# 3. 安装 UDPGW (Badvpn)
 # =============================
 echo "==== 安装 UDPGW (Badvpn) ===="
 UDPGW_DIR="/usr/local/src/badvpn"
@@ -375,5 +369,4 @@ echo "UDPGW 已安装并启动，端口: $UDPGW_PORT (仅限本地访问)"
 echo "----------------------------------"
 
 echo "所有组件安装完成!"
-echo "WSS 和 Stunnel4 现在都配置为将流量转发到本地的 SSH 端口 $SSH_PORT。"
-echo "请确保您的防火墙 (如 ufw/security group) 允许公网访问 WSS 端口 ($WSS_PORT) 和 Stunnel 端口 ($STUNNEL_PORT)。"
+echo "WSS ($WSS_PORT) 和 Stunnel4 ($STUNNEL_PORT) 现在都配置为将流量转发到本地的 SSH 端口 $SSH_PORT。"
