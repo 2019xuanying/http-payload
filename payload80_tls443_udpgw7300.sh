@@ -8,13 +8,13 @@ echo "==== 端口配置 (请根据需要输入或使用默认值) ===="
 read -p "1. SSH 监听端口（内部转发目标，默认为41816）：" SSH_PORT
 SSH_PORT=${SSH_PORT:-41816}
 
-read -p "2. WSS 监听端口（面向公网/HTTP Payload，默认80）：" WSS_PORT
+read -p "2. WSS 监听端口（面向公网/SSH-HTTP-Payload，默认80）：" WSS_PORT
 WSS_PORT=${WSS_PORT:-80}
 
 read -p "3. Stunnel4 端口（面向公网/SSH-TLS，默认443）：" STUNNEL_PORT
 STUNNEL_PORT=${STUNNEL_PORT:-443}
 
-read -p "4. WSS-TLS 端口（面向公网/SSH-TLS-Payload，默认444）：" WSS_TLS_PORT
+read -p "4. WSS-TLS 端口（面向公网/SSH-TLS-HTTP-Payload，默认444）：" WSS_TLS_PORT
 WSS_TLS_PORT=${WSS_TLS_PORT:-444}
 
 read -p "5. UDPGW 端口（仅本地监听，默认7300）：" UDPGW_PORT
@@ -41,11 +41,13 @@ echo "依赖安装完成"
 echo "----------------------------------"
 
 # =============================
-# 1. 安装 WSS 脚本 (SSH-HTTP-Payload 核心)
+# 1. 安装 WSS 脚本 (已修复 EOF 错误)
+# 策略: 使用单引号HereDoc + sed 注入变量，确保Bash解析正确
 # =============================
-echo "==== 安装 WSS 脚本 ===="
-# 使用 heredoc 注入 $SSH_PORT 变量
-WSS_SCRIPT=$(cat <<EOF
+echo "==== 安装 WSS 脚本 (Python) ===="
+
+# 步骤 1: 使用单引号 HereDoc 创建临时文件，阻止 Bash 解析内部语法
+sudo tee /usr/local/bin/wss_temp > /dev/null <<'EOF'
 #!/usr/bin/python3
 # Python Proxy (WSS/HTTP Simulation) - Author: Zink
 import socket, threading, select, sys, time
@@ -56,8 +58,8 @@ LISTENING_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 80
 PASS = ''
 BUFLEN = 4096 * 4
 TIMEOUT = 60
-DEFAULT_HOST = '127.0.0.1:$SSH_PORT' # 转发到自定义的SSH端口
-RESPONSE = 'HTTP/1.1 101 Switching Protocols\\r\\nConnection: Upgrade\\r\\nUpgrade: websocket\\r\\nContent-Length: 104857600000\\r\\n\\r\\n'
+DEFAULT_HOST = '127.0.0.1:__SSH_PORT__' # 占位符
+RESPONSE = 'HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nContent-Length: 104857600000\r\n\r\n'
 
 class Server(threading.Thread):
     def __init__(self, host, port):
@@ -154,7 +156,7 @@ class ConnectionHandler(threading.Thread):
             
             passwd = self.findHeader(head, 'X-Pass')
             if len(PASS) != 0 and passwd != PASS:
-                self.client.send(b'HTTP/1.1 400 WrongPass!\\r\\n\\r\\n')
+                self.client.send(b'HTTP/1.1 400 WrongPass!\r\n\r\n')
                 return
 
             self.method_CONNECT(hostPort)
@@ -171,7 +173,7 @@ class ConnectionHandler(threading.Thread):
             return ''
         aux = head.find(':', aux)
         head = head[aux + 2:]
-        aux = head.find('\\r\\n')
+        aux = head.find('\r\n')
         if aux == -1:
             return ''
         return head[:aux].strip()
@@ -231,8 +233,8 @@ def main():
         global LISTENING_PORT
         LISTENING_PORT = int(sys.argv[1])
     
-    print("\\n:-------PythonProxy WSS-------:")
-    print(f"Listening addr: {LISTENING_ADDR}, port: {LISTENING_PORT}, Default Target: {DEFAULT_HOST}\\n")
+    print("\n:-------PythonProxy WSS-------:")
+    print(f"Listening addr: {LISTENING_ADDR}, port: {LISTENING_PORT}, Default Target: {DEFAULT_HOST}\n")
     server = Server(LISTENING_ADDR, LISTENING_PORT)
     server.start()
     
@@ -247,7 +249,10 @@ def main():
 if __name__ == '__main__':
     main()
 EOF
-echo "$WSS_SCRIPT" | sudo tee /usr/local/bin/wss > /dev/null
+
+# 步骤 2: 使用 sed 注入 $SSH_PORT 变量到正式文件
+sudo sed "s/__SSH_PORT__/$SSH_PORT/g" /usr/local/bin/wss_temp | sudo tee /usr/local/bin/wss > /dev/null
+sudo rm /usr/local/bin/wss_temp
 
 sudo chmod +x /usr/local/bin/wss
 
@@ -324,8 +329,13 @@ EOF
 # 修改 stunnel4 启动配置，使用新的配置文件
 sudo systemctl disable stunnel4
 sudo sed -i 's/ENABLED=0/ENABLED=1/' /etc/default/stunnel4
-# 备份旧配置并链接新配置 (部分系统需要这步来指定配置文件)
-sudo sh -c 'echo "FILES=\"/etc/stunnel/multitunnel.conf\"" >> /etc/default/stunnel4'
+# 确保 FILES 变量设置正确
+if ! grep -q "FILES=" /etc/default/stunnel4; then
+    sudo sh -c 'echo "FILES=\"/etc/stunnel/multitunnel.conf\"" >> /etc/default/stunnel4'
+else
+    sudo sed -i 's/^FILES=.*$/FILES="\/etc\/stunnel\/multitunnel.conf"/' /etc/default/stunnel4
+fi
+
 
 sudo systemctl daemon-reload
 sudo systemctl enable stunnel4
@@ -376,15 +386,15 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable udpgw
 sudo systemctl start udpgw
-echo "UDPGW 已安装并启动，端口: $UDPGW_PORT"
+echo "UDPGW 已安装并启动，端口: $UDPGW_PORT (仅限本地访问)"
 echo "----------------------------------"
 
 echo "所有组件安装完成!"
 echo "--- 总结 ---"
-echo "SSH 裸协议端口: $SSH_PORT"
-echo "SSH-HTTP-Payload 端口: $WSS_PORT"
-echo "SSH-TLS 端口: $STUNNEL_PORT"
-echo "SSH-TLS-HTTP-Payload 端口: $WSS_TLS_PORT"
-echo "UDPGW 端口: $UDPGW_PORT (仅本地)"
+echo "SSH 裸协议端口 (sshd): $SSH_PORT"
+echo "SSH-HTTP-Payload 端口 (WSS): $WSS_PORT"
+echo "SSH-TLS 端口 (Stunnel4): $STUNNEL_PORT"
+echo "SSH-TLS-HTTP-Payload 端口 (Stunnel4+WSS): $WSS_TLS_PORT"
+echo "UDPGW 端口 (Badvpn): $UDPGW_PORT (仅本地)"
 echo ""
-echo "请确保防火墙 (如 ufw/security group) 允许公网访问 $WSS_PORT, $STUNNEL_PORT, 和 $WSS_TLS_PORT。"
+echo "请确保防火墙 (ufw/安全组) 已开放端口 $WSS_PORT, $STUNNEL_PORT, 和 $WSS_TLS_PORT。"
