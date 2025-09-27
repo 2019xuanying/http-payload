@@ -2,61 +2,65 @@
 set -e
 
 # =======================================================
-# Configuration Variables (User-Defined)
+# 预设变量与端口提示
 # =======================================================
 
-# Your SSH server is listening on this internal port.
-SSH_SERVER_PORT="41816"
-echo "INFO: Internal SSH server port set to $SSH_SERVER_PORT (User-defined)."
+# 你的实际 SSH 登录端口
+ACTUAL_SSH_PORT="41816"
 
-# Internal port for the WSS Python proxy (unexposed, wrapped by Stunnel for TLS)
-WSS_INTERNAL_PORT="8080"
+echo "--------------------------------------------------------"
+echo "  [重要提示] 你的 SSH 后端端口已锁定为: ${ACTUAL_SSH_PORT}"
+echo "--------------------------------------------------------"
 
-# =============================
-# Prompt for External Ports
-# =============================
-read -p "1. Enter WSS HTTP port (for SSH-HTTP-Payload, default 80): " WSS_EXTERNAL_PORT
-WSS_EXTERNAL_PORT=${WSS_EXTERNAL_PORT:-80}
+# 解决端口 80 冲突的提示和处理
+echo "注意: 如果你看到 tinyproxy 或其他服务占用 80 端口，"
+echo "      请在此输入一个空闲端口 (例如 8080 或 8888)。"
+read -p "请输入 WSS 监听端口（默认 80）: " WSS_PORT
+WSS_PORT=${WSS_PORT:-80}
 
-read -p "2. Enter Stunnel4 TLS port (for direct SSH-TLS, default 443): " SSH_TLS_PORT
-SSH_TLS_PORT=${SSH_TLS_PORT:-443}
+read -p "请输入 Stunnel4 端口（用于 SSH-TLS, 默认 443）: " STUNNEL_PORT
+STUNNEL_PORT=${STUNNEL_PORT:-443}
 
-read -p "3. Enter Stunnel4 WSS-TLS port (for SSH-TLS-HTTP-Payload, default 8443): " WSS_TLS_PORT
-WSS_TLS_PORT=${WSS_TLS_PORT:-8443}
-
-read -p "4. Enter UDPGW port (for UDP forwarding, default 7300): " UDPGW_PORT
+read -p "请输入 UDPGW 端口（默认 7300）: " UDPGW_PORT
 UDPGW_PORT=${UDPGW_PORT:-7300}
 
-# =============================
-# System Update and Dependency Installation
-# =============================
-echo "==== Updating system and installing dependencies ===="
-# Using 'apt-get' instead of 'apt' for better script compatibility
-sudo apt update -y
-sudo apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4
-echo "Dependencies installed successfully."
-echo "----------------------------------------------------"
+echo "--------------------------------------------------------"
+echo "  配置信息确认:"
+echo "  WSS (SSH-Proxy-Payload): ${WSS_PORT}"
+echo "  Stunnel4 (SSH-TLS):      ${STUNNEL_PORT}"
+echo "  UDPGW (内部转发):        ${UDPGW_PORT}"
+echo "--------------------------------------------------------"
 
-# =============================
-# Install WSS Python Script
-# This script listens on an internal port and forwards to SSH_SERVER_PORT
-# =============================
-echo "==== Installing WSS Python Script on internal port $WSS_INTERNAL_PORT ===="
-# NOTE: The DEFAULT_HOST is set to your specified SSH port
+
+# =======================================================
+# 1. 系统更新与依赖安装
+# =======================================================
+echo "==== 1. 更新系统并安装依赖 ===="
+# 确保安装 openssh-server 以防万一，但主要依赖是 python, stunnel4, cmake
+sudo apt update -y
+sudo apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4 openssh-server
+echo "依赖安装完成"
+echo "----------------------------------"
+
+# =======================================================
+# 2. 安装 WSS 脚本 (支持 SSH-Proxy-Payload)
+# =======================================================
+echo "==== 2. 安装 WSS 脚本 (/usr/local/bin/wss) ===="
+
+# WSS 脚本内容 (Python)
 sudo tee /usr/local/bin/wss > /dev/null <<EOF
 #!/usr/bin/python3
+# Python WSS Proxy Script (Backend SSH Port: 41816)
 import socket, threading, select, sys, time
 
 LISTENING_ADDR = '0.0.0.0'
-# Use the internal port for the WSS service
-LISTENING_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else $WSS_INTERNAL_PORT 
+LISTENING_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 80
 PASS = ''
 BUFLEN = 4096 * 4
 TIMEOUT = 60
-# Target is the SSH Server Port
-DEFAULT_HOST = '127.0.0.1:$SSH_SERVER_PORT' 
-# Standard WebSocket/HTTP response for tunneling
-RESPONSE = 'HTTP/1.1 101 Switching Protocols\\r\\nContent-Length: 104857600000\\r\\n\\r\\n'
+# *** 转发目标锁定到实际 SSH 端口 41816 ***
+DEFAULT_HOST = '127.0.0.1:${ACTUAL_SSH_PORT}'
+RESPONSE = 'HTTP/1.1 101 Switching Protocols\r\nContent-Length: 104857600000\r\n\r\n'
 
 class Server(threading.Thread):
     def __init__(self, host, port):
@@ -74,13 +78,11 @@ class Server(threading.Thread):
         try:
             self.soc.bind((self.host, int(self.port)))
         except OSError as e:
-            self.printLog(f"ERROR: Could not bind to port {self.port}. Is it already in use? ({e})")
+            self.printLog(f"ERROR: Port {self.port} is already in use or unavailable. {e}")
+            self.running = False
             return
-            
         self.soc.listen(0)
         self.running = True
-        self.printLog(f"WSS Server started on {self.host}:{self.port}, forwarding to {DEFAULT_HOST}")
-        
         try:
             while self.running:
                 try:
@@ -88,22 +90,16 @@ class Server(threading.Thread):
                     c.setblocking(1)
                 except socket.timeout:
                     continue
-                except OSError:
-                    # Socket closed during accept
-                    break
                 conn = ConnectionHandler(c, self, addr)
                 conn.start()
                 self.addConn(conn)
         finally:
             self.running = False
             self.soc.close()
-            self.printLog("WSS Server stopped.")
-
     def printLog(self, log):
         self.logLock.acquire()
-        print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {log}", flush=True)
+        print(log)
         self.logLock.release()
-
     def addConn(self, conn):
         try:
             self.threadsLock.acquire()
@@ -111,15 +107,12 @@ class Server(threading.Thread):
                 self.threads.append(conn)
         finally:
             self.threadsLock.release()
-
     def removeConn(self, conn):
         try:
             self.threadsLock.acquire()
-            if conn in self.threads:
-                self.threads.remove(conn)
+            self.threads.remove(conn)
         finally:
             self.threadsLock.release()
-
     def close(self):
         try:
             self.running = False
@@ -138,9 +131,7 @@ class ConnectionHandler(threading.Thread):
         self.client = socClient
         self.client_buffer = b''
         self.server = server
-        self.log = f'Connection from: {addr[0]}:{addr[1]}'
-        self.addr = addr
-
+        self.log = 'Connection: ' + str(addr)
     def close(self):
         try:
             if not self.clientClosed:
@@ -158,139 +149,130 @@ class ConnectionHandler(threading.Thread):
             pass
         finally:
             self.targetClosed = True
-            
     def run(self):
         try:
-            # Receive initial data
-            self.client.settimeout(TIMEOUT)
+            # 接收第一个数据块
             self.client_buffer = self.client.recv(BUFLEN)
             
-            if not self.client_buffer:
-                self.log += " - client disconnected prematurely"
-                return
-
-            # Decode buffer for header parsing
-            head = self.client_buffer.decode('utf-8', 'ignore')
-            
-            # Find the actual target (or use default)
-            hostPort = self.findHeader(head, 'X-Real-Host')
+            # 解析头部
+            hostPort = self.findHeader(self.client_buffer, 'X-Real-Host')
             if hostPort == '':
                 hostPort = DEFAULT_HOST
-                
-            passwd = self.findHeader(head, 'X-Pass')
-            if len(PASS) != 0 and passwd != PASS:
-                self.client.sendall(b'HTTP/1.1 400 WrongPass!\r\n\r\n')
-                self.log += ' - Blocked: WrongPass'
-                return
-
-            self.method_CONNECT(hostPort)
             
-        except socket.timeout:
-            self.log += ' - error: socket timeout'
+            passwd = self.findHeader(self.client_buffer, 'X-Pass')
+            if len(PASS) != 0 and passwd != PASS:
+                self.client.send(b'HTTP/1.1 400 WrongPass!\r\n\r\n')
+                return
+            
+            self.method_CONNECT(hostPort)
         except Exception as e:
             self.log += ' - error: ' + str(e)
-        finally:
             self.server.printLog(self.log)
+        finally:
             self.close()
             self.server.removeConn(self)
 
     def findHeader(self, head, header):
-        # Helper to find a specific header value
+        if isinstance(head, bytes):
+            # 将头部字节串解码为 UTF-8
+            try:
+                head = head.decode('utf-8')
+            except UnicodeDecodeError:
+                return ''
+        
+        # 搜索头部
         aux = head.find(header + ': ')
         if aux == -1:
             return ''
-        start = aux + len(header) + 2
-        end = head.find('\r\n', start)
-        if end == -1:
-            return ''
-        return head[start:end].strip()
+        
+        # 提取值
+        start_index = aux + len(header) + 2
+        end_index = head.find('\r\n', start_index)
+        
+        if end_index == -1:
+            return head[start_index:].strip() # 尝试获取最后一行
+        
+        return head[start_index:end_index].strip()
 
     def connect_target(self, host):
-        # Connect to the target host (SSH port)
         i = host.find(':')
         if i != -1:
             port = int(host[i + 1:])
             host = host[:i]
         else:
-            port = 22 # Should never happen if DEFAULT_HOST is correct, but safe fallback
+            port = ${ACTUAL_SSH_PORT} # 确保默认端口也是 41816
         
-        # Use only IPv4 for simplicity unless specific need for IPv6 is determined
-        self.target = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.target.settimeout(TIMEOUT)
+        # 使用 getaddrinfo 获取地址信息
+        try:
+            (soc_family, soc_type, proto, _, address) = socket.getaddrinfo(host, port)[0]
+        except socket.gaierror:
+            self.server.printLog(f"DNS lookup failed for host: {host}")
+            raise
+            
+        self.target = socket.socket(soc_family, soc_type, proto)
         self.targetClosed = False
-        self.target.connect((host, port))
-        
+        self.target.connect(address)
+
     def method_CONNECT(self, path):
         self.log += ' - CONNECT ' + path
         self.connect_target(path)
-        # Send the successful protocol switch response
+        # 切换协议响应
         self.client.sendall(RESPONSE.encode('utf-8'))
-        
-        # We need to send any buffered data that came after the headers
-        if self.client_buffer:
-            # Try to find the end of the HTTP headers to strip them
-            header_end = self.client_buffer.find(b'\r\n\r\n')
-            if header_end != -1:
-                data_after_headers = self.client_buffer[header_end + 4:]
-                if data_after_headers:
-                    self.target.sendall(data_after_headers)
-        
+        self.client_buffer = b''
+        self.server.printLog(self.log)
         self.doCONNECT()
 
     def doCONNECT(self):
         socs = [self.client, self.target]
         count = 0
-        while not self.clientClosed and not self.targetClosed:
+        error = False
+        while True:
             count += 1
-            # Wait for data on either socket
+            # 使用 select 进行非阻塞 I/O
             (recv, _, err) = select.select(socs, [], socs, 3)
             
             if err:
-                # Socket error occurred
-                break
+                error = True
             
-            if not recv:
-                if count >= TIMEOUT:
-                    # Timeout if no activity
-                    break
-                continue
-
-            # Process received data
-            for in_ in recv:
-                try:
-                    data = in_.recv(BUFLEN)
-                    if not data:
-                        # Peer disconnected gracefully
-                        return 
-                    
-                    if in_ is self.target:
-                        # Data from target (SSH) to client (Browser/Client app)
-                        self.client.sendall(data)
-                    else:
-                        # Data from client (Browser/Client app) to target (SSH)
-                        self.target.sendall(data)
-                    
-                    count = 0 # Reset timeout counter on activity
-                except socket.error as e:
-                    # Connection error (e.g., reset by peer)
-                    self.log += f" - socket error during transfer: {e}"
-                    return
-                except Exception as e:
-                    self.log += f" - unexpected transfer error: {e}"
-                    return
-        
-        self.log += " - transfer complete or timed out"
-
+            if recv:
+                for in_ in recv:
+                    try:
+                        data = in_.recv(BUFLEN)
+                        if data:
+                            if in_ is self.target:
+                                self.client.send(data)
+                            else:
+                                # 确保所有数据都发送
+                                while data:
+                                    byte = self.target.send(data)
+                                    data = data[byte:]
+                            count = 0
+                        else:
+                            # 连接关闭
+                            break
+                    except Exception as e:
+                        # 传输错误
+                        error = True
+                        break
+            
+            if count == TIMEOUT:
+                # 超时
+                error = True
+            
+            if error:
+                break
 
 def main():
-    print("\n:-------WSS Python Proxy Initializing-------:\n")
-    print(f"Internal Bind Port: {LISTENING_PORT}")
-    print(f"SSH Target: {DEFAULT_HOST}\n")
+    print("\n:-------PythonProxy WSS-------:\n")
+    print(f"Listening addr: {LISTENING_ADDR}, port: {LISTENING_PORT}, Target: {DEFAULT_HOST}\n")
     server = Server(LISTENING_ADDR, LISTENING_PORT)
     server.start()
     while True:
         try:
             time.sleep(2)
+            if not server.running: # 检查是否因为端口占用启动失败
+                print("WSS server failed to start. Check error log above.")
+                break
         except KeyboardInterrupt:
             print('Stopping...')
             server.close()
@@ -301,17 +283,18 @@ if __name__ == '__main__':
 EOF
 
 sudo chmod +x /usr/local/bin/wss
+echo "WSS 脚本安装完成"
+echo "----------------------------------"
 
-# WSS Systemd Service (Now using WSS_EXTERNAL_PORT to listen on)
+# 创建 systemd 服务
 sudo tee /etc/systemd/system/wss.service > /dev/null <<EOF
 [Unit]
-Description=WSS Python Proxy (HTTP/Payload Backend)
+Description=WSS Python Proxy
 After=network.target
 
 [Service]
 Type=simple
-# WSS listens on the internal WSS_INTERNAL_PORT (8080) for both HTTP and TLS-wrapped traffic
-ExecStart=/usr/local/bin/wss $WSS_INTERNAL_PORT
+ExecStart=/usr/local/bin/wss $WSS_PORT
 Restart=on-failure
 User=root
 
@@ -321,26 +304,27 @@ EOF
 
 sudo systemctl daemon-reload
 sudo systemctl enable wss
-sudo systemctl start wss
-echo "WSS Python Proxy (Backend) started on 0.0.0.0:$WSS_INTERNAL_PORT"
-echo "----------------------------------------------------"
+sudo systemctl restart wss
+echo "WSS 已启动，端口 $WSS_PORT"
+echo "----------------------------------"
 
-# =============================
-# Install Stunnel4 and Generate Certificate
-# Stunnel handles SSH-TLS (443) and SSH-TLS-HTTP-Payload (8443)
-# =============================
-echo "==== Installing Stunnel4 and generating self-signed certificate ===="
+# =======================================================
+# 3. 安装 Stunnel4 并生成证书 (支持 SSH-TLS)
+# =======================================================
+echo "==== 3. 安装 Stunnel4 ===="
 sudo mkdir -p /etc/stunnel/certs
+# 使用主机名生成证书
 sudo openssl req -x509 -nodes -newkey rsa:2048 \
 -keyout /etc/stunnel/certs/stunnel.key \
 -out /etc/stunnel/certs/stunnel.crt \
 -days 1095 \
--subj "/CN=MultiTunnelServer"
+-subj "/CN=$(hostname -f)"
 sudo sh -c 'cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem'
+sudo chmod 644 /etc/stunnel/certs/*.crt
 sudo chmod 644 /etc/stunnel/certs/*.pem
 
-# Stunnel Configuration for two separate TLS tunnels
-sudo tee /etc/stunnel/multi-tunnel.conf > /dev/null <<EOF
+# Stunnel 配置
+sudo tee /etc/stunnel/ssh-tls.conf > /dev/null <<EOF
 pid=/var/run/stunnel.pid
 setuid=root
 setgid=root
@@ -349,101 +333,26 @@ debug = 5
 output = /var/log/stunnel4/stunnel.log
 socket = l:TCP_NODELAY=1
 socket = r:TCP_NODELAY=1
-verify = 0
 
-# --- Service 1: SSH-TLS (Direct to SSH port) ---
-# Protocol: SSH-TLS
-# External Port: $SSH_TLS_PORT
-[ssh-tls-direct]
-accept = 0.0.0.0:$SSH_TLS_PORT
+[ssh-tls-gateway]
+accept = 0.0.0.0:$STUNNEL_PORT
 cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.pem
-connect = 127.0.0.1:$SSH_SERVER_PORT
-
-# --- Service 2: SSH-TLS-HTTP-Payload (TLS wrapped WSS) ---
-# Protocol: SSH-TLS-HTTP-Payload
-# External Port: $WSS_TLS_PORT
-# Connects to the internal WSS script
-[wss-tls-wrapper]
-accept = 0.0.0.0:$WSS_TLS_PORT
-cert = /etc/stunnel/certs/stunnel.pem
-key = /etc/stunnel/certs/stunnel.pem
-connect = 127.0.0.1:$WSS_INTERNAL_PORT
+# *** 转发目标锁定到实际 SSH 端口 41816 ***
+connect = 127.0.0.1:${ACTUAL_SSH_PORT}
 EOF
 
-# Ensure stunnel4 default config is enabled to load our new config
-sudo sed -i 's/^ENABLED=0/ENABLED=1/' /etc/default/stunnel4 || true
-
-# Check stunnel config syntax before restart
-sudo stunnel4 /etc/stunnel/multi-tunnel.conf -check 2>/dev/null || echo "WARNING: Stunnel config check failed. Review /etc/stunnel/multi-tunnel.conf manually."
-
-sudo systemctl daemon-reload
 sudo systemctl enable stunnel4
 sudo systemctl restart stunnel4
-echo "Stunnel4 configured for SSH-TLS on $SSH_TLS_PORT and SSH-TLS-HTTP-Payload on $WSS_TLS_PORT."
-echo "----------------------------------------------------"
+echo "Stunnel4 安装完成，端口 $STUNNEL_PORT"
+echo "----------------------------------"
 
-# =============================
-# Configure SSH-HTTP-Payload via IPTables Redirection (Optional but common)
-# This allows WSS to be accessible on a common port like 80 without dedicated service.
-# For simplicity, we will stick to the WSS script directly listening on the external port.
-# If WSS_EXTERNAL_PORT is different from WSS_INTERNAL_PORT, we need to handle it.
-
-if [ "$WSS_EXTERNAL_PORT" != "$WSS_INTERNAL_PORT" ]; then
-    echo "NOTICE: Setting up simple TCP forwarding for SSH-HTTP-Payload."
-    # We will use iptables for redirection if a common port like 80 is requested,
-    # but for robustness, let's just create a simple Python forwarder if 80 is used.
-    # The simplest is to modify the WSS service to listen on 80.
-    # Since the Stunnel service is already connecting to the *internal* WSS port (8080),
-    # we need a *separate* simple service to expose 80 -> 8080.
-    
-    # Let's create a *second* WSS systemd service specifically for the external HTTP port
-    sudo tee /etc/systemd/system/wss-http-external.service > /dev/null <<EOF
-[Unit]
-Description=WSS Python Proxy HTTP External Listener
-After=network.target wss.service
-
-[Service]
-Type=simple
-# This service listens on the external port and connects to the WSS backend (8080)
-ExecStart=/usr/local/bin/wss-http-forwarder.sh
-Restart=on-failure
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-    
-    # Create the forwarder script (to keep WSS single-purpose)
-    sudo tee /usr/local/bin/wss-http-forwarder.sh > /dev/null <<EOF
-#!/bin/bash
-# A simple socat/netcat substitute for redirecting the WSS external port to the internal WSS port.
-# Since we only support the Python WSS script, we'll run a second instance on the external port
-# that redirects to the *actual* SSH port, effectively achieving the same result as the original script,
-# but now we have two WSS instances running, one for HTTP and one for TLS wrapping.
-# NOTE: The WSS script logic handles the X-Real-Host/DEFAULT_HOST targeting.
-
-/usr/local/bin/wss $WSS_EXTERNAL_PORT
-EOF
-    sudo chmod +x /usr/local/bin/wss-http-forwarder.sh
-    
-    # Start the external WSS listener service
-    sudo systemctl daemon-reload
-    sudo systemctl enable wss-http-external
-    sudo systemctl start wss-http-external
-    echo "WSS HTTP External Listener (SSH-HTTP-Payload) started on 0.0.0.0:$WSS_EXTERNAL_PORT"
-
-else
-    echo "SSH-HTTP-Payload is accessible on $WSS_EXTERNAL_PORT as it matches WSS internal port ($WSS_INTERNAL_PORT)."
-fi
-echo "----------------------------------------------------"
-
-# =============================
-# Install UDPGW
-# =============================
-echo "==== Installing UDPGW (for UDP tunneling) ===="
+# =======================================================
+# 4. 安装 UDPGW
+# =======================================================
+echo "==== 4. 安装 UDPGW ===="
 if [ -d "/root/badvpn" ]; then
-    echo "/root/badvpn directory found, skipping git clone."
+    echo "/root/badvpn 已存在，跳过克隆"
 else
     git clone https://github.com/ambrop72/badvpn.git /root/badvpn
 fi
@@ -453,7 +362,7 @@ cd /root/badvpn/badvpn-build
 cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1
 make -j$(nproc)
 
-# Create systemd service (binds to 127.0.0.1)
+# 创建 systemd 服务（绑定地址 127.0.0.1）
 sudo tee /etc/systemd/system/udpgw.service > /dev/null <<EOF
 [Unit]
 Description=UDP Gateway (Badvpn)
@@ -461,7 +370,6 @@ After=network.target
 
 [Service]
 Type=simple
-# UDPGW listens locally, client should connect to it via SSH tunnel's DYNAMIC port forwarding.
 ExecStart=/root/badvpn/badvpn-build/udpgw/badvpn-udpgw --listen-addr 127.0.0.1:$UDPGW_PORT --max-clients 1024 --max-connections-for-client 10
 Restart=on-failure
 User=root
@@ -473,37 +381,19 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable udpgw
 sudo systemctl start udpgw
-echo "UDPGW installed and started on 127.0.0.1:$UDPGW_PORT (Access via SSH tunnel)."
-echo "----------------------------------------------------"
+echo "UDPGW 已安装并启动，端口: $UDPGW_PORT"
+echo "----------------------------------"
 
-# =============================
-# Summary and Usage
-# =============================
-echo " "
-echo "===================================================="
-echo "✅ All tunneling components installed successfully!"
-echo "===================================================="
-echo " "
-echo "Your internal SSH server port: $SSH_SERVER_PORT"
-echo " "
-echo "--- Service Endpoints ---"
-echo "1. SSH-TLS (Standard TLS wrapper for SSH):"
-echo "   External Port: $SSH_TLS_PORT (Use for OpenSSH/Tunnelier/Bitvise/etc. with TLS/Stunnel support)"
-echo " "
-echo "2. SSH-HTTP-Payload (SSH over WebSocket/HTTP):"
-echo "   External Port: $WSS_EXTERNAL_PORT (Use for simple HTTP/WS payloads, e.g., KPN Tunnel)"
-echo " "
-echo "3. SSH-TLS-HTTP-Payload (SSH over WebSocket/HTTP wrapped in TLS):"
-echo "   External Port: $WSS_TLS_PORT (Use for secure WS/HTTP payloads, e.g., Stunnel Client -> $WSS_TLS_PORT)"
-echo " "
-echo "4. UDPGW (For UDP forwarding):"
-echo "   Internal Port: $UDPGW_PORT (Access via SOCKS proxy opened through any of the above tunnels)"
-echo " "
-echo "--- Status Commands ---"
-echo "WSS Backend:     sudo systemctl status wss"
-echo "WSS HTTP Ext:    sudo systemctl status wss-http-external (If used)"
-echo "Stunnel4:        sudo systemctl status stunnel4"
-echo "UDPGW:           sudo systemctl status udpgw"
-echo "===================================================="
-
-cd /root
+echo "=========================================================="
+echo "所有组件安装完成!"
+echo "----------------------------------------------------------"
+echo "支持协议一览:"
+echo "1. SSH (裸连接):      服务器IP:${ACTUAL_SSH_PORT}"
+echo "2. SSH-TLS:           服务器IP:${STUNNEL_PORT}"
+echo "3. SSH-Proxy-Payload: 服务器IP:${WSS_PORT} (如遇到 tinyproxy 冲突，请检查此端口是否为 8080 等)"
+echo "----------------------------------------------------------"
+echo "请检查服务状态:"
+echo "查看 WSS 状态: sudo systemctl status wss"
+echo "查看 Stunnel4 状态: sudo systemctl status stunnel4"
+echo "查看 UDPGW 状态: sudo systemctl status udpgw"
+echo "=========================================================="
