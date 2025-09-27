@@ -5,19 +5,28 @@ set -e
 # 提示端口
 # =============================
 echo "==== 端口配置 (请根据需要输入或使用默认值) ===="
+# 内部 SSH 转发端口
 read -p "1. SSH 监听端口（内部转发目标，默认为41816）：" SSH_PORT
 SSH_PORT=${SSH_PORT:-41816}
 
-read -p "2. WSS 监听端口（面向公网/SSH-HTTP-Payload，默认80）：" WSS_PORT
-WSS_PORT=${WSS_PORT:-80}
+# WSS 内部监听端口（原 80 端口，现强制改为非特权端口 8080）
+WSS_INTERNAL_PORT=8080
+echo "2. WSS 内部监听端口已固定为：$WSS_INTERNAL_PORT (非特权端口)"
 
-read -p "3. Stunnel4 端口（面向公网/SSH-TLS，默认443）：" STUNNEL_PORT
+# WSS 公网端口 (现在由 Stunnel4 负责监听，转发到 WSS_INTERNAL_PORT)
+read -p "3. Stunnel4 WSS 转发公网端口（SSH-HTTP-Payload，默认为80）：" WSS_PUBLIC_PORT
+WSS_PUBLIC_PORT=${WSS_PUBLIC_PORT:-80}
+
+# SSH-TLS 公网端口
+read -p "4. Stunnel4 SSH-TLS 公网端口（SSH-TLS，默认443）：" STUNNEL_PORT
 STUNNEL_PORT=${STUNNEL_PORT:-443}
 
-read -p "4. WSS-TLS 端口（面向公网/SSH-TLS-HTTP-Payload，默认444）：" WSS_TLS_PORT
+# WSS-TLS 公网端口
+read -p "5. Stunnel4 WSS-TLS 公网端口（SSH-TLS-HTTP-Payload，默认444）：" WSS_TLS_PORT
 WSS_TLS_PORT=${WSS_TLS_PORT:-444}
 
-read -p "5. UDPGW 端口（仅本地监听，默认7300）：" UDPGW_PORT
+# UDPGW 端口
+read -p "6. UDPGW 端口（仅本地监听，默认7300）：" UDPGW_PORT
 UDPGW_PORT=${UDPGW_PORT:-7300}
 echo "------------------------------------------------"
 
@@ -41,19 +50,18 @@ echo "依赖安装完成"
 echo "----------------------------------"
 
 # =============================
-# 1. 安装 WSS 脚本 (使用 Here Document 绕过 Base64 错误)
+# 1. 安装 WSS 脚本 (使用 Here Document)
 # =============================
 echo "==== 安装 WSS 脚本 (Python) ===="
 
-# 使用 Here Document 直接创建 Python 脚本，避免 Base64 错误
-# 注意：使用 'EOF' 阻止 shell 展开变量，只在 sed 阶段替换占位符
+# 使用 Here Document 直接创建 Python 脚本
 sudo tee /usr/local/bin/wss_temp_py > /dev/null <<'WSS_PYTHON_SCRIPT'
 #!/usr/bin/python3
 # Python Proxy (WSS/HTTP Simulation) - Author: Zien
 import socket, threading, select, sys, time
 
 # Configurations
-LISTENING_ADDR = '0.0.0.0'
+LISTENING_ADDR = '127.0.0.1' # WSS只在本地监听
 # 修复了 Python 三元表达式语法
 LISTENING_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 80 
 PASS = ''
@@ -87,6 +95,7 @@ class Server(threading.Thread):
             self.soc.bind((self.host, int(self.port)))
             self.soc.listen(0)
             self.running = True
+            print(f"WSS Server started on {self.host}:{self.port}")
             while self.running:
                 try:
                     c, addr = self.soc.accept()
@@ -267,7 +276,10 @@ def main():
     finally:
         server.close()
 
-        break
+        # break is unreachable here, remove it or put it outside the try-except-finally
+        # For simplicity, we just rely on KeyboardInterrupt handling.
+        pass
+
 
 if __name__ == '__main__':
     main()
@@ -279,7 +291,7 @@ sudo rm /usr/local/bin/wss_temp_py
 
 sudo chmod +x /usr/local/bin/wss
 
-# WSS Systemd Service
+# WSS Systemd Service (使用内部端口 8080)
 sudo tee /etc/systemd/system/wss.service > /dev/null <<EOF
 [Unit]
 Description=WSS Python Proxy
@@ -287,7 +299,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/wss $WSS_PORT
+ExecStart=/usr/local/bin/wss $WSS_INTERNAL_PORT
 Restart=on-failure
 User=$TUNNEL_USER
 Group=$TUNNEL_USER
@@ -302,7 +314,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable wss
 # 关键：重启 WSS 服务
 sudo systemctl restart wss
-echo "WSS 已启动，端口 $WSS_PORT，转发目标端口 $SSH_PORT"
+echo "WSS 已启动，端口 $WSS_INTERNAL_PORT (内部)，转发目标端口 $SSH_PORT"
 echo "----------------------------------"
 
 # =============================
@@ -326,9 +338,8 @@ sudo sh -c 'cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > 
 sudo chmod 600 /etc/stunnel/certs/stunnel.key
 echo "自签名证书生成完成"
 
-# Stunnel 配置包含两个服务: 
-# 1. ssh-tls-raw (SSH-TLS) -> 转发到 $SSH_PORT
-# 2. ssh-tls-wss (SSH-TLS-HTTP-Payload) -> 转发到 $WSS_PORT
+# Stunnel 配置包含三个服务 (SSH-TLS, WSS-TLS, WSS-HTTP)
+# 修复: 确保所有 WSS 转发都指向内部 8080 端口
 sudo tee /etc/stunnel/multitunnel.conf > /dev/null <<EOF
 pid=/var/run/stunnel.pid
 client = no
@@ -337,19 +348,24 @@ output = /var/log/stunnel4/stunnel.log
 socket = l:TCP_NODELAY=1
 socket = r:TCP_NODELAY=1
 
-# --- 1. SSH-TLS (将 TLS 流量直接转发到 SSH 端口) ---
+# --- 1. SSH-TLS (将公网 $STUNNEL_PORT (默认 443) 流量转发到内部 SSH 端口) ---
 [ssh-tls-raw]
 accept = 0.0.0.0:$STUNNEL_PORT
 cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.pem
 connect = 127.0.0.1:$SSH_PORT
 
-# --- 2. SSH-TLS-HTTP-Payload (将 TLS 流量转发到 WSS 端口) ---
+# --- 2. SSH-HTTP-Payload (将公网 $WSS_PUBLIC_PORT (默认 80) 流量转发到 WSS 内部端口) ---
+[ssh-http-payload]
+accept = 0.0.0.0:$WSS_PUBLIC_PORT
+connect = 127.0.0.1:$WSS_INTERNAL_PORT
+
+# --- 3. SSH-TLS-HTTP-Payload (将公网 $WSS_TLS_PORT (默认 444) 流量转发到 WSS 内部端口) ---
 [ssh-tls-wss]
 accept = 0.0.0.0:$WSS_TLS_PORT
 cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.pem
-connect = 127.0.0.1:$WSS_PORT
+connect = 127.0.0.1:$WSS_INTERNAL_PORT
 EOF
 
 # 修改 stunnel4 启动配置，使用新的配置文件
@@ -366,7 +382,7 @@ sudo systemctl stop stunnel4 || true
 sudo systemctl daemon-reload
 sudo systemctl enable stunnel4
 sudo systemctl restart stunnel4
-echo "Stunnel4 配置完成，SSH-TLS 端口 $STUNNEL_PORT，WSS-TLS 端口 $WSS_TLS_PORT"
+echo "Stunnel4 配置完成，SSH-TLS 公网端口 $STUNNEL_PORT，WSS-TLS 公网端口 $WSS_TLS_PORT"
 echo "----------------------------------"
 
 # =============================
@@ -423,7 +439,7 @@ echo "----------------------------------"
 echo "所有组件安装完成!"
 echo "--- 总结 ---"
 echo "1. SSH (裸协议): 端口 $SSH_PORT"
-echo "2. SSH-HTTP-Payload (WSS): 端口 $WSS_PORT"
+echo "2. SSH-HTTP-Payload (WSS): 公网 $WSS_PUBLIC_PORT -> 内部 $WSS_INTERNAL_PORT"
 echo "3. SSH-TLS (Stunnel4): 端口 $STUNNEL_PORT"
 echo "4. SSH-TLS-HTTP-Payload (Stunnel4+WSS): 端口 $WSS_TLS_PORT"
 echo "UDPGW (Badvpn): 端口 $UDPGW_PORT (仅本地)"
