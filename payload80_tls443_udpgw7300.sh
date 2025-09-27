@@ -4,39 +4,63 @@ set -e
 # =============================
 # 提示端口
 # =============================
-read -p "请输入 WSS 监听端口（默认80）: " WSS_PORT
+read -p "请输入 SSH 监听端口（内网转发目标，默认为41816）：" SSH_PORT
+SSH_PORT=${SSH_PORT:-41816}
+
+read -p "请输入 WSS 监听端口（面向公网，默认80）：" WSS_PORT
 WSS_PORT=${WSS_PORT:-80}
 
-read -p "请输入 Stunnel4 端口（默认443）: " STUNNEL_PORT
+read -p "请输入 Stunnel4 端口（面向公网，默认443）：" STUNNEL_PORT
 STUNNEL_PORT=${STUNNEL_PORT:-443}
 
-read -p "请输入 UDPGW 端口（默认7300）: " UDPGW_PORT
+read -p "请输入 UDPGW 端口（仅本地监听，默认7300）：" UDPGW_PORT
 UDPGW_PORT=${UDPGW_PORT:-7300}
+
+# =============================
+# 权限管理：创建非特权用户
+# =============================
+TUNNEL_USER="tunneluser"
+echo "==== 配置非特权用户 $TUNNEL_USER ===="
+if ! id "$TUNNEL_USER" &>/dev/null; then
+    # -r: 系统用户, -s /sbin/nologin: 禁止登录
+    sudo useradd -r -s /sbin/nologin "$TUNNEL_USER"
+    echo "创建非特权用户 $TUNNEL_USER 成功."
+else
+    echo "用户 $TUNNEL_USER 已存在."
+fi
+echo "----------------------------------"
 
 # =============================
 # 系统更新与依赖安装
 # =============================
 echo "==== 更新系统并安装依赖 ===="
 sudo apt update -y
-sudo apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4
+# 依赖 net-tools 只是为了检查，可精简。
+sudo apt install -y python3 python3-pip wget curl git cmake build-essential openssl stunnel4
 echo "依赖安装完成"
 echo "----------------------------------"
 
 # =============================
-# 安装 WSS 脚本
+# 安装 WSS 脚本 (/usr/local/bin/wss)
+# 
+# 关键更改: DEFAULT_HOST 修改为 127.0.0.1:$SSH_PORT
 # =============================
 echo "==== 安装 WSS 脚本 ===="
-sudo tee /usr/local/bin/wss > /dev/null <<'EOF'
+
+# 使用 heredoc 注入 $SSH_PORT 变量
+WSS_SCRIPT=$(cat <<EOF
 #!/usr/bin/python3
+# Python Proxy (WSS/HTTP Simulation) - Author: Zink
 import socket, threading, select, sys, time
 
+# Configurations
 LISTENING_ADDR = '0.0.0.0'
 LISTENING_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 80
 PASS = ''
 BUFLEN = 4096 * 4
 TIMEOUT = 60
-DEFAULT_HOST = '127.0.0.1:22'
-RESPONSE = 'HTTP/1.1 101 Switching Protocols\r\nContent-Length: 104857600000\r\n\r\n'
+DEFAULT_HOST = '127.0.0.1:$SSH_PORT' # <--- 更改目标端口
+RESPONSE = 'HTTP/1.1 101 Switching Protocols\\r\\nConnection: Upgrade\\r\\nUpgrade: websocket\\r\\nContent-Length: 104857600000\\r\\n\\r\\n'
 
 class Server(threading.Thread):
     def __init__(self, host, port):
@@ -51,10 +75,10 @@ class Server(threading.Thread):
         self.soc = socket.socket(socket.AF_INET)
         self.soc.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self.soc.settimeout(2)
-        self.soc.bind((self.host, int(self.port)))
-        self.soc.listen(0)
-        self.running = True
         try:
+            self.soc.bind((self.host, int(self.port)))
+            self.soc.listen(0)
+            self.running = True
             while self.running:
                 try:
                     c, addr = self.soc.accept()
@@ -64,6 +88,8 @@ class Server(threading.Thread):
                 conn = ConnectionHandler(c, self, addr)
                 conn.start()
                 self.addConn(conn)
+        except Exception as e:
+            print(f"Server error on port {self.port}: {e}")
         finally:
             self.running = False
             self.soc.close()
@@ -100,13 +126,12 @@ class ConnectionHandler(threading.Thread):
         self.clientClosed = False
         self.targetClosed = True
         self.client = socClient
-        self.client_buffer = ''
+        self.client_buffer = b''
         self.server = server
         self.log = 'Connection: ' + str(addr)
     def close(self):
         try:
             if not self.clientClosed:
-                self.client.shutdown(socket.SHUT_RDWR)
                 self.client.close()
         except:
             pass
@@ -114,7 +139,6 @@ class ConnectionHandler(threading.Thread):
             self.clientClosed = True
         try:
             if not self.targetClosed:
-                self.target.shutdown(socket.SHUT_RDWR)
                 self.target.close()
         except:
             pass
@@ -122,14 +146,20 @@ class ConnectionHandler(threading.Thread):
             self.targetClosed = True
     def run(self):
         try:
+            self.client.settimeout(TIMEOUT)
             self.client_buffer = self.client.recv(BUFLEN)
-            hostPort = self.findHeader(self.client_buffer, 'X-Real-Host')
+            
+            head = self.client_buffer.decode('utf-8', errors='ignore')
+
+            hostPort = self.findHeader(head, 'X-Real-Host')
             if hostPort == '':
                 hostPort = DEFAULT_HOST
-            passwd = self.findHeader(self.client_buffer, 'X-Pass')
+            
+            passwd = self.findHeader(head, 'X-Pass')
             if len(PASS) != 0 and passwd != PASS:
-                self.client.send(b'HTTP/1.1 400 WrongPass!\r\n\r\n')
+                self.client.send(b'HTTP/1.1 400 WrongPass!\\r\\n\\r\\n')
                 return
+
             self.method_CONNECT(hostPort)
         except Exception as e:
             self.log += ' - error: ' + str(e)
@@ -137,46 +167,51 @@ class ConnectionHandler(threading.Thread):
         finally:
             self.close()
             self.server.removeConn(self)
+    
     def findHeader(self, head, header):
-        if isinstance(head, bytes):
-            head = head.decode('utf-8')
         aux = head.find(header + ': ')
         if aux == -1:
             return ''
         aux = head.find(':', aux)
         head = head[aux + 2:]
-        aux = head.find('\r\n')
+        aux = head.find('\\r\\n')
         if aux == -1:
             return ''
-        return head[:aux]
+        return head[:aux].strip()
+
     def connect_target(self, host):
         i = host.find(':')
         if i != -1:
             port = int(host[i + 1:])
             host = host[:i]
         else:
-            port = 22
-        (soc_family, soc_type, proto, _, address) = socket.getaddrinfo(host, port)[0]
-        self.target = socket.socket(soc_family, soc_type, proto)
+            # Fallback to the port in DEFAULT_HOST if client only sent IP
+            port = int(DEFAULT_HOST.split(':')[-1]) 
+
+        self.target = socket.create_connection((host, port), timeout=TIMEOUT)
         self.targetClosed = False
-        self.target.connect(address)
+
     def method_CONNECT(self, path):
         self.log += ' - CONNECT ' + path
         self.connect_target(path)
         self.client.sendall(RESPONSE.encode('utf-8'))
-        self.client_buffer = ''
         self.server.printLog(self.log)
         self.doCONNECT()
+    
     def doCONNECT(self):
         socs = [self.client, self.target]
-        count = 0
         error = False
-        while True:
-            count += 1
-            (recv, _, err) = select.select(socs, [], socs, 3)
+        last_activity = time.time()
+        
+        while time.time() - last_activity < TIMEOUT:
+            (recv, _, err) = select.select(socs, [], socs, 1)
+            
             if err:
                 error = True
+                break
+            
             if recv:
+                last_activity = time.time()
                 for in_ in recv:
                     try:
                         data = in_.recv(BUFLEN)
@@ -184,42 +219,45 @@ class ConnectionHandler(threading.Thread):
                             if in_ is self.target:
                                 self.client.send(data)
                             else:
-                                while data:
-                                    byte = self.target.send(data)
-                                    data = data[byte:]
-                            count = 0
+                                self.target.sendall(data)
                         else:
+                            error = True
                             break
-                    except:
+                    except Exception as e:
                         error = True
                         break
-            if count == TIMEOUT:
-                error = True
+            
             if error:
                 break
 
 def main():
-    print("\n:-------PythonProxy WSS-------:\n")
-    print(f"Listening addr: {LISTENING_ADDR}, port: {LISTENING_PORT}\n")
+    if len(sys.argv) > 1:
+        global LISTENING_PORT
+        LISTENING_PORT = int(sys.argv[1])
+    
+    print("\\n:-------PythonProxy WSS-------:")
+    print(f"Listening addr: {LISTENING_ADDR}, port: {LISTENING_PORT}, Default Target: {DEFAULT_HOST}\\n")
     server = Server(LISTENING_ADDR, LISTENING_PORT)
     server.start()
-    while True:
-        try:
+    
+    try:
+        while True:
             time.sleep(2)
-        except KeyboardInterrupt:
-            print('Stopping...')
-            server.close()
-            break
+    except KeyboardInterrupt:
+        print('Stopping...')
+    finally:
+        server.close()
 
 if __name__ == '__main__':
     main()
 EOF
+echo "$WSS_SCRIPT" | sudo tee /usr/local/bin/wss > /dev/null
 
 sudo chmod +x /usr/local/bin/wss
 echo "WSS 脚本安装完成"
 echo "----------------------------------"
 
-# 创建 systemd 服务
+# 创建 WSS systemd 服务
 sudo tee /etc/systemd/system/wss.service > /dev/null <<EOF
 [Unit]
 Description=WSS Python Proxy
@@ -229,7 +267,8 @@ After=network.target
 Type=simple
 ExecStart=/usr/local/bin/wss $WSS_PORT
 Restart=on-failure
-User=root
+User=$TUNNEL_USER
+Group=$TUNNEL_USER
 
 [Install]
 WantedBy=multi-user.target
@@ -237,29 +276,39 @@ EOF
 
 sudo systemctl daemon-reload
 sudo systemctl enable wss
-sudo systemctl start wss
-echo "WSS 已启动，端口 $WSS_PORT"
+sudo systemctl restart wss
+echo "WSS 已启动，端口 $WSS_PORT，转发目标端口 $SSH_PORT"
 echo "----------------------------------"
 
 # =============================
 # 安装 Stunnel4 并生成证书
+# 
+# 关键更改: connect 修改为 127.0.0.1:$SSH_PORT
 # =============================
 echo "==== 安装 Stunnel4 ===="
+# 证书信息
+COUNTRY="US"
+STATE="California"
+CITY="Mountain View"
+ORG="MyTunnel Service"
+CN="$(hostname)"
+
 sudo mkdir -p /etc/stunnel/certs
 sudo openssl req -x509 -nodes -newkey rsa:2048 \
 -keyout /etc/stunnel/certs/stunnel.key \
 -out /etc/stunnel/certs/stunnel.crt \
 -days 1095 \
--subj "/CN=example.com"
+-subj "/C=$COUNTRY/ST=$STATE/L=$CITY/O=$ORG/CN=$CN"
+
 sudo sh -c 'cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem'
+sudo chmod 600 /etc/stunnel/certs/stunnel.key
 sudo chmod 644 /etc/stunnel/certs/*.crt
 sudo chmod 644 /etc/stunnel/certs/*.pem
+echo "自签名证书生成完成"
 
 # Stunnel 配置
 sudo tee /etc/stunnel/ssh-tls.conf > /dev/null <<EOF
 pid=/var/run/stunnel.pid
-setuid=root
-setgid=root
 client = no
 debug = 5
 output = /var/log/stunnel4/stunnel.log
@@ -270,29 +319,39 @@ socket = r:TCP_NODELAY=1
 accept = 0.0.0.0:$STUNNEL_PORT
 cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.pem
-connect = 127.0.0.1:22
+connect = 127.0.0.1:$SSH_PORT # <--- 更改目标端口
 EOF
 
+# 确保 stunnel4 服务启用并重启
 sudo systemctl enable stunnel4
 sudo systemctl restart stunnel4
-echo "Stunnel4 安装完成，端口 $STUNNEL_PORT"
+echo "Stunnel4 安装完成，端口 $STUNNEL_PORT，转发目标端口 $SSH_PORT"
 echo "----------------------------------"
 
 # =============================
-# 安装 UDPGW
+# 安装 UDPGW (Badvpn)
 # =============================
-echo "==== 安装 UDPGW ===="
-if [ -d "/root/badvpn" ]; then
-    echo "/root/badvpn 已存在，跳过克隆"
+echo "==== 安装 UDPGW (Badvpn) ===="
+UDPGW_DIR="/usr/local/src/badvpn"
+BUILD_DIR="${UDPGW_DIR}/badvpn-build"
+
+if [ -d "${UDPGW_DIR}" ]; then
+    echo "badvpn 源码目录已存在，跳过克隆"
 else
-    git clone https://github.com/ambrop72/badvpn.git /root/badvpn
+    git clone https://github.com/ambrop72/badvpn.git "${UDPGW_DIR}"
 fi
-mkdir -p /root/badvpn/badvpn-build
-cd /root/badvpn/badvpn-build
-cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1
+
+mkdir -p "${BUILD_DIR}"
+cd "${BUILD_DIR}"
+
+echo "开始编译 badvpn-udpgw..."
+cmake "${UDPGW_DIR}" -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1
 make -j$(nproc)
 
-# 创建 systemd 服务（修正绑定地址为 127.0.0.1）
+# 复制可执行文件到标准路径
+sudo cp "${BUILD_DIR}/udpgw/badvpn-udpgw" /usr/local/bin/
+
+# 创建 systemd 服务
 sudo tee /etc/systemd/system/udpgw.service > /dev/null <<EOF
 [Unit]
 Description=UDP Gateway (Badvpn)
@@ -300,9 +359,10 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/root/badvpn/badvpn-build/udpgw/badvpn-udpgw --listen-addr 127.0.0.1:$UDPGW_PORT --max-clients 1024 --max-connections-for-client 10
+ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 127.0.0.1:$UDPGW_PORT --max-clients 1024 --max-connections-for-client 10
 Restart=on-failure
-User=root
+User=$TUNNEL_USER
+Group=$TUNNEL_USER
 
 [Install]
 WantedBy=multi-user.target
@@ -311,10 +371,9 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable udpgw
 sudo systemctl start udpgw
-echo "UDPGW 已安装并启动，端口: $UDPGW_PORT"
+echo "UDPGW 已安装并启动，端口: $UDPGW_PORT (仅限本地访问)"
 echo "----------------------------------"
 
 echo "所有组件安装完成!"
-echo "查看 WSS 状态: sudo systemctl status wss"
-echo "查看 Stunnel4 状态: sudo systemctl status stunnel4"
-echo "查看 UDPGW 状态: sudo systemctl status udpgw"
+echo "WSS 和 Stunnel4 现在都配置为将流量转发到本地的 SSH 端口 $SSH_PORT。"
+echo "请确保您的防火墙 (如 ufw/security group) 允许公网访问 WSS 端口 ($WSS_PORT) 和 Stunnel 端口 ($STUNNEL_PORT)。"
