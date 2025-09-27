@@ -14,7 +14,10 @@ WSS_PORT=${WSS_PORT:-80}
 read -p "3. Stunnel4 端口（面向公网/SSH-TLS，默认443）：" STUNNEL_PORT
 STUNNEL_PORT=${STUNNEL_PORT:-443}
 
-read -p "4. UDPGW 端口（仅本地监听，默认7300）：" UDPGW_PORT
+read -p "4. WSS-TLS 端口（面向公网/SSH-TLS-Payload，默认444）：" WSS_TLS_PORT
+WSS_TLS_PORT=${WSS_TLS_PORT:-444}
+
+read -p "5. UDPGW 端口（仅本地监听，默认7300）：" UDPGW_PORT
 UDPGW_PORT=${UDPGW_PORT:-7300}
 echo "------------------------------------------------"
 
@@ -38,14 +41,11 @@ echo "依赖安装完成"
 echo "----------------------------------"
 
 # =============================
-# 1. 安装 WSS 脚本 (已修复 EOF 错误)
-# 
-# 策略: 使用单引号HereDoc防止Bash解析内部Python语法，再用sed注入变量。
+# 1. 安装 WSS 脚本 (SSH-HTTP-Payload 核心)
 # =============================
 echo "==== 安装 WSS 脚本 ===="
-
-# 使用单引号HereDoc，阻止Bash解析内部括号和特殊字符
-sudo tee /usr/local/bin/wss_temp > /dev/null <<'EOF'
+# 使用 heredoc 注入 $SSH_PORT 变量
+WSS_SCRIPT=$(cat <<EOF
 #!/usr/bin/python3
 # Python Proxy (WSS/HTTP Simulation) - Author: Zink
 import socket, threading, select, sys, time
@@ -56,8 +56,8 @@ LISTENING_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 80
 PASS = ''
 BUFLEN = 4096 * 4
 TIMEOUT = 60
-DEFAULT_HOST = '127.0.0.1:__SSH_PORT__' # 占位符，将被sed替换
-RESPONSE = 'HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nContent-Length: 104857600000\r\n\r\n'
+DEFAULT_HOST = '127.0.0.1:$SSH_PORT' # 转发到自定义的SSH端口
+RESPONSE = 'HTTP/1.1 101 Switching Protocols\\r\\nConnection: Upgrade\\r\\nUpgrade: websocket\\r\\nContent-Length: 104857600000\\r\\n\\r\\n'
 
 class Server(threading.Thread):
     def __init__(self, host, port):
@@ -154,7 +154,7 @@ class ConnectionHandler(threading.Thread):
             
             passwd = self.findHeader(head, 'X-Pass')
             if len(PASS) != 0 and passwd != PASS:
-                self.client.send(b'HTTP/1.1 400 WrongPass!\r\n\r\n')
+                self.client.send(b'HTTP/1.1 400 WrongPass!\\r\\n\\r\\n')
                 return
 
             self.method_CONNECT(hostPort)
@@ -171,7 +171,7 @@ class ConnectionHandler(threading.Thread):
             return ''
         aux = head.find(':', aux)
         head = head[aux + 2:]
-        aux = head.find('\r\n')
+        aux = head.find('\\r\\n')
         if aux == -1:
             return ''
         return head[:aux].strip()
@@ -231,8 +231,8 @@ def main():
         global LISTENING_PORT
         LISTENING_PORT = int(sys.argv[1])
     
-    print("\n:-------PythonProxy WSS-------:")
-    print(f"Listening addr: {LISTENING_ADDR}, port: {LISTENING_PORT}, Default Target: {DEFAULT_HOST}\n")
+    print("\\n:-------PythonProxy WSS-------:")
+    print(f"Listening addr: {LISTENING_ADDR}, port: {LISTENING_PORT}, Default Target: {DEFAULT_HOST}\\n")
     server = Server(LISTENING_ADDR, LISTENING_PORT)
     server.start()
     
@@ -247,16 +247,11 @@ def main():
 if __name__ == '__main__':
     main()
 EOF
-
-# 使用 sed 注入 $SSH_PORT 变量
-sudo sed "s/__SSH_PORT__/$SSH_PORT/g" /usr/local/bin/wss_temp | sudo tee /usr/local/bin/wss > /dev/null
-sudo rm /usr/local/bin/wss_temp
+echo "$WSS_SCRIPT" | sudo tee /usr/local/bin/wss > /dev/null
 
 sudo chmod +x /usr/local/bin/wss
-echo "WSS 脚本安装完成"
-echo "----------------------------------"
 
-# 创建 WSS systemd 服务
+# WSS Systemd Service
 sudo tee /etc/systemd/system/wss.service > /dev/null <<EOF
 [Unit]
 Description=WSS Python Proxy
@@ -280,10 +275,9 @@ echo "WSS 已启动，端口 $WSS_PORT，转发目标端口 $SSH_PORT"
 echo "----------------------------------"
 
 # =============================
-# 2. 安装 Stunnel4 并生成证书
+# 2. 安装 Stunnel4 (SSH-TLS & SSH-TLS-Payload)
 # =============================
-echo "==== 安装 Stunnel4 ===="
-# 证书信息
+echo "==== 安装 Stunnel4 (双模式配置) ===="
 COUNTRY="US"
 STATE="California"
 CITY="Mountain View"
@@ -301,8 +295,10 @@ sudo sh -c 'cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > 
 sudo chmod 600 /etc/stunnel/certs/stunnel.key
 echo "自签名证书生成完成"
 
-# Stunnel 配置
-sudo tee /etc/stunnel/ssh-tls.conf > /dev/null <<EOF
+# Stunnel 配置包含两个服务: 
+# 1. ssh-tls-raw (SSH-TLS) -> 转发到 $SSH_PORT
+# 2. ssh-tls-wss (SSH-TLS-HTTP-Payload) -> 转发到 $WSS_PORT
+sudo tee /etc/stunnel/multitunnel.conf > /dev/null <<EOF
 pid=/var/run/stunnel.pid
 client = no
 debug = 5
@@ -310,20 +306,35 @@ output = /var/log/stunnel4/stunnel.log
 socket = l:TCP_NODELAY=1
 socket = r:TCP_NODELAY=1
 
-[ssh-tls-gateway]
+# --- 1. SSH-TLS (将 TLS 流量直接转发到 SSH 端口) ---
+[ssh-tls-raw]
 accept = 0.0.0.0:$STUNNEL_PORT
 cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.pem
-connect = 127.0.0.1:$SSH_PORT # 更改目标端口
+connect = 127.0.0.1:$SSH_PORT
+
+# --- 2. SSH-TLS-HTTP-Payload (将 TLS 流量转发到 WSS 端口) ---
+[ssh-tls-wss]
+accept = 0.0.0.0:$WSS_TLS_PORT
+cert = /etc/stunnel/certs/stunnel.pem
+key = /etc/stunnel/certs/stunnel.pem
+connect = 127.0.0.1:$WSS_PORT
 EOF
 
+# 修改 stunnel4 启动配置，使用新的配置文件
+sudo systemctl disable stunnel4
+sudo sed -i 's/ENABLED=0/ENABLED=1/' /etc/default/stunnel4
+# 备份旧配置并链接新配置 (部分系统需要这步来指定配置文件)
+sudo sh -c 'echo "FILES=\"/etc/stunnel/multitunnel.conf\"" >> /etc/default/stunnel4'
+
+sudo systemctl daemon-reload
 sudo systemctl enable stunnel4
 sudo systemctl restart stunnel4
-echo "Stunnel4 安装完成，端口 $STUNNEL_PORT，转发目标端口 $SSH_PORT"
+echo "Stunnel4 配置完成，SSH-TLS 端口 $STUNNEL_PORT，WSS-TLS 端口 $WSS_TLS_PORT"
 echo "----------------------------------"
 
 # =============================
-# 3. 安装 UDPGW (Badvpn)
+# 3. 安装 UDPGW
 # =============================
 echo "==== 安装 UDPGW (Badvpn) ===="
 UDPGW_DIR="/usr/local/src/badvpn"
@@ -365,8 +376,15 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable udpgw
 sudo systemctl start udpgw
-echo "UDPGW 已安装并启动，端口: $UDPGW_PORT (仅限本地访问)"
+echo "UDPGW 已安装并启动，端口: $UDPGW_PORT"
 echo "----------------------------------"
 
 echo "所有组件安装完成!"
-echo "WSS ($WSS_PORT) 和 Stunnel4 ($STUNNEL_PORT) 现在都配置为将流量转发到本地的 SSH 端口 $SSH_PORT。"
+echo "--- 总结 ---"
+echo "SSH 裸协议端口: $SSH_PORT"
+echo "SSH-HTTP-Payload 端口: $WSS_PORT"
+echo "SSH-TLS 端口: $STUNNEL_PORT"
+echo "SSH-TLS-HTTP-Payload 端口: $WSS_TLS_PORT"
+echo "UDPGW 端口: $UDPGW_PORT (仅本地)"
+echo ""
+echo "请确保防火墙 (如 ufw/security group) 允许公网访问 $WSS_PORT, $STUNNEL_PORT, 和 $WSS_TLS_PORT。"
