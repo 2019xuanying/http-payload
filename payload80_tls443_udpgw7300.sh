@@ -2,65 +2,85 @@
 set -e
 
 # =======================================================
-# 预设变量与端口提示
+# 1. 端口配置提示与输入
 # =======================================================
 
-# 你的实际 SSH 登录端口
-ACTUAL_SSH_PORT="41816"
-
 echo "--------------------------------------------------------"
-echo "  [重要提示] 你的 SSH 后端端口已锁定为: ${ACTUAL_SSH_PORT}"
+echo "  [配置开始] 请输入 SSH 后端及代理端口"
 echo "--------------------------------------------------------"
 
-# 解决端口 80 冲突的提示和处理
-echo "注意: 如果你看到 tinyproxy 或其他服务占用 80 端口，"
-echo "      请在此输入一个空闲端口 (例如 8080 或 8888)。"
-read -p "请输入 WSS 监听端口（默认 80）: " WSS_PORT
+# 步骤 1: 获取实际的 SSH 后端端口 (REQUIRED)
+read -p "请输入 [必需] SSH 裸连接的实际后端端口 (例如 22 或 41816): " ACTUAL_SSH_PORT
+if [ -z "$ACTUAL_SSH_PORT" ]; then
+    echo "错误: SSH 实际后端端口不能为空。脚本将退出。"
+    exit 1
+fi
+
+echo "--------------------------------------------------------"
+echo "  核心 SSH 后端端口已设置为: ${ACTUAL_SSH_PORT}"
+echo "--------------------------------------------------------"
+
+# 步骤 2: 获取 WSS (SSH-Proxy-Payload) 端口
+read -p "请输入 WSS (SSH-Proxy-Payload) 监听端口（默认 80）: " WSS_PORT
 WSS_PORT=${WSS_PORT:-80}
 
-read -p "请输入 Stunnel4 端口（用于 SSH-TLS, 默认 443）: " STUNNEL_PORT
+# 步骤 3: 获取 Stunnel4 (SSH-TLS) 端口
+read -p "请输入 Stunnel4 (SSH-TLS) 监听端口（默认 443）: " STUNNEL_PORT
 STUNNEL_PORT=${STUNNEL_PORT:-443}
 
+# 步骤 4: 获取 WSS-TLS (SSH-TLS-Proxy-Payload) 端口
+# WSS-TLS 将转发到 Stunnel4 端口
+read -p "请输入 WSS-TLS 监听端口（用于 SSH-TLS-Payload, 默认 8080）: " WSS_TLS_PORT
+WSS_TLS_PORT=${WSS_TLS_PORT:-8080}
+
+# 步骤 5: 获取 UDPGW 端口
 read -p "请输入 UDPGW 端口（默认 7300）: " UDPGW_PORT
 UDPGW_PORT=${UDPGW_PORT:-7300}
 
 echo "--------------------------------------------------------"
-echo "  配置信息确认:"
-echo "  WSS (SSH-Proxy-Payload): ${WSS_PORT}"
-echo "  Stunnel4 (SSH-TLS):      ${STUNNEL_PORT}"
-echo "  UDPGW (内部转发):        ${UDPGW_PORT}"
+echo "  配置信息确认:"
+echo "  SSH Backend Port:        ${ACTUAL_SSH_PORT}"
+echo "  WSS (SSH-Payload):        ${WSS_PORT}        -> 目标: ${ACTUAL_SSH_PORT}"
+echo "  Stunnel4 (SSH-TLS):      ${STUNNEL_PORT}    -> 目标: ${ACTUAL_SSH_PORT}"
+echo "  WSS-TLS (SSH-TLS-Payload): ${WSS_TLS_PORT}  -> 目标: ${STUNNEL_PORT}"
+echo "  UDPGW (内部转发):        ${UDPGW_PORT}"
 echo "--------------------------------------------------------"
 
 
 # =======================================================
-# 1. 系统更新与依赖安装
+# 2. 系统更新与依赖安装
 # =======================================================
-echo "==== 1. 更新系统并安装依赖 ===="
-# 确保安装 openssh-server 以防万一，但主要依赖是 python, stunnel4, cmake
+echo "==== 2. 更新系统并安装依赖 ===="
 sudo apt update -y
 sudo apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4 openssh-server
 echo "依赖安装完成"
 echo "----------------------------------"
 
 # =======================================================
-# 2. 安装 WSS 脚本 (支持 SSH-Proxy-Payload)
+# 3. 安装通用 WSS 脚本 (支持动态目标端口)
 # =======================================================
-echo "==== 2. 安装 WSS 脚本 (/usr/local/bin/wss) ===="
+echo "==== 3. 安装通用 WSS 脚本 (/usr/local/bin/wss) ===="
 
-# WSS 脚本内容 (Python)
+# WSS 脚本内容 (Python) - 现在接收两个参数: LISTENING_PORT 和 TARGET_PORT
 sudo tee /usr/local/bin/wss > /dev/null <<EOF
 #!/usr/bin/python3
-# Python WSS Proxy Script (Backend SSH Port: 41816)
+# Python WSS Proxy Script (General Purpose)
 import socket, threading, select, sys, time
 
+if len(sys.argv) < 3:
+    print("Usage: wss <LISTENING_PORT> <TARGET_PORT>")
+    sys.exit(1)
+
 LISTENING_ADDR = '0.0.0.0'
-LISTENING_PORT = int(sys.argv[1]) if len(sys.argv) > 1 else 80
+LISTENING_PORT = int(sys.argv[1])
+TARGET_PORT = int(sys.argv[2])
+
 PASS = ''
 BUFLEN = 4096 * 4
 TIMEOUT = 60
-# *** 转发目标锁定到实际 SSH 端口 41816 ***
-DEFAULT_HOST = '127.0.0.1:${ACTUAL_SSH_PORT}'
-RESPONSE = 'HTTP/1.1 101 Switching Protocols\r\nContent-Length: 104857600000\r\n\r\n'
+# *** 转发目标锁定到 127.0.0.1 上的 TARGET_PORT ***
+DEFAULT_HOST = '127.0.0.1:' + str(TARGET_PORT)
+RESPONSE = 'HTTP/1.1 101 Switching Protocols\\r\\nContent-Length: 104857600000\\r\\n\\r\\n'
 
 class Server(threading.Thread):
     def __init__(self, host, port):
@@ -151,17 +171,15 @@ class ConnectionHandler(threading.Thread):
             self.targetClosed = True
     def run(self):
         try:
-            # 接收第一个数据块
             self.client_buffer = self.client.recv(BUFLEN)
             
-            # 解析头部
             hostPort = self.findHeader(self.client_buffer, 'X-Real-Host')
             if hostPort == '':
                 hostPort = DEFAULT_HOST
             
             passwd = self.findHeader(self.client_buffer, 'X-Pass')
             if len(PASS) != 0 and passwd != PASS:
-                self.client.send(b'HTTP/1.1 400 WrongPass!\r\n\r\n')
+                self.client.send(b'HTTP/1.1 400 WrongPass!\\r\\n\\r\\n')
                 return
             
             self.method_CONNECT(hostPort)
@@ -174,23 +192,20 @@ class ConnectionHandler(threading.Thread):
 
     def findHeader(self, head, header):
         if isinstance(head, bytes):
-            # 将头部字节串解码为 UTF-8
             try:
                 head = head.decode('utf-8')
             except UnicodeDecodeError:
                 return ''
-        
-        # 搜索头部
+            
         aux = head.find(header + ': ')
         if aux == -1:
             return ''
         
-        # 提取值
         start_index = aux + len(header) + 2
         end_index = head.find('\r\n', start_index)
         
         if end_index == -1:
-            return head[start_index:].strip() # 尝试获取最后一行
+            return head[start_index:].strip()
         
         return head[start_index:end_index].strip()
 
@@ -200,9 +215,8 @@ class ConnectionHandler(threading.Thread):
             port = int(host[i + 1:])
             host = host[:i]
         else:
-            port = ${ACTUAL_SSH_PORT} # 确保默认端口也是 41816
+            port = TARGET_PORT # 使用脚本启动时传入的 TARGET_PORT
         
-        # 使用 getaddrinfo 获取地址信息
         try:
             (soc_family, soc_type, proto, _, address) = socket.getaddrinfo(host, port)[0]
         except socket.gaierror:
@@ -216,7 +230,6 @@ class ConnectionHandler(threading.Thread):
     def method_CONNECT(self, path):
         self.log += ' - CONNECT ' + path
         self.connect_target(path)
-        # 切换协议响应
         self.client.sendall(RESPONSE.encode('utf-8'))
         self.client_buffer = b''
         self.server.printLog(self.log)
@@ -228,7 +241,6 @@ class ConnectionHandler(threading.Thread):
         error = False
         while True:
             count += 1
-            # 使用 select 进行非阻塞 I/O
             (recv, _, err) = select.select(socs, [], socs, 3)
             
             if err:
@@ -242,35 +254,31 @@ class ConnectionHandler(threading.Thread):
                             if in_ is self.target:
                                 self.client.send(data)
                             else:
-                                # 确保所有数据都发送
                                 while data:
                                     byte = self.target.send(data)
                                     data = data[byte:]
                             count = 0
                         else:
-                            # 连接关闭
                             break
                     except Exception as e:
-                        # 传输错误
                         error = True
                         break
             
             if count == TIMEOUT:
-                # 超时
                 error = True
             
             if error:
                 break
 
 def main():
-    print("\n:-------PythonProxy WSS-------:\n")
+    print(f"\n:-------PythonProxy WSS-------:\n")
     print(f"Listening addr: {LISTENING_ADDR}, port: {LISTENING_PORT}, Target: {DEFAULT_HOST}\n")
     server = Server(LISTENING_ADDR, LISTENING_PORT)
     server.start()
     while True:
         try:
             time.sleep(2)
-            if not server.running: # 检查是否因为端口占用启动失败
+            if not server.running: 
                 print("WSS server failed to start. Check error log above.")
                 break
         except KeyboardInterrupt:
@@ -283,18 +291,39 @@ if __name__ == '__main__':
 EOF
 
 sudo chmod +x /usr/local/bin/wss
-echo "WSS 脚本安装完成"
+echo "通用 WSS 脚本安装完成"
 echo "----------------------------------"
 
-# 创建 systemd 服务
-sudo tee /etc/systemd/system/wss.service > /dev/null <<EOF
+# =======================================================
+# 4. 配置 WSS Systemd 服务 (分为 SSH-Payload 和 SSH-TLS-Payload)
+# =======================================================
+echo "==== 4. 配置并启动 WSS Systemd 服务 ===="
+
+# 4a. WSS for SSH (SSH-Proxy-Payload)
+sudo tee /etc/systemd/system/wss-ssh.service > /dev/null <<EOF
 [Unit]
-Description=WSS Python Proxy
+Description=WSS Proxy for SSH (Payload)
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/wss $WSS_PORT
+ExecStart=/usr/local/bin/wss $WSS_PORT $ACTUAL_SSH_PORT
+Restart=on-failure
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# 4b. WSS for Stunnel (SSH-TLS-Proxy-Payload)
+sudo tee /etc/systemd/system/wss-tls.service > /dev/null <<EOF
+[Unit]
+Description=WSS Proxy for Stunnel (TLS-Payload)
+After=network.target stunnel4.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wss $WSS_TLS_PORT $STUNNEL_PORT
 Restart=on-failure
 User=root
 
@@ -303,15 +332,17 @@ WantedBy=multi-user.target
 EOF
 
 sudo systemctl daemon-reload
-sudo systemctl enable wss
-sudo systemctl restart wss
-echo "WSS 已启动，端口 $WSS_PORT"
+sudo systemctl enable wss-ssh wss-tls
+sudo systemctl restart wss-ssh wss-tls
+echo "WSS (SSH-Payload) 已启动，端口 $WSS_PORT"
+echo "WSS-TLS (SSH-TLS-Payload) 已启动，端口 $WSS_TLS_PORT"
 echo "----------------------------------"
 
+
 # =======================================================
-# 3. 安装 Stunnel4 并生成证书 (支持 SSH-TLS)
+# 5. 安装 Stunnel4 并生成证书 (支持 SSH-TLS)
 # =======================================================
-echo "==== 3. 安装 Stunnel4 ===="
+echo "==== 5. 安装 Stunnel4 ===="
 sudo mkdir -p /etc/stunnel/certs
 # 使用主机名生成证书
 sudo openssl req -x509 -nodes -newkey rsa:2048 \
@@ -338,7 +369,7 @@ socket = r:TCP_NODELAY=1
 accept = 0.0.0.0:$STUNNEL_PORT
 cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.pem
-# *** 转发目标锁定到实际 SSH 端口 41816 ***
+# *** 转发目标锁定到实际 SSH 端口 ${ACTUAL_SSH_PORT} ***
 connect = 127.0.0.1:${ACTUAL_SSH_PORT}
 EOF
 
@@ -348,9 +379,9 @@ echo "Stunnel4 安装完成，端口 $STUNNEL_PORT"
 echo "----------------------------------"
 
 # =======================================================
-# 4. 安装 UDPGW
+# 6. 安装 UDPGW
 # =======================================================
-echo "==== 4. 安装 UDPGW ===="
+echo "==== 6. 安装 UDPGW ===="
 if [ -d "/root/badvpn" ]; then
     echo "/root/badvpn 已存在，跳过克隆"
 else
@@ -388,12 +419,14 @@ echo "=========================================================="
 echo "所有组件安装完成!"
 echo "----------------------------------------------------------"
 echo "支持协议一览:"
-echo "1. SSH (裸连接):      服务器IP:${ACTUAL_SSH_PORT}"
-echo "2. SSH-TLS:           服务器IP:${STUNNEL_PORT}"
-echo "3. SSH-Proxy-Payload: 服务器IP:${WSS_PORT} (如遇到 tinyproxy 冲突，请检查此端口是否为 8080 等)"
+echo "1. **SSH (裸连接)**:      服务器IP:${ACTUAL_SSH_PORT}"
+echo "2. **SSH-TLS (Stunnel)**:     服务器IP:${STUNNEL_PORT}"
+echo "3. **SSH-Proxy-Payload**:    服务器IP:${WSS_PORT}"
+echo "4. **SSH-TLS-Proxy-Payload**: 服务器IP:${WSS_TLS_PORT} (WSS 转发到 Stunnel)"
 echo "----------------------------------------------------------"
 echo "请检查服务状态:"
-echo "查看 WSS 状态: sudo systemctl status wss"
-echo "查看 Stunnel4 状态: sudo systemctl status stunnel4"
-echo "查看 UDPGW 状态: sudo systemctl status udpgw"
+echo "WSS-SSH 状态: sudo systemctl status wss-ssh"
+echo "WSS-TLS 状态: sudo systemctl status wss-tls"
+echo "Stunnel4 状态: sudo systemctl status stunnel4"
+echo "UDPGW 状态: sudo systemctl status udpgw"
 echo "=========================================================="
