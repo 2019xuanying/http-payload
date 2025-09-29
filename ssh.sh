@@ -221,7 +221,7 @@ socket = r:TCP_NODELAY=1
 accept = 0.0.0.0:$STUNNEL_PORT
 cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.pem
-connect = 127.0.0.1:41816 #自定义你的端口
+connect = 127.0.0.1:41816 
 EOF
 
 sudo systemctl enable stunnel4
