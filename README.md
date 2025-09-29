@@ -8,4 +8,9 @@
 WSS-SSH 状态: sudo systemctl status wss-ssh
 WSS-TLS 状态: sudo systemctl status wss-tls
 Stunnel4 状态: sudo systemctl status stunnel4
-UDPGW 状态: sudo systemctl status udpgw 
+UDPGW 状态: sudo systemctl status udpgw
+
+日志
+sudo journalctl -f -u stunnel4
+sudo journalctl -f -u wss-tls
+ 
