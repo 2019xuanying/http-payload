@@ -138,17 +138,3 @@ EOF
 
 sudo chmod +x /usr/local/bin/wss
 echo "WSS 脚本已更新并赋予执行权限。"
-
-### 步骤三：重新加载和启动服务
-
-```bash
-sudo systemctl daemon-reload
-sudo systemctl restart wss
-```
-
-### 步骤四：检查 WSS 状态
-
-**这是最关键的一步。** 请再次运行下面的命令，确认这次服务是否成功启动，并且不再报告 `IndentationError`。
-
-```bash
-sudo journalctl -u wss.service -n 50 --no-pager
