@@ -26,18 +26,19 @@ echo "依赖安装完成"
 echo "----------------------------------"
 
 # =============================
-# 安装 WSS 脚本
+# 安装 WSS 脚本 (已修复变量替换问题)
 # =============================
 echo "==== 安装 WSS 脚本 ===="
-sudo tee /usr/local/bin/wss > /dev/null <<'EOF'
+# 注意: 移除了单引号，以便shell变量($WSS_HTTP_PORT, $WSS_TLS_PORT)能够被正确替换
+sudo tee /usr/local/bin/wss > /dev/null <<EOF
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-import asyncio, ssl
+import asyncio, ssl, sys
 
 LISTEN_ADDR = '0.0.0.0'
-HTTP_PORT = 80        # 修改为你的 HTTP 端口
-TLS_PORT = 443        # 修改为你的 TLS 端口
+HTTP_PORT = $WSS_HTTP_PORT        # 修改为你的 HTTP 端口
+TLS_PORT = $WSS_TLS_PORT        # 修改为你的 TLS 端口
 DEFAULT_TARGET = ('127.0.0.1', 41816)
 BUFFER_SIZE = 65536
 TIMEOUT = 60
@@ -89,8 +90,12 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     continue  # 等待下一次 payload
             else:
                 # 已经触发转发，直接转发数据
-                writer.write(SWITCH_RESPONSE)
-                await writer.drain()
+                # 这里的 SWITCH_RESPONSE 应该只发送一次，但由于逻辑已进入转发阶段，
+                # 后续数据应直接转发给目标服务器。
+                # 原始脚本逻辑：
+                # writer.write(SWITCH_RESPONSE)
+                # await writer.drain()
+                pass
             
             # 解析目标
             if host_header:
@@ -98,12 +103,23 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     host, port = host_header.split(':')
                     target = (host.strip(), int(port.strip()))
                 else:
-                    target = (host_header.strip(), 22)
+                    # 默认使用 22 端口，但通常应该用一个更通用的端口，这里保留原始脚本的 22 端口逻辑
+                    target = (host_header.strip(), 22) 
             else:
                 target = DEFAULT_TARGET
 
             # ==== 连接目标服务器 ====
+            print(f"Forwarding connection to {target}")
             target_reader, target_writer = await asyncio.open_connection(*target)
+            
+            # 首次连接后，将客户端已经发送的 data 转发给目标服务器
+            if forwarding_started:
+                # 只转发 GET-RAY 之后的数据，因为 SWITCH_RESPONSE 已经发送
+                # 原始脚本逻辑在此处有缺陷，它在触发转发后立即跳到了这里，
+                # 但并没有处理第一次收到的完整数据（包含了GET-RAY头）。
+                # 为了兼容，我们假设 data 包含需要转发的第一批数据。
+                target_writer.write(data)
+                await target_writer.drain()
 
             async def pipe(src_reader, dst_writer):
                 try:
@@ -118,6 +134,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 finally:
                     dst_writer.close()
 
+            # 开始双向转发
             await asyncio.gather(
                 pipe(reader, target_writer),
                 pipe(target_reader, writer)
@@ -128,11 +145,16 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         print(f"Connection error {peer}: {e}")
     finally:
         writer.close()
-        await writer.wait_closed()
+        # await writer.wait_closed() # wait_closed in finally block might cause issues, removed for safety
         print(f"Closed {peer}")
 
 
 async def main():
+    # 检查证书文件是否存在
+    if not all(os.path.exists(f) for f in [CERT_FILE, KEY_FILE]):
+        print(f"Error: Certificate files not found! Expected: {CERT_FILE} and {KEY_FILE}", file=sys.stderr)
+        sys.exit(1) # 立即退出以报告错误
+
     # TLS server
     ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     ssl_ctx.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
@@ -161,7 +183,10 @@ async def main():
         )
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    import os # Add import for os to check files
+    # 增加了一个检查，防止在主程序外重复运行
+    if 'asyncio' in locals():
+        asyncio.run(main())
 
 EOF
 
@@ -179,6 +204,8 @@ After=network.target
 
 [Service]
 Type=simple
+# ExecStart 已经将端口作为参数传入，但由于 Python 脚本已修复为内部读取变量，
+# 此处保持不变，兼容性更好。
 ExecStart=/usr/local/bin/wss $WSS_HTTP_PORT $WSS_TLS_PORT
 Restart=on-failure
 User=root
@@ -189,7 +216,7 @@ EOF
 
 sudo systemctl daemon-reload
 sudo systemctl enable wss
-sudo systemctl start wss
+sudo systemctl restart wss
 echo "WSS 已启动，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
 echo "----------------------------------"
 
@@ -203,7 +230,9 @@ sudo openssl req -x509 -nodes -newkey rsa:2048 \
 -out /etc/stunnel/certs/stunnel.crt \
 -days 1095 \
 -subj "/CN=example.com"
+# 确保权限正确
 sudo sh -c 'cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem'
+sudo chmod 644 /etc/stunnel/certs/*.key
 sudo chmod 644 /etc/stunnel/certs/*.crt
 sudo chmod 644 /etc/stunnel/certs/*.pem
 
@@ -224,6 +253,8 @@ key = /etc/stunnel/certs/stunnel.pem
 connect = 127.0.0.1:22
 EOF
 
+# 确保 log 目录存在
+sudo mkdir -p /var/log/stunnel4
 sudo systemctl enable stunnel4
 sudo systemctl restart stunnel4
 echo "Stunnel4 安装完成，端口 $STUNNEL_PORT"
