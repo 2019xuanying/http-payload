@@ -38,7 +38,7 @@ import asyncio, ssl
 LISTEN_ADDR = '0.0.0.0'
 HTTP_PORT = 80        # 修改为你的 HTTP 端口
 TLS_PORT = 443        # 修改为你的 TLS 端口
-DEFAULT_TARGET = ('127.0.0.1', 22)
+DEFAULT_TARGET = ('127.0.0.1', 22) #自定义你的端口
 BUFFER_SIZE = 65536
 TIMEOUT = 60
 CERT_FILE = '/etc/stunnel/certs/stunnel.pem'
@@ -221,7 +221,7 @@ socket = r:TCP_NODELAY=1
 accept = 0.0.0.0:$STUNNEL_PORT
 cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.pem
-connect = 127.0.0.1:22
+connect = 127.0.0.1:41816 #自定义你的端口
 EOF
 
 sudo systemctl enable stunnel4
