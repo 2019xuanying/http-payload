@@ -4,22 +4,40 @@ set -e
 # =============================
 # 提示端口
 # =============================
+echo "==== 端口配置 ===="
 read -p "请输入 WSS HTTP 监听端口（默认80）: " WSS_HTTP_PORT
 WSS_HTTP_PORT=${WSS_HTTP_PORT:-80}
 
 read -p "请输入 WSS TLS 监听端口（默认443）: " WSS_TLS_PORT
 WSS_TLS_PORT=${WSS_TLS_PORT:-443}
 
-read -p "请输入 Stunnel4 端口（默认444）: " STUNNEL_PORT
+read -p "请输入 Stunnel4 监听端口（默认444）: " STUNNEL_PORT
 STUNNEL_PORT=${STUNNEL_PORT:-444}
 
-read -p "请输入 UDPGW 端口（默认7300）: " UDPGW_PORT
+read -p "请输入 UDPGW 监听端口（默认7300）: " UDPGW_PORT
 UDPGW_PORT=${UDPGW_PORT:-7300}
+
+# 关键设置: 后端转发目标端口 (您的 SSH/V2Ray/Trojan 等服务端口)
+read -p "请输入后端目标端口（例如您的SSH端口，默认41816）: " TARGET_PORT
+TARGET_PORT=${TARGET_PORT:-41816}
+
+echo "配置摘要："
+echo "WSS HTTP: $WSS_HTTP_PORT"
+echo "WSS TLS: $WSS_TLS_PORT"
+echo "Stunnel4: $STUNNEL_PORT"
+echo "UDPGW: $UDPGW_PORT"
+echo "内部目标端口: $TARGET_PORT"
+echo "----------------------------------"
+
 
 # =============================
 # 系统更新与依赖安装
 # =============================
 echo "==== 更新系统并安装依赖 ===="
+# 停止可能占用 80/443 的服务，以防冲突
+if systemctl is-active --quiet nginx; then sudo systemctl stop nginx; fi
+if systemctl is-active --quiet apache2; then sudo systemctl stop apache2; fi
+
 sudo apt update -y
 sudo apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4
 echo "依赖安装完成"
@@ -29,17 +47,17 @@ echo "----------------------------------"
 # 安装 WSS 脚本 (已修复变量替换问题)
 # =============================
 echo "==== 安装 WSS 脚本 ===="
-# 注意: 移除了单引号，以便shell变量($WSS_HTTP_PORT, $WSS_TLS_PORT)能够被正确替换
+# 使用双引号的 HereDoc 确保 shell 变量被替换
 sudo tee /usr/local/bin/wss > /dev/null <<EOF
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-import asyncio, ssl, sys
+import asyncio, ssl, sys, os
 
 LISTEN_ADDR = '0.0.0.0'
-HTTP_PORT = $WSS_HTTP_PORT        # 修改为你的 HTTP 端口
-TLS_PORT = $WSS_TLS_PORT        # 修改为你的 TLS 端口
-DEFAULT_TARGET = ('127.0.0.1', 41816)
+HTTP_PORT = $WSS_HTTP_PORT        # 从脚本参数获取 WSS HTTP 端口
+TLS_PORT = $WSS_TLS_PORT        # 从脚本参数获取 WSS TLS 端口
+DEFAULT_TARGET = ('127.0.0.1', $TARGET_PORT) # 使用您的后端目标端口
 BUFFER_SIZE = 65536
 TIMEOUT = 60
 CERT_FILE = '/etc/stunnel/certs/stunnel.pem'
@@ -52,141 +70,141 @@ SWITCH_RESPONSE = b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nCo
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
     peer = writer.get_extra_info('peername')
     print(f"Connection from {peer} {'(TLS)' if tls else ''}")
-    forwarding_started = False  # 是否进入转发阶段
+    forwarding_started = False
 
     try:
         # 循环处理客户端发送的 payload
-        while True:
-            data = await asyncio.wait_for(reader.read(BUFFER_SIZE), timeout=TIMEOUT)
-            if not data:
-                break
+        data = await asyncio.wait_for(reader.read(BUFFER_SIZE), timeout=TIMEOUT)
+        if not data:
+            return
 
-            headers = data.decode(errors='ignore')
-            host_header = ''
-            passwd_header = ''
-            for line in headers.split('\r\n'):
-                if line.startswith('X-Real-Host:'):
-                    host_header = line.split(':', 1)[1].strip()
-                if line.startswith('X-Pass:'):
-                    passwd_header = line.split(':', 1)[1].strip()
+        headers = data.decode(errors='ignore')
+        host_header = ''
+        passwd_header = ''
+        for line in headers.split('\r\n'):
+            if line.startswith('X-Real-Host:'):
+                host_header = line.split(':', 1)[1].strip()
+            if line.startswith('X-Pass:'):
+                passwd_header = line.split(':', 1)[1].strip()
 
-            # 密码验证
-            if PASS and passwd_header != PASS:
-                writer.write(b'HTTP/1.1 400 WrongPass!\r\n\r\n')
-                await writer.drain()
-                break
+        # 密码验证
+        if PASS and passwd_header != PASS:
+            writer.write(b'HTTP/1.1 400 WrongPass!\r\n\r\n')
+            await writer.drain()
+            return
 
-            # 检查是否触发转发
-            if not forwarding_started:
-                if 'GET-RAY' in headers:
-                    # 第一段就触发转发
-                    writer.write(SWITCH_RESPONSE)
-                    await writer.drain()
-                    forwarding_started = True
-                else:
-                    # 返回200并继续等待下一段 payload
-                    writer.write(FIRST_RESPONSE)
-                    await writer.drain()
-                    continue  # 等待下一次 payload
+        # 检查是否触发转发 (只检查第一次收到的数据)
+        if 'GET-RAY' in headers:
+            # 触发转发
+            writer.write(SWITCH_RESPONSE)
+            await writer.drain()
+            forwarding_started = True
+        else:
+            # 返回 200 响应
+            writer.write(FIRST_RESPONSE)
+            await writer.drain()
+            return
+
+        # 解析目标
+        if host_header:
+            if ':' in host_header:
+                host, port = host_header.split(':')
+                target = (host.strip(), int(port.strip()))
             else:
-                # 已经触发转发，直接转发数据
-                # 这里的 SWITCH_RESPONSE 应该只发送一次，但由于逻辑已进入转发阶段，
-                # 后续数据应直接转发给目标服务器。
-                # 原始脚本逻辑：
-                # writer.write(SWITCH_RESPONSE)
-                # await writer.drain()
+                target = (host_header.strip(), DEFAULT_TARGET[1]) # 使用默认端口
+        else:
+            target = DEFAULT_TARGET
+
+        # ==== 连接目标服务器 ====
+        print(f"Forwarding connection to {target}")
+        target_reader, target_writer = await asyncio.open_connection(*target)
+
+        # 首次连接后，将客户端已经发送的 data 转发给目标服务器
+        if forwarding_started:
+            target_writer.write(data)
+            await target_writer.drain()
+
+        async def pipe(src_reader, dst_writer):
+            try:
+                while True:
+                    buf = await src_reader.read(BUFFER_SIZE)
+                    if not buf:
+                        break
+                    dst_writer.write(buf)
+                    await dst_writer.drain()
+            except ConnectionResetError:
+                # 客户端或目标端断开连接是正常的
                 pass
-            
-            # 解析目标
-            if host_header:
-                if ':' in host_header:
-                    host, port = host_header.split(':')
-                    target = (host.strip(), int(port.strip()))
-                else:
-                    # 默认使用 22 端口，但通常应该用一个更通用的端口，这里保留原始脚本的 22 端口逻辑
-                    target = (host_header.strip(), 22) 
-            else:
-                target = DEFAULT_TARGET
+            except Exception as e:
+                # print(f"Pipe error: {e}")
+                pass
+            finally:
+                dst_writer.close()
 
-            # ==== 连接目标服务器 ====
-            print(f"Forwarding connection to {target}")
-            target_reader, target_writer = await asyncio.open_connection(*target)
-            
-            # 首次连接后，将客户端已经发送的 data 转发给目标服务器
-            if forwarding_started:
-                # 只转发 GET-RAY 之后的数据，因为 SWITCH_RESPONSE 已经发送
-                # 原始脚本逻辑在此处有缺陷，它在触发转发后立即跳到了这里，
-                # 但并没有处理第一次收到的完整数据（包含了GET-RAY头）。
-                # 为了兼容，我们假设 data 包含需要转发的第一批数据。
-                target_writer.write(data)
-                await target_writer.drain()
-
-            async def pipe(src_reader, dst_writer):
-                try:
-                    while True:
-                        buf = await src_reader.read(BUFFER_SIZE)
-                        if not buf:
-                            break
-                        dst_writer.write(buf)
-                        await dst_writer.drain()
-                except Exception:
-                    pass
-                finally:
-                    dst_writer.close()
-
-            # 开始双向转发
-            await asyncio.gather(
-                pipe(reader, target_writer),
-                pipe(target_reader, writer)
-            )
-            break  # 转发完成后退出循环
+        # 开始双向转发
+        await asyncio.gather(
+            pipe(reader, target_writer),
+            pipe(target_reader, writer)
+        )
 
     except Exception as e:
         print(f"Connection error {peer}: {e}")
     finally:
+        # 确保关闭客户端连接
         writer.close()
-        # await writer.wait_closed() # wait_closed in finally block might cause issues, removed for safety
         print(f"Closed {peer}")
 
 
 async def main():
-    # 检查证书文件是否存在
+    # 检查证书文件是否存在 (修复后的 WSS 脚本)
     if not all(os.path.exists(f) for f in [CERT_FILE, KEY_FILE]):
-        print(f"Error: Certificate files not found! Expected: {CERT_FILE} and {KEY_FILE}", file=sys.stderr)
-        sys.exit(1) # 立即退出以报告错误
+        print(f"Error: Certificate files not found! Please run the Stunnel4 setup step first.", file=sys.stderr)
+        sys.exit(1)
 
     # TLS server
     ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     ssl_ctx.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
 
-    tls_server = await asyncio.start_server(
-        lambda r, w: handle_client(r, w, tls=True),
-        LISTEN_ADDR,
-        TLS_PORT,
-        ssl=ssl_ctx
-    )
+    # 启动服务器
+    try:
+        tls_server = asyncio.start_server(
+            lambda r, w: handle_client(r, w, tls=True),
+            LISTEN_ADDR,
+            TLS_PORT,
+            ssl=ssl_ctx
+        )
+    except Exception as e:
+        print(f"Error starting TLS server on port {TLS_PORT}: {e}", file=sys.stderr)
+        sys.exit(1)
 
-    # HTTP server
-    http_server = await asyncio.start_server(
-        lambda r, w: handle_client(r, w, tls=False),
-        LISTEN_ADDR,
-        HTTP_PORT
-    )
+    try:
+        http_server = asyncio.start_server(
+            lambda r, w: handle_client(r, w, tls=False),
+            LISTEN_ADDR,
+            HTTP_PORT
+        )
+    except Exception as e:
+        print(f"Error starting HTTP server on port {HTTP_PORT}: {e}", file=sys.stderr)
+        sys.exit(1)
+
 
     print(f"Listening on {LISTEN_ADDR}:{HTTP_PORT} (HTTP payload)")
     print(f"Listening on {LISTEN_ADDR}:{TLS_PORT} (TLS)")
 
-    async with tls_server, http_server:
-        await asyncio.gather(
-            tls_server.serve_forever(),
-            http_server.serve_forever()
-        )
+    await asyncio.gather(
+        (await http_server).serve_forever(),
+        (await tls_server).serve_forever()
+    )
+
 
 if __name__ == '__main__':
-    import os # Add import for os to check files
-    # 增加了一个检查，防止在主程序外重复运行
-    if 'asyncio' in locals():
+    import os
+    try:
         asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nServer stopped.")
+    except Exception as e:
+        print(f"Fatal error in main loop: {e}", file=sys.stderr)
 
 EOF
 
@@ -204,9 +222,8 @@ After=network.target
 
 [Service]
 Type=simple
-# ExecStart 已经将端口作为参数传入，但由于 Python 脚本已修复为内部读取变量，
-# 此处保持不变，兼容性更好。
-ExecStart=/usr/local/bin/wss $WSS_HTTP_PORT $WSS_TLS_PORT
+# WSS 脚本不再接受端口作为参数，但 systemd 配置通常无需修改。
+ExecStart=/usr/local/bin/wss
 Restart=on-failure
 User=root
 
@@ -236,6 +253,7 @@ sudo chmod 644 /etc/stunnel/certs/*.key
 sudo chmod 644 /etc/stunnel/certs/*.crt
 sudo chmod 644 /etc/stunnel/certs/*.pem
 
+# Stunnel4 配置: 接受外部连接，转发到内部 $TARGET_PORT
 sudo tee /etc/stunnel/ssh-tls.conf > /dev/null <<EOF
 pid=/var/run/stunnel.pid
 setuid=root
@@ -250,14 +268,14 @@ socket = r:TCP_NODELAY=1
 accept = 0.0.0.0:$STUNNEL_PORT
 cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.pem
-connect = 127.0.0.1:22
+connect = 127.0.0.1:$TARGET_PORT
 EOF
 
 # 确保 log 目录存在
 sudo mkdir -p /var/log/stunnel4
 sudo systemctl enable stunnel4
 sudo systemctl restart stunnel4
-echo "Stunnel4 安装完成，端口 $STUNNEL_PORT"
+echo "Stunnel4 安装完成，监听端口 $STUNNEL_PORT，转发到内部端口 $TARGET_PORT"
 echo "----------------------------------"
 
 # =============================
