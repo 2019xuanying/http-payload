@@ -31,22 +31,37 @@ echo "----------------------------------"
 echo "==== 安装 WSS 脚本 ===="
 sudo tee /usr/local/bin/wss > /dev/null <<'EOF'
 #!/usr/bin/python3
+#!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
 import asyncio, ssl
+import sys # 导入 sys 模块以处理命令行参数
 
 LISTEN_ADDR = '0.0.0.0'
-HTTP_PORT = 80        # 修改为你的 HTTP 端口
-TLS_PORT = 443        # 修改为你的 TLS 端口
-DEFAULT_TARGET = ('127.0.0.1', 22) #自定义你的端口
+
+# 使用 sys.argv 获取命令行参数。如果未提供，则使用默认值
+try:
+    # 命令行参数从索引 1 开始
+    HTTP_PORT = int(sys.argv[1])
+except (IndexError, ValueError):
+    HTTP_PORT = 80        # 默认 HTTP 端口
+
+try:
+    TLS_PORT = int(sys.argv[2])
+except (IndexError, ValueError):
+    TLS_PORT = 443        # 默认 TLS 端口
+
+# 修正：根据用户的 SSH 端口 41816 修改默认转发目标
+DEFAULT_TARGET = ('127.0.0.1', 41816) 
 BUFFER_SIZE = 65536
-TIMEOUT = 60
+TIMEOUT = 3600
 CERT_FILE = '/etc/stunnel/certs/stunnel.pem'
 KEY_FILE = '/etc/stunnel/certs/stunnel.key'
 PASS = ''  # 如果需要密码验证，可填
 
 FIRST_RESPONSE = b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK'
 SWITCH_RESPONSE = b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'
+FORBIDDEN_RESPONSE = b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
     peer = writer.get_extra_info('peername')
@@ -60,7 +75,17 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             if not data:
                 break
 
-            headers = data.decode(errors='ignore')
+            headers = data.decode(errors='ignore') # ~ line 55
+
+            # --- VVV 检查转发逻辑的起点 VVV ---
+            
+            # 使用更灵活的方式检查 WebSocket 握手头部
+            is_websocket_request = False
+            
+            # 检查关键的 WebSocket 头部
+            if 'Upgrade: websocket' in headers or 'Connection: Upgrade' in headers or 'GET-RAY' in headers:
+                 is_websocket_request = True
+
             host_header = ''
             passwd_header = ''
             for line in headers.split('\r\n'):
@@ -75,32 +100,35 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 await writer.drain()
                 break
 
-            # 检查是否触发转发
-            if not forwarding_started:
-                if 'GET-RAY' in headers:
-                    # 第一段就触发转发
+            # 检查是否触发转发 (~ line 60)
+            if not forwarding_started: # 确保这行相对于上一行有正确的缩进
+                # 只要检测到是 WebSocket 升级请求，就触发转发
+                if is_websocket_request:
+                    # 触发转发 (返回 101 Switching Protocols)
                     writer.write(SWITCH_RESPONSE)
                     await writer.drain()
                     forwarding_started = True
                 else:
-                    # 返回200并继续等待下一段 payload
+                    # 否则，返回 200 OK 并继续等待下一段 payload
                     writer.write(FIRST_RESPONSE)
                     await writer.drain()
                     continue  # 等待下一次 payload
             else:
                 # 已经触发转发，直接转发数据
+                # 这一段逻辑实际上是多余的，但保留原脚本结构
                 writer.write(SWITCH_RESPONSE)
                 await writer.drain()
             
-            # 解析目标
+            # 解析目标。如果客户端通过 X-Real-Host 提供了目标，则使用它，否则使用 DEFAULT_TARGET
             if host_header:
                 if ':' in host_header:
                     host, port = host_header.split(':')
                     target = (host.strip(), int(port.strip()))
                 else:
+                    # 如果只提供了主机名，默认端口使用 22
                     target = (host_header.strip(), 22)
             else:
-                target = DEFAULT_TARGET
+                target = DEFAULT_TARGET # 使用 127.0.0.1:41816
 
             # ==== 连接目标服务器 ====
             target_reader, target_writer = await asyncio.open_connection(*target)
@@ -118,6 +146,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 finally:
                     dst_writer.close()
 
+            # 开始双向转发
             await asyncio.gather(
                 pipe(reader, target_writer),
                 pipe(target_reader, writer)
@@ -140,7 +169,7 @@ async def main():
     tls_server = await asyncio.start_server(
         lambda r, w: handle_client(r, w, tls=True),
         LISTEN_ADDR,
-        TLS_PORT,
+        TLS_PORT, # 使用动态端口
         ssl=ssl_ctx
     )
 
@@ -148,7 +177,7 @@ async def main():
     http_server = await asyncio.start_server(
         lambda r, w: handle_client(r, w, tls=False),
         LISTEN_ADDR,
-        HTTP_PORT
+        HTTP_PORT # 使用动态端口
     )
 
     print(f"Listening on {LISTEN_ADDR}:{HTTP_PORT} (HTTP payload)")
@@ -162,7 +191,7 @@ async def main():
 
 if __name__ == '__main__':
     asyncio.run(main())
-
+    
 EOF
 
 sudo chmod +x /usr/local/bin/wss
