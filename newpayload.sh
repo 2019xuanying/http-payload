@@ -56,13 +56,14 @@ echo "----------------------------------"
 echo "==== 系统更新与依赖安装 ===="
 apt update -y
 apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4
-pip3 install flask
+# 额外安装 jinja2 用于手动渲染模板
+pip3 install flask jinja2
 echo "依赖安装完成"
 echo "----------------------------------"
 
 
 # =============================
-# WSS 核心代理脚本 (与原脚本一致)
+# WSS 核心代理脚本
 # =============================
 echo "==== 安装 WSS 核心代理脚本 (/usr/local/bin/wss) ===="
 tee /usr/local/bin/wss > /dev/null <<'EOF'
@@ -184,7 +185,7 @@ async def main():
     except FileNotFoundError:
         print(f"WARNING: TLS certificate not found at {CERT_FILE}. TLS server disabled.")
         tls_task = asyncio.sleep(86400) # Keep task running but effectively disabled
-
+    
     http_server = await asyncio.start_server(
         lambda r, w: handle_client(r, w, tls=False), LISTEN_ADDR, HTTP_PORT)
     
@@ -228,7 +229,7 @@ echo "WSS 已启动，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
 echo "----------------------------------"
 
 # =============================
-# 安装 Stunnel4 并生成证书 (与原脚本一致)
+# 安装 Stunnel4 并生成证书
 # =============================
 echo "==== 安装 Stunnel4 ===="
 mkdir -p /etc/stunnel/certs
@@ -264,7 +265,7 @@ echo "Stunnel4 安装完成，端口 $STUNNEL_PORT"
 echo "----------------------------------"
 
 # =============================
-# 安装 UDPGW (与原脚本一致)
+# 安装 UDPGW
 # =============================
 echo "==== 安装 UDPGW ===="
 if [ ! -d "/root/badvpn" ]; then
@@ -311,22 +312,30 @@ if [ ! -f "$USER_DB" ]; then
     echo "[]" > "$USER_DB"
 fi
 
-# 嵌入 Python 面板代码
+# 嵌入 Python 面板代码 (修复了模板渲染问题)
 tee /usr/local/bin/wss_panel.py > /dev/null <<EOF
 # -*- coding: utf-8 -*-
-from flask import Flask, request, jsonify, render_template, redirect, url_for, session, make_response
+from flask import Flask, request, jsonify, redirect, url_for, session, make_response
 import json
 import subprocess
 import os
 import hashlib
 import time
+import jinja2 # 引入 Jinja2
 
 # --- 配置 ---
 USER_DB_PATH = "$USER_DB"
 ROOT_USERNAME = "root"
 ROOT_PASSWORD_HASH = "$PANEL_ROOT_PASS_HASH"
-FLASK_SECRET_KEY = os.urandom(24).hex() # 每次启动生成新的 secret key
+FLASK_SECRET_KEY = os.urandom(24).hex()
 SSHD_CONFIG = "/etc/ssh/sshd_config"
+
+# 面板和端口配置 (用于模板)
+PANEL_PORT = "$PANEL_PORT"
+WSS_HTTP_PORT = "$WSS_HTTP_PORT"
+WSS_TLS_PORT = "$WSS_TLS_PORT"
+STUNNEL_PORT = "$STUNNEL_PORT"
+UDPGW_PORT = "$UDPGW_PORT"
 
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET_KEY
@@ -340,13 +349,17 @@ def load_users():
     try:
         with open(USER_DB_PATH, 'r') as f:
             return json.load(f)
-    except Exception:
+    except Exception as e:
+        print(f"Error loading users.json: {e}")
         return []
 
 def save_users(users):
     """保存用户列表到 JSON 文件."""
-    with open(USER_DB_PATH, 'w') as f:
-        json.dump(users, f, indent=4)
+    try:
+        with open(USER_DB_PATH, 'w') as f:
+            json.dump(users, f, indent=4)
+    except Exception as e:
+        print(f"Error saving users.json: {e}")
 
 def get_user(username):
     """按用户名查找用户."""
@@ -369,7 +382,7 @@ def login_required(f):
 
 # --- 系统工具函数 ---
 
-def safe_run_command(command):
+def safe_run_command(command, input=None):
     """安全执行系统命令并返回结果."""
     try:
         result = subprocess.run(
@@ -377,183 +390,16 @@ def safe_run_command(command):
             check=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True
+            input=input, # 接受 bytes 输入
         )
-        return True, result.stdout.strip()
+        return True, result.stdout.decode('utf-8').strip()
     except subprocess.CalledProcessError as e:
-        return False, e.stderr.strip()
+        return False, e.stderr.decode('utf-8').strip()
     except FileNotFoundError:
         return False, "Command not found."
 
-# --- Web 路由 ---
+# --- HTML 模板和渲染 (修复后的逻辑) ---
 
-@app.route('/', methods=['GET'])
-@login_required
-def dashboard():
-    users = load_users()
-    return render_template('dashboard.html', users=users)
-
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    error = None
-    if request.method == 'POST':
-        username = request.form['username']
-        password_raw = request.form['password']
-        
-        # 验证 ROOT 账户
-        if username == ROOT_USERNAME:
-            password_hash = hashlib.sha256(password_raw.encode('utf-8')).hexdigest()
-            if password_hash == ROOT_PASSWORD_HASH:
-                session['logged_in'] = True
-                session['username'] = ROOT_USERNAME
-                return redirect(url_for('dashboard'))
-            else:
-                error = '用户名或密码错误。'
-        else:
-            error = '用户名或密码错误。'
-
-    html = f"""
-<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WSS Panel - 登录</title>
-    <style>
-        body {{ font-family: sans-serif; background-color: #f4f7f6; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
-        .container {{ background: white; padding: 25px; border-radius: 12px; box-shadow: 0 6px 15px rgba(0, 0, 0, 0.1); width: 100%; max-width: 380px; }}
-        h1 {{ text-align: center; color: #333; margin-bottom: 25px; font-weight: 600; }}
-        input[type=text], input[type=password] {{ width: 100%; padding: 12px 10px; margin: 8px 0; display: inline-block; border: 1px solid #ccc; border-radius: 8px; box-sizing: border-box; transition: border-color 0.3s; }}
-        input[type=text]:focus, input[type=password]:focus {{ border-color: #4CAF50; outline: none; }}
-        button {{ background-color: #4CAF50; color: white; padding: 14px 20px; margin: 15px 0 5px 0; border: none; border-radius: 8px; cursor: pointer; width: 100%; font-size: 16px; transition: background-color 0.3s; }}
-        button:hover {{ background-color: #45a049; }}
-        .error {{ color: #e74c3c; text-align: center; margin-bottom: 15px; font-weight: bold; }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>WSS 管理面板</h1>
-        {f'<div class="error">{error}</div>' if error else ''}
-        <form method="POST">
-            <label for="username"><b>用户名</b></label>
-            <input type="text" placeholder="输入 {ROOT_USERNAME}" name="username" value="{ROOT_USERNAME}" required>
-
-            <label for="password"><b>密码</b></label>
-            <input type="password" placeholder="输入密码" name="password" required>
-
-            <button type="submit">登录</button>
-        </form>
-    </div>
-</body>
-</html>
-    """
-    return html
-
-@app.route('/logout')
-def logout():
-    session.pop('logged_in', None)
-    return redirect(url_for('login'))
-
-@app.route('/api/users', methods=['GET'])
-@login_required
-def list_users_api():
-    """获取用户列表 (API)"""
-    users = load_users()
-    return jsonify(users)
-
-@app.route('/api/users/add', methods=['POST'])
-@login_required
-def add_user_api():
-    """添加用户 (API)"""
-    data = request.json
-    username = data.get('username')
-    password_raw = data.get('password')
-    
-    if not username or not password_raw:
-        return jsonify({"success": False, "message": "缺少用户名或密码"}), 400
-
-    users = load_users()
-    if get_user(username):
-        return jsonify({"success": False, "message": f"用户 {username} 已存在于面板"}), 409
-
-    # 1. 创建系统用户
-    success, output = safe_run_command(['useradd', '-m', '-s', '/bin/bash', username])
-    if not success:
-        return jsonify({"success": False, "message": f"创建系统用户失败: {output}"}), 500
-
-    # 2. 设置密码
-    chpasswd_input = f"{username}:{password_raw}"
-    success, output = safe_run_command(['/usr/sbin/chpasswd'], input=chpasswd_input.encode('utf-8'))
-    if not success:
-        # 如果设置密码失败，尝试删除已创建的系统用户
-        safe_run_command(['userdel', '-r', username])
-        return jsonify({"success": False, "message": f"设置密码失败: {output}"}), 500
-        
-    # 3. 记录到 JSON 数据库
-    new_user = {
-        "username": username,
-        "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-        "status": "active"
-    }
-    users.append(new_user)
-    save_users(users)
-
-    return jsonify({"success": True, "message": f"用户 {username} 创建成功"})
-
-@app.route('/api/users/delete', methods=['POST'])
-@login_required
-def delete_user_api():
-    """删除用户 (API)"""
-    data = request.json
-    username = data.get('username')
-    
-    if not username:
-        return jsonify({"success": False, "message": "缺少用户名"}), 400
-
-    users = load_users()
-    user_to_delete = get_user(username)
-
-    if not user_to_delete:
-        return jsonify({"success": False, "message": f"面板中用户 {username} 不存在"}), 404
-
-    # 1. 删除系统用户及其主目录
-    success, output = safe_run_command(['userdel', '-r', username])
-    if not success:
-        # 即使删除系统用户失败，也应该从面板中删除记录，以免混淆
-        print(f"Warning: Failed to delete system user {username}: {output}")
-
-    # 2. 从 JSON 数据库中删除记录
-    users = [user for user in users if user['username'] != username]
-    save_users(users)
-
-    return jsonify({"success": True, "message": f"用户 {username} 已删除"})
-
-
-# --- HTML 模板 (内嵌) ---
-
-@app.route('/dashboard.html')
-def render_dashboard_html():
-    return render_template('dashboard.html')
-
-@app.context_processor
-def inject_panel_config():
-    """注入面板配置信息到模板"""
-    return dict(
-        panel_port="$PANEL_PORT",
-        wss_http_port="$WSS_HTTP_PORT",
-        wss_tls_port="$WSS_TLS_PORT",
-        stunnel_port="$STUNNEL_PORT",
-        udpgw_port="$UDPGW_PORT"
-    )
-
-@app.template_filter('current_host')
-def current_host_filter(s):
-    """尝试获取当前请求的主机名或IP"""
-    # 这是一个简化的处理，在实际环境中需要更复杂的逻辑来获取正确的IP
-    if request.host.startswith('127.0.0.1'):
-        return '[Your Server IP]'
-    return request.host.split(':')[0]
-    
 # 仪表盘 HTML (内嵌)
 _DASHBOARD_HTML = """
 <!DOCTYPE html>
@@ -622,35 +468,29 @@ _DASHBOARD_HTML = """
                 <p>{{ wss_http_port }}</p>
             </div>
             <div class="stat-box">
-                <h3>WSS (TLS) 端口 / Stunnel</h3>
+                <h3>WSS (TLS) / Stunnel 端口</h3>
                 <p>{{ wss_tls_port }} / {{ stunnel_port }}</p>
             </div>
         </div>
 
         <div class="card connection-info">
             <h3>连接信息 (请替换 [Your Server IP])</h3>
-            <p>使用以下信息配置你的客户端（如 v2ray/Shadowsocks-Rust/Tunnelier等，选择 WSS 或 Stunnel 模式）：</p>
+            <p>使用以下信息配置你的客户端 (如 v2ray/Shadowsocks-Rust/Tunnelier等)：</p>
             
-            <h4>WSS (WebSocket) 连接</h4>
+            <h4>WSS (WebSocket) 或 Stunnel (TLS) 连接</h4>
             <pre>
-服务器地址: {{ '' | current_host }}
+服务器地址: {{ host_ip }}
 WSS HTTP 端口: {{ wss_http_port }}
 WSS TLS 端口: {{ wss_tls_port }}
-UDPGW 端口: 127.0.0.1:{{ udpgw_port }} (仅供本机 WSS 代理内部使用)
-</pre>
-
-            <h4>Stunnel (TLS) 连接</h4>
-            <pre>
-服务器地址: {{ '' | current_host }}
 Stunnel 端口: {{ stunnel_port }}
 </pre>
-            <p class="note">注意：所有连接方式的底层认证都是 **SSH 账户/密码**。用户只能使用面板创建的账户密码进行登录。</p>
+            <p class="note">注意：所有连接方式的底层认证都是 **SSH 账户/密码**。用户只能使用面板创建的账户密码进行登录。UDPGW端口 {{ udpgw_port }} 仅供本机 WSS 代理内部转发 UDP 流量使用。</p>
         </div>
 
         <div class="card">
             <h3>新增 WSS 用户</h3>
             <form id="add-user-form" class="user-form">
-                <input type="text" id="new-username" placeholder="用户名" required>
+                <input type="text" id="new-username" placeholder="用户名" pattern="[a-z0-9_]{3,16}" title="用户名只能包含小写字母、数字和下划线，长度3-16位" required>
                 <input type="password" id="new-password" placeholder="密码" required>
                 <button type="submit">创建用户</button>
             </form>
@@ -723,7 +563,8 @@ Stunnel 端口: {{ stunnel_port }}
         });
 
         async function deleteUser(username) {
-            if (!confirm(`确定要删除用户 ${username} 吗？`)) {
+            // 使用简化的 prompt 替代 confirm，提高 iframe 兼容性
+            if (window.prompt(\`确定要删除用户 \${username} 吗? (输入 YES 确认)\`) !== 'YES') {
                 return;
             }
             
@@ -738,8 +579,11 @@ Stunnel 端口: {{ stunnel_port }}
 
                 if (response.ok && result.success) {
                     showStatus(result.message, true);
-                    document.getElementById(`row-${username}`).remove();
-                    document.getElementById('user-count').textContent = parseInt(document.getElementById('user-count').textContent) - 1;
+                    const row = document.getElementById(\`row-\${username}\`);
+                    if (row) row.remove();
+                    
+                    const countEl = document.getElementById('user-count');
+                    countEl.textContent = parseInt(countEl.textContent) - 1;
                 } else {
                     showStatus('删除失败: ' + result.message, false);
                 }
@@ -752,45 +596,177 @@ Stunnel 端口: {{ stunnel_port }}
             window.location.href = '/logout';
         }
         
-        // 替换原生 confirm/alert，因为它们在 iframe 中可能被禁用
-        window.confirm = (message) => {
-            return window.prompt(message + ' (输入 "yes" 确认删除)') === 'yes';
-        }
-        
     </script>
 </body>
 </html>
 """
 
-# 渲染模板，以便 Flask 可以在没有文件系统的情况下运行
-@app.route('/render_template/<path:template_name>')
-def render_in_memory_template(template_name):
-    if template_name == 'dashboard.html':
-        return make_response(render_template(_DASHBOARD_HTML))
-    # Flask默认也会处理 dashboard.html
-    return "Template not found", 404
+# 修复后的渲染函数
+def render_dashboard(users):
+    """手动渲染 Jinja2 模板字符串."""
+    template_env = jinja2.Environment(loader=jinja2.BaseLoader)
+    template = template_env.from_string(_DASHBOARD_HTML)
+    
+    # 获取服务器IP (这里只能从请求头推测，不能保证准确，需要用户手动替换)
+    host_ip = request.host.split(':')[0]
+    if host_ip in ('127.0.0.1', 'localhost'):
+         host_ip = '[Your Server IP]'
 
-# 覆盖 Flask 的 render_template 函数，使其使用内嵌的字符串
-def render_template(template_name, **context):
-    if template_name == 'dashboard.html':
-        # 这里需要用一个更优雅的方式来处理 Jinja2 渲染，但为简化，直接替换并渲染
-        import jinja2
-        template = jinja2.Template(_DASHBOARD_HTML)
-        # 注入全局变量
-        context.update(inject_panel_config())
-        return template.render(**context)
-    # 对于其他模板，返回错误
-    return "Template not found", 404
+    context = {
+        'users': users,
+        'panel_port': PANEL_PORT,
+        'wss_http_port': WSS_HTTP_PORT,
+        'wss_tls_port': WSS_TLS_PORT,
+        'stunnel_port': STUNNEL_PORT,
+        'udpgw_port': UDPGW_PORT,
+        'host_ip': host_ip
+    }
+    return template.render(**context)
 
-# 使用内嵌的 render_template
-import builtins
-builtins.render_template = render_template
+
+# --- Web 路由 ---
+
+@app.route('/', methods=['GET'])
+@login_required
+def dashboard():
+    users = load_users()
+    html_content = render_dashboard(users=users)
+    return make_response(html_content)
+
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    error = None
+    if request.method == 'POST':
+        username = request.form.get('username')
+        password_raw = request.form.get('password')
+        
+        # 验证 ROOT 账户
+        if username == ROOT_USERNAME and password_raw:
+            password_hash = hashlib.sha256(password_raw.encode('utf-8')).hexdigest()
+            if password_hash == ROOT_PASSWORD_HASH:
+                session['logged_in'] = True
+                session['username'] = ROOT_USERNAME
+                return redirect(url_for('dashboard'))
+            else:
+                error = '用户名或密码错误。'
+        else:
+            error = '用户名或密码错误。'
+
+    html = f"""
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WSS Panel - 登录</title>
+    <style>
+        body {{ font-family: sans-serif; background-color: #f4f7f6; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
+        .container {{ background: white; padding: 25px; border-radius: 12px; box-shadow: 0 6px 15px rgba(0, 0, 0, 0.1); width: 100%; max-width: 380px; }}
+        h1 {{ text-align: center; color: #333; margin-bottom: 25px; font-weight: 600; }}
+        input[type=text], input[type=password] {{ width: 100%; padding: 12px 10px; margin: 8px 0; display: inline-block; border: 1px solid #ccc; border-radius: 8px; box-sizing: border-box; transition: border-color 0.3s; }}
+        input[type=text]:focus, input[type=password]:focus {{ border-color: #4CAF50; outline: none; }}
+        button {{ background-color: #4CAF50; color: white; padding: 14px 20px; margin: 15px 0 5px 0; border: none; border-radius: 8px; cursor: pointer; width: 100%; font-size: 16px; transition: background-color 0.3s; }}
+        button:hover {{ background-color: #45a049; }}
+        .error {{ color: #e74c3c; text-align: center; margin-bottom: 15px; font-weight: bold; }}
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>WSS 管理面板</h1>
+        {f'<div class="error">{error}</div>' if error else ''}
+        <form method="POST">
+            <label for="username"><b>用户名</b></label>
+            <input type="text" placeholder="输入 {ROOT_USERNAME}" name="username" value="{ROOT_USERNAME}" required>
+
+            <label for="password"><b>密码</b></label>
+            <input type="password" placeholder="输入密码" name="password" required>
+
+            <button type="submit">登录</button>
+        </form>
+    </div>
+</body>
+</html>
+    """
+    return make_response(html)
+
+@app.route('/logout')
+def logout():
+    session.pop('logged_in', None)
+    return redirect(url_for('login'))
+
+@app.route('/api/users/add', methods=['POST'])
+@login_required
+def add_user_api():
+    """添加用户 (API)"""
+    data = request.json
+    username = data.get('username')
+    password_raw = data.get('password')
+    
+    if not username or not password_raw:
+        return jsonify({"success": False, "message": "缺少用户名或密码"}), 400
+
+    users = load_users()
+    if get_user(username):
+        return jsonify({"success": False, "message": f"用户 {username} 已存在于面板"}), 409
+
+    # 1. 创建系统用户 (使用 -s /bin/false 禁用远程 shell 登录，增加安全性)
+    success, output = safe_run_command(['useradd', '-m', '-s', '/bin/false', username])
+    if not success:
+        return jsonify({"success": False, "message": f"创建系统用户失败: {output}"}), 500
+
+    # 2. 设置密码
+    chpasswd_input = f"{username}:{password_raw}"
+    # 使用 full path for robustness and pass input as bytes
+    success, output = safe_run_command(['/usr/sbin/chpasswd'], input=chpasswd_input.encode('utf-8'))
+    if not success:
+        # 如果设置密码失败，尝试删除已创建的系统用户
+        safe_run_command(['userdel', '-r', username])
+        return jsonify({"success": False, "message": f"设置密码失败: {output}"}), 500
+        
+    # 3. 记录到 JSON 数据库
+    new_user = {
+        "username": username,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        "status": "active"
+    }
+    users.append(new_user)
+    save_users(users)
+
+    return jsonify({"success": True, "message": f"用户 {username} 创建成功"})
+
+@app.route('/api/users/delete', methods=['POST'])
+@login_required
+def delete_user_api():
+    """删除用户 (API)"""
+    data = request.json
+    username = data.get('username')
+    
+    if not username:
+        return jsonify({"success": False, "message": "缺少用户名"}), 400
+
+    users = load_users()
+    user_to_delete = get_user(username)
+
+    if not user_to_delete:
+        return jsonify({"success": False, "message": f"面板中用户 {username} 不存在"}), 404
+
+    # 1. 删除系统用户及其主目录
+    success, output = safe_run_command(['userdel', '-r', username])
+    if not success:
+        print(f"Warning: Failed to delete system user {username}: {output}")
+
+    # 2. 从 JSON 数据库中删除记录
+    users = [user for user in users if user['username'] != username]
+    save_users(users)
+
+    return jsonify({"success": True, "message": f"用户 {username} 已删除"})
 
 
 if __name__ == '__main__':
     # 为了简化部署，将 debug 设置为 False
     print(f"WSS Panel running on port {PANEL_PORT}")
-    app.run(host='0.0.0.0', port=$PANEL_PORT, debug=False)
+    app.run(host='0.0.0.0', port=int(PANEL_PORT), debug=False)
 EOF
 
 chmod +x /usr/local/bin/wss_panel.py
@@ -834,24 +810,17 @@ echo "SSHD 配置已备份到 ${SSHD_CONFIG}${BACKUP_SUFFIX}"
 # 删除旧的 WSS 配置段
 sed -i '/# WSS_TUNNEL_BLOCK_START/,/# WSS_TUNNEL_BLOCK_END/d' "$SSHD_CONFIG"
 
-# 写入新的、更具扩展性的统一 WSS 隧道策略
+# 写入新的 WSS 隧道策略
 cat >> "$SSHD_CONFIG" <<EOF
 
 # WSS_TUNNEL_BLOCK_START -- managed by deploy_wss_panel.sh
 # 统一策略: 允许所有用户通过本机 (127.0.0.1, ::1) 使用密码进行认证。
-# WSS 和 Stunnel 代理都会将外部连接伪装成 127.0.0.1 发送到 SSHD 的 41816 端口。
 Match Address 127.0.0.1,::1
     # 允许密码认证，用于 WSS/Stunnel 隧道连接
     PasswordAuthentication yes
     # 允许 TTY 和转发
     PermitTTY yes
     AllowTcpForwarding yes
-
-# 对于所有其他远程 IP，如果默认是允许密码认证的，则将其禁用以提高安全性
-# 注意：如果您的 SSHD 配置文件中 PasswordAuthentication 默认为 yes，可以添加以下行
-# Match all
-#    PasswordAuthentication no 
-# 但这可能会影响到正常的远程 SSH 管理。这里我们只确保隧道工作。
 # WSS_TUNNEL_BLOCK_END -- managed by deploy_wss_panel.sh
 
 EOF
