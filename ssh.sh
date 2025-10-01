@@ -34,14 +34,12 @@ sudo tee /usr/local/bin/wss > /dev/null <<'EOF'
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-import asyncio, ssl
-import sys # 导入 sys 模块以处理命令行参数
+import asyncio, ssl, sys
 
 LISTEN_ADDR = '0.0.0.0'
 
 # 使用 sys.argv 获取命令行参数。如果未提供，则使用默认值
 try:
-    # 命令行参数从索引 1 开始
     HTTP_PORT = int(sys.argv[1])
 except (IndexError, ValueError):
     HTTP_PORT = 80        # 默认 HTTP 端口
@@ -51,109 +49,131 @@ try:
 except (IndexError, ValueError):
     TLS_PORT = 443        # 默认 TLS 端口
 
-# 修正：根据用户的 SSH 端口 41816 修改默认转发目标
 DEFAULT_TARGET = ('127.0.0.1', 41816) 
 BUFFER_SIZE = 65536
 TIMEOUT = 3600
 CERT_FILE = '/etc/stunnel/certs/stunnel.pem'
 KEY_FILE = '/etc/stunnel/certs/stunnel.key'
-PASS = ''  # 如果需要密码验证，可填
+PASS = ''  # WSS 隧道密钥
 
-FIRST_RESPONSE = b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK'
+FIRST_RESPONSE = b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK\r\n\r\n'
 SWITCH_RESPONSE = b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'
 FORBIDDEN_RESPONSE = b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
     peer = writer.get_extra_info('peername')
     print(f"Connection from {peer} {'(TLS)' if tls else ''}")
-    forwarding_started = False  # 是否进入转发阶段
+    forwarding_started = False
+    full_request = b'' # 用于累积 Payload 数据
 
     try:
-        # 循环处理客户端发送的 payload
-        while True:
+        # --- 1. 握手循环 ---
+        while not forwarding_started:
+            
             data = await asyncio.wait_for(reader.read(BUFFER_SIZE), timeout=TIMEOUT)
             if not data:
                 break
-
-            headers = data.decode(errors='ignore') # ~ line 55
-
-            # --- VVV 检查转发逻辑的起点 VVV ---
             
-            # 使用更灵活的方式检查 WebSocket 握手头部
-            is_websocket_request = False
+            full_request += data
             
-            # 检查关键的 WebSocket 头部
-            if 'Upgrade: websocket' in headers or 'Connection: Upgrade' in headers or 'GET-RAY' in headers:
-                 is_websocket_request = True
+            # 找到 HTTP 头部和实际数据之间的分隔符
+            header_end_index = full_request.find(b'\r\n\r\n')
+            
+            # 如果尚未找到完整的头部，继续等待
+            if header_end_index == -1:
+                # 如果是多段 Payload，客户端通常会在收到 200 OK 后发送下一段
+                # 这里我们假设客户端在下一段数据中会发送完整的头部和标记
+                
+                # 在没有找到完整头部时，检查是否有 WebSocket 升级关键词
+                headers_temp = full_request.decode(errors='ignore')
+                if 'Upgrade: websocket' in headers_temp:
+                    # 如果在不完整的头部中找到了 Upgrade，可能是单段 Payload 或分段错误
+                    pass # 继续处理，让下面的完整逻辑决定
+                else:
+                    # 如果头部不完整且没有 Upgrade，返回 200 OK，等待下一段
+                    writer.write(FIRST_RESPONSE)
+                    await writer.drain()
+                    full_request = b'' # 清空，等待下一段数据
+                    continue
+
+
+            # 2. 头部解析 (在找到分隔符后或在继续处理时)
+            headers = full_request[:header_end_index].decode(errors='ignore') if header_end_index != -1 else full_request.decode(errors='ignore')
+            data_to_forward = full_request[header_end_index + 4:] if header_end_index != -1 else b'' # 分离出 SSH 数据
 
             host_header = ''
             passwd_header = ''
+            is_websocket_request = False
+            
+            # 解析头部信息
+            if 'Upgrade: websocket' in headers or 'Connection: Upgrade' in headers or 'GET-RAY' in headers:
+                 is_websocket_request = True
+            
             for line in headers.split('\r\n'):
                 if line.startswith('X-Real-Host:'):
                     host_header = line.split(':', 1)[1].strip()
                 if line.startswith('X-Pass:'):
                     passwd_header = line.split(':', 1)[1].strip()
 
-            # 密码验证
+            # 3. 密码验证
             if PASS and passwd_header != PASS:
                 writer.write(b'HTTP/1.1 400 WrongPass!\r\n\r\n')
                 await writer.drain()
-                break
+                return
 
-            # 检查是否触发转发 (~ line 60)
-            if not forwarding_started: # 确保这行相对于上一行有正确的缩进
-                # 只要检测到是 WebSocket 升级请求，就触发转发
-                if is_websocket_request:
-                    # 触发转发 (返回 101 Switching Protocols)
-                    writer.write(SWITCH_RESPONSE)
-                    await writer.drain()
-                    forwarding_started = True
-                else:
-                    # 否则，返回 200 OK 并继续等待下一段 payload
-                    writer.write(FIRST_RESPONSE)
-                    await writer.drain()
-                    continue  # 等待下一次 payload
-            else:
-                # 已经触发转发，直接转发数据
-                # 这一段逻辑实际上是多余的，但保留原脚本结构
+            # 4. 转发触发
+            if is_websocket_request:
                 writer.write(SWITCH_RESPONSE)
                 await writer.drain()
-            
-            # 解析目标。如果客户端通过 X-Real-Host 提供了目标，则使用它，否则使用 DEFAULT_TARGET
-            if host_header:
-                if ':' in host_header:
-                    host, port = host_header.split(':')
-                    target = (host.strip(), int(port.strip()))
-                else:
-                    # 如果只提供了主机名，默认端口使用 22
-                    target = (host_header.strip(), 22)
+                forwarding_started = True
             else:
-                target = DEFAULT_TARGET # 使用 127.0.0.1:41816
+                # 如果不是 WebSocket 请求 (例如，第一段 Payload)，返回 200 OK
+                writer.write(FIRST_RESPONSE)
+                await writer.drain()
+                full_request = b'' # 清空，等待下一段数据
+                continue
+        
+        # --- 退出握手循环 ---
 
-            # ==== 连接目标服务器 ====
-            target_reader, target_writer = await asyncio.open_connection(*target)
+        # 5. 解析目标
+        if host_header:
+            if ':' in host_header:
+                host, port = host_header.split(':')
+                target = (host.strip(), int(port.strip()))
+            else:
+                target = (host_header.strip(), 22)
+        else:
+            target = DEFAULT_TARGET # 127.0.0.1:41816
 
-            async def pipe(src_reader, dst_writer):
-                try:
-                    while True:
-                        buf = await src_reader.read(BUFFER_SIZE)
-                        if not buf:
-                            break
-                        dst_writer.write(buf)
-                        await dst_writer.drain()
-                except Exception:
-                    pass
-                finally:
-                    dst_writer.close()
+        # 6. 连接目标服务器
+        target_reader, target_writer = await asyncio.open_connection(*target)
 
-            # 开始双向转发
-            await asyncio.gather(
-                pipe(reader, target_writer),
-                pipe(target_reader, writer)
-            )
-            break  # 转发完成后退出循环
+        # 7. 转发初始数据 (SSH 握手)
+        if data_to_forward:
+            target_writer.write(data_to_forward)
+            await target_writer.drain()
+        
+        # 8. 转发后续数据流
+        async def pipe(src_reader, dst_writer):
+            try:
+                while True:
+                    buf = await src_reader.read(BUFFER_SIZE)
+                    if not buf:
+                        break
+                    dst_writer.write(buf)
+                    await dst_writer.drain()
+            except Exception:
+                pass
+            finally:
+                dst_writer.close()
+
+        await asyncio.gather(
+            pipe(reader, target_writer),
+            pipe(target_reader, writer)
+        )
 
     except Exception as e:
+        # 打印异常，帮助调试
         print(f"Connection error {peer}: {e}")
     finally:
         writer.close()
@@ -162,23 +182,21 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
 
 async def main():
-    # TLS server
+    # TLS server setup (unchanged)
     ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
-    ssl_ctx.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
+    try:
+        ssl_ctx.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
+    except FileNotFoundError:
+        print(f"ERROR: TLS certificate not found at {CERT_FILE}. TLS server disabled.")
+        return
+    except Exception as e:
+        print(f"ERROR loading certificate: {e}")
+        return
 
     tls_server = await asyncio.start_server(
-        lambda r, w: handle_client(r, w, tls=True),
-        LISTEN_ADDR,
-        TLS_PORT, # 使用动态端口
-        ssl=ssl_ctx
-    )
-
-    # HTTP server
+        lambda r, w: handle_client(r, w, tls=True), LISTEN_ADDR, TLS_PORT, ssl=ssl_ctx)
     http_server = await asyncio.start_server(
-        lambda r, w: handle_client(r, w, tls=False),
-        LISTEN_ADDR,
-        HTTP_PORT # 使用动态端口
-    )
+        lambda r, w: handle_client(r, w, tls=False), LISTEN_ADDR, HTTP_PORT)
 
     print(f"Listening on {LISTEN_ADDR}:{HTTP_PORT} (HTTP payload)")
     print(f"Listening on {LISTEN_ADDR}:{TLS_PORT} (TLS)")
@@ -186,8 +204,7 @@ async def main():
     async with tls_server, http_server:
         await asyncio.gather(
             tls_server.serve_forever(),
-            http_server.serve_forever()
-        )
+            http_server.serve_forever())
 
 if __name__ == '__main__':
     asyncio.run(main())
