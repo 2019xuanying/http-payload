@@ -54,7 +54,6 @@ BUFFER_SIZE = 65536
 TIMEOUT = 3600
 CERT_FILE = '/etc/stunnel/certs/stunnel.pem'
 KEY_FILE = '/etc/stunnel/certs/stunnel.key'
-PASS = ''  # WSS 隧道密钥
 
 FIRST_RESPONSE = b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK\r\n\r\n'
 SWITCH_RESPONSE = b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'
@@ -115,13 +114,8 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 if line.startswith('X-Pass:'):
                     passwd_header = line.split(':', 1)[1].strip()
 
-            # 3. 密码验证
-            if PASS and passwd_header != PASS:
-                writer.write(b'HTTP/1.1 400 WrongPass!\r\n\r\n')
-                await writer.drain()
-                return
 
-            # 4. 转发触发
+            # 3. 转发触发
             if is_websocket_request:
                 writer.write(SWITCH_RESPONSE)
                 await writer.drain()
