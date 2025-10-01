@@ -387,345 +387,424 @@ EOCONF
 
 # 生成 Python Web 面板
 sudo tee /usr/local/bin/wss_manager.py > /dev/null <<'EOF'
-import os
-import subprocess
+# -*- coding: utf-8 -*-
+import asyncio, ssl, sys
 import json
+import subprocess
+import os
+from flask import Flask, render_template, request, redirect, url_for, session, flash
+from datetime import datetime, timedelta
+import hashlib
 import time
-from flask import Flask, render_template_string, request, redirect, url_for, session, abort
-from hashlib import sha256
 
-# --- Configuration Load ---
+# --- 配置参数 (从部署脚本的 JSON 文件中加载) ---
 CONFIG_FILE = "/etc/wss-manager-config.json"
 SSHD_CONFIG = "/etc/ssh/sshd_config"
-WSS_USER_BASE_NAME = "wssuser" # Should match deploy script
+WSS_USER_BASE_NAME = "wssuser"
+USER_HOME_BASE = "/home"
 
+# 加载配置
 try:
     with open(CONFIG_FILE, 'r') as f:
         config = json.load(f)
-except FileNotFoundError:
-    print(f"ERROR: Config file not found at {CONFIG_FILE}. Ensure deploy script ran.")
+        MANAGER_PORT = config['MANAGER_PORT']
+        ADMIN_PASSWORD_HASH = config.get('ADMIN_PASSWORD_HASH', None)
+        # 兼容旧版流程和缺失检查
+        if not ADMIN_PASSWORD_HASH:
+             ADMIN_PASSWORD_HASH = config.get('ROOT_PASSWORD_HASH', "")
+
+except Exception as e:
+    # 如果配置加载失败，打印错误并退出
+    print(f"ERROR: Failed to load configuration from {CONFIG_FILE}. Details: {e}")
+    MANAGER_PORT = 54321
+    ADMIN_PASSWORD_HASH = ""
     exit(1)
 
-ADMIN_HASH = config['ADMIN_HASH']
-MANAGER_PORT = config['MANAGER_PORT']
-
 app = Flask(__name__)
-app.secret_key = os.urandom(24) # Used for session encryption
+# 强烈建议在实际生产环境中使用复杂的密钥
+app.secret_key = os.urandom(24) 
 
-def run_cmd(cmd):
-    """Run shell command and return output/error."""
+
+# --- 辅助函数 ---
+
+def run_cmd(command):
+    """
+    运行 Bash 命令并返回其输出。
+    为了提高可靠性，显式使用 /bin/bash 执行，确保 PATH 环境变量完整。
+    """
     try:
-        # 增加 /usr/sbin/ 和 /usr/bin/ 到 PATH，确保能找到 adduser, userdel, chpasswd, systemctl
-        env = os.environ.copy()
-        env["PATH"] = "/usr/sbin:/usr/bin:" + env.get("PATH", "")
-
-        # Use subprocess.run for all command execution
-        result = subprocess.run(cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
-        return result.stdout.decode().strip()
+        # 使用 /bin/bash 确保命令能被正确执行
+        result = subprocess.run(
+            ['/bin/bash', '-c', command],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        return result.stdout.strip()
     except subprocess.CalledProcessError as e:
-        # In the web manager, errors should be handled gracefully
-        # Removed full command for security/clarity in logs
-        return f"Error executing: {e.stderr.decode().strip()}"
+        print(f"CMD ERROR: Command failed: {e.cmd}")
+        print(f"STDERR: {e.stderr}")
+        # 如果命令失败，返回一个明确的错误标记
+        return f"CMD_ERROR: {e.stderr}"
+    except FileNotFoundError:
+        print(f"CMD ERROR: /bin/bash not found.")
+        return "CMD_ERROR: /bin/bash not found."
 
-def get_active_users():
-    """Get list of active users logged in via SSH (simulated check)."""
-    try:
-        # Use 'w' command to find currently logged-in users (basic check)
-        output = run_cmd("w -h | awk '{print $1}' | sort -u")
-        return output.split('\n')
-    except Exception:
-        return []
+
+def check_auth():
+    """检查用户是否登录"""
+    if 'logged_in' not in session or not session['logged_in']:
+        return redirect(url_for('login'))
+    return None
+
+def hash_password(password):
+    """使用 SHA256 对密码进行哈希处理"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+# --- 用户管理逻辑 ---
 
 def get_user_status():
-    """Reads users from passwd file and checks their active status."""
-    user_data = {}
-    active_users = get_active_users()
-    
-    # Get all users matching the WSS pattern (simple filter for demonstration)
-    # Filter users with UID >= 1000 (standard user IDs)
-    user_list_cmd = "awk -F: '$3 >= 1000 {print $1}' /etc/passwd"
-    all_users = run_cmd(user_list_cmd).split('\n')
-    
-    for username in all_users:
-        if not username or username in ['root', 'nobody', 'daemon', 'bin', 'sys']: continue
+    """获取所有隧道用户的状态、流量和在线信息"""
+    user_status = []
+
+    # 1. 获取所有 UID >= 1000 的用户列表 (非系统用户)
+    try:
+        # 显式使用 /usr/bin/awk 提高可靠性
+        user_list_cmd = "/usr/bin/awk -F: '($3 >= 1000) {print $1}' /etc/passwd"
+        all_users = run_cmd(user_list_cmd).split('\n')
+    except Exception as e:
+        print(f"ERROR reading /etc/passwd: {e}")
+        all_users = []
         
-        # Panel only displays users starting with WSS_USER_BASE_NAME
-        if username.startswith(WSS_USER_BASE_NAME) or username == WSS_USER_BASE_NAME:
-            status = 'Online' if username in active_users else 'Offline'
+    # 2. 获取在线用户列表 (w 命令)
+    online_users_output = run_cmd("w -h").split('\n')
+    online_list = {line.split()[0]: True for line in online_users_output if line.strip()}
+    
+    # 3. 构建用户状态列表
+    for username in all_users:
+        # 排除系统保留用户
+        if not username or username in ['root', 'nobody', 'daemon', 'bin', 'sys', 'man', 'lp', 'mail', 'news', 'uucp']: 
+            continue
             
-            # --- Placeholders for unimplemented features ---
-            user_data[username] = {
-                'status': status,
-                'traffic': '0.00 GB', # Placeholder: True traffic requires iptables integration
-                'limit': 'Unlimited', # Placeholder
-                'expiry': 'Never',    # Placeholder: Time limit requires external tracking
-                'created': 'N/A'
-            }
-    return user_data
+        # 检查该用户是否在 sshd_config 中有配置块 (判断是否为面板创建的隧道用户)
+        if run_cmd(f"grep -q '# WSSUSER_BLOCK_START_{username}' {SSHD_CONFIG}") == "CMD_ERROR":
+            continue # 如果grep命令失败或没有找到，则跳过
+            
+        # 流量和时间数据是手动配置的占位符
+        user_data = {
+            'username': username,
+            'is_online': online_list.get(username, False),
+            # last_login 字段在离线时显示 N/A，在线时显示 'Online' (W输出复杂，简化处理)
+            'last_login': 'Online' if online_list.get(username, False) else 'N/A',
+            'data_limit': "50 GB", # 占位符
+            'data_used': "0 GB", # 占位符
+            'expiry_date': (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d"), # 占位符
+            'status': 'Active'
+        }
+        user_status.append(user_data)
 
-def sshd_restart():
-    """Restarts the SSHD service."""
-    if run_cmd("systemctl list-units --full -all | grep -q 'sshd.service'"):
-        service = "sshd"
-    else:
-        service = "ssh"
-    return run_cmd(f"systemctl restart {service}")
+    return user_status
 
-# --- Web UI Routes ---
+def manage_user_ssh_config(username, action, password=None):
+    """管理用户在 sshd_config 中的配置块"""
+    
+    # 1. 清理所有与该用户相关的旧配置
+    # 注意 sed 命令的语法，必须确保引号和变量正确
+    # 使用 Python 变量安全地构建 sed 命令
+    run_cmd(f"sudo sed -i '/# WSSUSER_BLOCK_START_{username}/,/# WSSUSER_BLOCK_END_{username}/d' {SSHD_CONFIG}")
+    
+    if action == 'delete':
+        run_cmd(f"sudo userdel -r {username}")
+        return f"User {username} deleted successfully."
+        
+    if action == 'create' or action == 'update_password':
+        if action == 'create':
+            # 2. 创建用户
+            if 'No such user' in run_cmd(f"id {username} 2>&1"): # 检查用户是否存在
+                run_cmd(f"sudo adduser --disabled-password --gecos 'WSS Tunnel User' {username}")
+            
+            # 3. 确保没有 sudo 权限
+            if 'is not in the sudoers file' not in run_cmd(f"sudo -l -U {username} 2>&1"):
+                 run_cmd(f"sudo gpasswd -d {username} sudo")
+                 
+        # 4. 设置/更新密码
+        if password:
+            run_cmd(f'echo "{username}:{password}" | sudo chpasswd')
+            
+        # 5. 写入 SSHD 配置块 (使用四重引号来安全地构造字符串)
+        config_block = f"""
 
+# WSSUSER_BLOCK_START_{username} -- managed by wss_manager
+# 允许 {username} 从本机登录 (WSS/Stunnel)
+Match User {username} Address 127.0.0.1,::1
+    PermitTTY no
+    AllowTcpForwarding yes
+    PasswordAuthentication yes
+    AuthenticationMethods password,keyboard-interactive
+    ChallengeResponseAuthentication yes
+# 禁止 {username} 远程登录 (其他地址)
+Match User {username} Address *,!127.0.0.1,!::1
+    PermitTTY no
+    AllowTcpForwarding no
+    PasswordAuthentication no
+# WSSUSER_BLOCK_END_{username}
+"""     
+        # 使用 Python 的文件写入功能，比 Bash 的 tee/echo 更安全、更可靠
+        try:
+            with open(SSHD_CONFIG, 'a') as f:
+                f.write(config_block)
+            
+            # 6. 重启 SSHD
+            sshd_service = "sshd" if "sshd.service" in run_cmd("systemctl list-units --full -all | grep -i sshd") else "ssh"
+            run_cmd(f"sudo systemctl restart {sshd_service}")
+            return f"User {username} created/updated and SSHD restarted successfully."
+        except Exception as e:
+            return f"CMD_ERROR: Failed to write SSHD config: {e}"
+            
+    return "Invalid action."
+
+
+# --- 路由定义 (保持不变) ---
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     if request.method == 'POST':
         password = request.form['password']
-        # Note: Username is hardcoded to 'root' but password must match hash set by deploy script
-        input_hash = sha256(password.encode()).hexdigest()
-        
-        if input_hash == ADMIN_HASH:
+        if hash_password(password) == ADMIN_PASSWORD_HASH:
             session['logged_in'] = True
+            session['username'] = 'Admin'
             return redirect(url_for('index'))
         else:
-            return render_template_string(LOGIN_PAGE, error="密码错误。")
-    return render_template_string(LOGIN_PAGE, error=None)
+            flash("Invalid password", "error")
+            return redirect(url_for('login'))
+    return render_template('login.html', error=None)
 
 @app.route('/logout')
 def logout():
-    session.pop('logged_in', None)
+    session.clear()
     return redirect(url_for('login'))
 
-@app.route('/')
+
+@app.route('/', methods=['GET', 'POST'])
 def index():
-    if not session.get('logged_in'):
-        return redirect(url_for('login'))
-    
-    users = get_user_status()
-    
-    # Find active SSHD service name for display/debugging
-    if run_cmd("systemctl list-units --full -all | grep -q 'sshd.service'"):
-        service_name = "sshd"
-    else:
-        service_name = "ssh"
-        
-    return render_template_string(DASHBOARD_PAGE, users=users, sshd_service=service_name)
+    if check_auth():
+        return check_auth()
 
-@app.route('/manage', methods=['POST'])
-def manage():
-    if not session.get('logged_in'):
-        return redirect(url_for('login'))
+    # 处理用户管理动作
+    if request.method == 'POST':
+        action = request.form.get('action')
+        username = request.form.get('username')
         
-    action = request.form['action']
-    username = request.form.get('username')
-    
-    if action == 'create':
-        new_user = request.form['new_user']
-        new_pass = request.form['new_pass']
-        
-        # Security check: Prevent creating root or system users
-        if new_user in ['root', 'bin', 'daemon', 'sys', 'nobody'] or new_user.startswith('wssuser_'):
-            pass # Simple prevention, deploy script handles full logic
-        
-        # Use bash functions to manage user/sshd_config
-        # Note: SSHD config needs to be appended atomically to prevent corruption
-        
-        # 1. Create user and set password (must run as root)
-        # Using full path for adduser and chpasswd for reliability
-        run_cmd(f"/usr/sbin/adduser --disabled-password --gecos 'WSS User' {new_user} 2>/dev/null && echo '{new_user}:{new_pass}' | /usr/bin/chpasswd")
-        
-        # 2. Add SSHD config (Must be robust against f-string/template conflicts)
-        config_block = f"""
-# WSSUSER_BLOCK_START_{new_user}
-Match User {new_user} Address 127.0.0.1,::1
-    PermitTTY no
-    AllowTcpForwarding yes
-    PasswordAuthentication yes
-    AuthenticationMethods password
-# WSSUSER_BLOCK_END_{new_user}
-"""
-        # Run command to remove old block and append new one (Line 151 fix)
-        # FIX: The sed command needs proper escaping for the literal curly braces.
-        # We need to escape the user variable name, but the original issue was with the literal brace after the variable.
-        run_cmd(f"sudo sed -i '/# WSSUSER_BLOCK_START_{new_user}}}/d; /# WSSUSER_BLOCK_END_{new_user}}}/d' {SSHD_CONFIG}") # <- Final fix
-        run_cmd(f"echo '{config_block}' | sudo tee -a {SSHD_CONFIG}")
-        
-        sshd_restart()
-        
-    elif action == 'delete' and username:
-        # Delete user and clean config
-        run_cmd(f"/usr/sbin/userdel -r {username} 2>/dev/null")
-        # Fix: Need to ensure sed command handles potential braces in username
-        run_cmd(f"sudo sed -i '/# WSSUSER_BLOCK_START_{username}}}/d; /# WSSUSER_BLOCK_END_{username}}}/d' {SSHD_CONFIG}")
-        sshd_restart()
+        if action == 'create_user':
+            password = request.form.get('password')
+            if not username or not password:
+                flash("Username and password are required.", "error")
+                return redirect(url_for('index'))
+            
+            result = manage_user_ssh_config(username, 'create', password)
+            if 'CMD_ERROR' in result:
+                flash(f"创建失败: {result}", "error")
+            else:
+                flash(f"用户 {username} 创建/更新成功! SSHD已重启。", "success")
 
-    elif action == 'reset' and username:
-        # Reset password
-        reset_pass = request.form['reset_pass']
-        run_cmd(f"echo '{username}:{reset_pass}' | /usr/bin/chpasswd")
+        elif action == 'delete_user':
+            result = manage_user_ssh_config(username, 'delete')
+            if 'CMD_ERROR' in result:
+                flash(f"删除失败: {result}", "error")
+            else:
+                flash(f"用户 {username} 删除成功。", "success")
         
-    elif action == 'restart_sshd':
-        sshd_restart()
+        return redirect(url_for('index'))
 
-    return redirect(url_for('index'))
+    user_data = get_user_status()
+    # 临时修复 jinja2 找不到 flash 的问题
+    try:
+        get_flashed_messages() 
+    except Exception:
+        pass
+        
+    return render_template('index.html', users=user_data, app_name='WSS Manager')
 
-# --- HTML Templates ---
-LOGIN_PAGE = """
+
+# --- Flask 模板 (内嵌 HTML) ---
+
+# 使用 Flask 的 @app.template_filter 将 HTML/CSS/JS 内嵌到 Python 脚本中
+from flask import get_flashed_messages
+from jinja2 import Markup
+
+@app.template_filter('insecure_html')
+def insecure_html(s):
+    return Markup(s)
+
+
+@app.route('/_html_template')
+def html_template():
+    return """
 <!DOCTYPE html>
-<html lang="zh">
+<html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
-    <title>WSS 管理面板 - 登录</title>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <script src="https://cdn.tailwindcss.com"></script>
-</head>
-<body class="bg-gray-100 flex items-center justify-center min-h-screen">
-    <div class="bg-white p-8 rounded-lg shadow-xl w-full max-w-md">
-        <h2 class="text-2xl font-bold text-center text-gray-800 mb-6">WSS 隧道管理面板</h2>
-        {% if error %}
-            <p class="bg-red-100 text-red-700 p-3 rounded mb-4 text-sm">{{ error }}</p>
-        {% endif %}
-        <form method="post" action="{{ url_for('login') }}">
-            <div class="mb-4">
-                <label for="username" class="block text-gray-700 text-sm font-semibold mb-2">用户名</label>
-                <input type="text" id="username" name="username" value="root" readonly class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 bg-gray-200 cursor-not-allowed leading-tight focus:outline-none focus:shadow-outline">
-            </div>
-            <div class="mb-6">
-                <label for="password" class="block text-gray-700 text-sm font-semibold mb-2">密码</label>
-                <input type="password" id="password" name="password" required class="shadow appearance-none border rounded w-full py-2 px-3 text-gray-700 leading-tight focus:outline-none focus:shadow-outline">
-            </div>
-            <div class="flex items-center justify-between">
-                <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded focus:outline-none focus:shadow-outline w-full transition duration-150">
-                    登录
-                </button>
-            </div>
-        </form>
-    </div>
-</body>
-</html>
-"""
-
-DASHBOARD_PAGE = """
-<!DOCTYPE html>
-<html lang="zh">
-<head>
-    <meta charset="UTF-8">
-    <title>WSS 管理面板 - 仪表盘</title>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WSS Manager</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        .online { color: #10B981; }
-        .offline { color: #F59E0B; }
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; background-color: #0d1117; color: #c9d1d9; }
+        .card { background-color: #161b22; border: 1px solid #30363d; border-radius: 8px;}
+        .btn-primary { background-color: #238636; color: white; transition: background-color 0.2s; border-radius: 6px;}
+        .btn-primary:hover { background-color: #2ea043; }
+        .btn-danger { background-color: #da3633; color: white; transition: background-color 0.2s; border-radius: 6px;}
+        .btn-danger:hover { background-color: #f85149; }
+        input[type="text"], input[type="password"] { background-color: #0d1117; border: 1px solid #30363d; color: #c9d1d9; border-radius: 6px; }
+        .success { background-color: #23863622; border-left: 4px solid #238636; color: #56d364; }
+        .error { background-color: #da363322; border-left: 4px solid #da3633; color: #f85149; }
+        .online-dot { background-color: #56d364; }
+        .offline-dot { background-color: #f85149; }
     </style>
 </head>
-<body class="bg-gray-100">
-    <div class="container mx-auto p-4 sm:p-8">
-        <div class="flex justify-between items-center mb-6">
-            <h1 class="text-3xl font-extrabold text-gray-900">WSS 隧道管理面板</h1>
-            <div class="space-x-2">
-                <form method="POST" action="{{ url_for('manage') }}" class="inline">
-                    <input type="hidden" name="action" value="restart_sshd">
-                    <button type="submit" class="bg-red-500 hover:bg-red-600 text-white text-sm py-2 px-3 rounded shadow-md transition duration-150">
-                        重启 SSHD (当前: {{ sshd_service }})
-                    </button>
-                </form>
-                <a href="{{ url_for('logout') }}" class="bg-gray-500 hover:bg-gray-600 text-white text-sm py-2 px-3 rounded shadow-md transition duration-150">
-                    退出
-                </button>
-                </a>
+<body>
+
+<!-- Base Template Wrapper -->
+<div class="container mx-auto p-4 md:p-8">
+    <div class="flex justify-between items-center mb-6">
+        <h1 class="text-3xl font-bold text-white">{{ app_name if app_name is defined else 'WSS Manager' }}</h1>
+        {% if session.logged_in %}
+        <a href="{{ url_for('logout') }}" class="text-sm text-gray-400 hover:text-white transition duration-150">退出 (Admin)</a>
+        {% endif %}
+    </div>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+            <div class="mb-4">
+                {% for category, message in messages %}
+                    <div class="p-3 mb-2 rounded-md text-sm {{ 'error' if category == 'error' else 'success' }}">
+                        {{ message|insecure_html }}
+                    </div>
+                {% endfor %}
             </div>
+        {% endif %}
+    {% endwith %}
+
+    {% if error is defined %}
+        <!-- Login Template -->
+        <div class="flex items-center justify-center min-h-[calc(100vh-100px)]">
+            <div class="card p-8 rounded-lg shadow-xl w-full max-w-md">
+                <h2 class="text-2xl font-bold mb-6 text-center text-white">管理员登录</h2>
+                <form method="POST">
+                    <div class="mb-4">
+                        <label for="password" class="block text-sm font-medium mb-1">密码</label>
+                        <input type="password" name="password" id="password" required class="w-full p-3 rounded-md focus:outline-none focus:ring-2 focus:ring-[#238636]">
+                    </div>
+                    <button type="submit" class="btn-primary w-full p-3 rounded-md font-semibold">登录</button>
+                </form>
+            </div>
+        </div>
+        <!-- End Login Template -->
+    {% endif %}
+
+    {% if users is defined %}
+        <!-- Index Template -->
+        
+        <!-- 用户列表 -->
+        <h2 class="text-xl font-semibold mb-3">隧道用户列表 (UID >= 1000)</h2>
+        <div class="overflow-x-auto card rounded-lg shadow-lg mb-8">
+            <table class="min-w-full divide-y divide-[#30363d]">
+                <thead class="bg-[#161b22]">
+                    <tr>
+                        <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">状态</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">用户名</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">在线时长</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">流量限制</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">流量使用</th>
+                        <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">操作</th>
+                    </tr>
+                </thead>
+                <tbody class="divide-y divide-[#30363d]">
+                    {% for user in users %}
+                    <tr class="hover:bg-[#21262d] transition duration-150">
+                        <td class="px-6 py-4 whitespace-nowrap">
+                            <span class="h-3 w-3 rounded-full inline-block mr-2 {{ 'online-dot' if user.is_online else 'offline-dot' }}"></span>
+                            {{ '在线' if user.is_online else '离线' }}
+                        </td>
+                        <td class="px-6 py-4 whitespace-nowrap font-medium">{{ user.username }}</td>
+                        <td class="px-6 py-4 whitespace-nowrap">{{ user.last_login }}</td>
+                        <td class="px-6 py-4 whitespace-nowrap text-green-400">{{ user.data_limit }}</td>
+                        <td class="px-6 py-4 whitespace-nowrap text-red-400">{{ user.data_used }}</td>
+                        <td class="px-6 py-4 whitespace-nowrap">
+                            <form method="POST" class="inline" onsubmit="return confirm('确认删除用户 {{ user.username }}? 这将删除其系统账户和所有配置。');">
+                                <input type="hidden" name="action" value="delete_user">
+                                <input type="hidden" name="username" value="{{ user.username }}">
+                                <button type="submit" class="btn-danger p-2 text-xs rounded-md">删除</button>
+                            </form>
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr>
+                        <td colspan="6" class="px-6 py-4 text-center text-gray-500">
+                            当前没有隧道用户。请在下方创建。
+                        </td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
         </div>
 
-        <div class="bg-white p-6 rounded-xl shadow-lg mb-8">
-            <h2 class="text-xl font-bold text-gray-800 mb-4">用户列表 ({{ users|length }} 个用户)</h2>
-            <div class="overflow-x-auto">
-                <table class="min-w-full divide-y divide-gray-200">
-                    <thead class="bg-gray-50">
-                        <tr>
-                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">用户名</th>
-                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">状态</th>
-                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">总流量 (模拟)</th>
-                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">到期时间 (模拟)</th>
-                            <th class="px-6 py-3 text-center text-xs font-medium text-gray-500 uppercase tracking-wider">操作</th>
-                        </tr>
-                    </thead>
-                    <tbody class="bg-white divide-y divide-gray-200">
-                        {% for username, user in users.items() %}
-                        <tr class="hover:bg-gray-50">
-                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{{ username }}</td>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium">
-                                <span class="{% if user.status == 'Online' %}online{% else %}offline{% endif %}">
-                                    {{ user.status }}
-                                </span>
-                            </td>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{{ user.traffic }}</td>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{{ user.expiry }}</td>
-                            <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium space-x-2 flex justify-center">
-                                
-                                <button onclick="document.getElementById('reset-{{ username }}').style.display='table-row'" class="text-indigo-600 hover:text-indigo-900 text-xs py-1 px-2 rounded border border-indigo-600 transition duration-150">
-                                    重置密码
-                                </button>
-                                
-                                <form method="POST" action="{{ url_for('manage') }}" class="inline" onsubmit="return confirm('确认删除用户 {{ username }}?');">
-                                    <input type="hidden" name="action" value="delete">
-                                    <input type="hidden" name="username" value="{{ username }}">
-                                    <button type="submit" class="text-red-600 hover:text-red-900 text-xs py-1 px-2 rounded border border-red-600 transition duration-150">
-                                        删除
-                                    </button>
-                                </form>
-                            </td>
-                        </tr>
-                        <!-- Reset Password Modal -->
-                        <tr id="reset-{{ username }}" class="hidden bg-yellow-50">
-                            <td colspan="5" class="p-4">
-                                <form method="POST" action="{{ url_for('manage') }}" class="flex items-center space-x-3">
-                                    <input type="hidden" name="action" value="reset">
-                                    <input type="hidden" name="username" value="{{ username }}">
-                                    <label class="text-sm font-medium text-gray-700">新密码:</label>
-                                    <input type="password" name="reset_pass" required class="shadow-sm border border-gray-300 rounded p-1 text-sm focus:ring-indigo-500 focus:border-indigo-500 w-48">
-                                    <button type="submit" class="bg-yellow-500 hover:bg-yellow-600 text-white text-sm py-1 px-3 rounded shadow-md transition duration-150">
-                                        确认重置
-                                    </button>
-                                    <button type="button" onclick="document.getElementById('reset-{{ username }}').style.display='none'" class="text-gray-500 hover:text-gray-700 text-sm">
-                                        取消
-                                    </button>
-                                </form>
-                            </td>
-                        </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-            </div>
-        </div>
-        
-        <!-- Add User Form -->
-        <div class="bg-white p-6 rounded-xl shadow-lg">
-            <h2 class="text-xl font-bold text-gray-800 mb-4">添加新用户</h2>
-            <form method="POST" action="{{ url_for('manage') }}" class="space-y-4">
-                <input type="hidden" name="action" value="create">
-                <div class="flex space-x-4">
-                    <div class="w-1/2">
-                        <label for="new_user" class="block text-sm font-medium text-gray-700">用户名 (例如: wssuser01)</label>
-                        <input type="text" name="new_user" id="new_user" required pattern="^[a-zA-Z0-9_]{3,16}$" title="用户名只能包含字母、数字和下划线，长度3-16位" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-blue-500 focus:border-blue-500">
-                    </div>
-                    <div class="w-1/2">
-                        <label for="new_pass" class="block text-sm font-medium text-gray-700">密码</label>
-                        <input type="password" name="new_pass" id="new_pass" required class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-blue-500 focus:border-blue-500">
-                    </div>
+        <!-- 添加用户 -->
+        <div class="mt-8 card p-6 rounded-lg">
+            <h2 class="text-xl font-semibold mb-4">添加/更新隧道用户</h2>
+            <form method="POST" class="space-y-4">
+                <input type="hidden" name="action" value="create_user">
+                <div>
+                    <label for="new_username" class="block text-sm font-medium mb-1">用户名</label>
+                    <input type="text" name="username" id="new_username" required class="w-full p-2 rounded-md focus:outline-none focus:ring-2 focus:ring-[#238636]" placeholder="用户名 (例如: tunnel01)">
                 </div>
                 <div>
-                    <button type="submit" class="bg-green-600 hover:bg-green-700 text-white font-bold py-2 px-4 rounded shadow-md transition duration-150">
-                        创建用户并配置 SSH
-                    </button>
+                    <label for="new_password" class="block text-sm font-medium mb-1">密码</label>
+                    <input type="password" name="password" id="new_password" required class="w-full p-2 rounded-md focus:outline-none focus:ring-2 focus:ring-[#238636]">
                 </div>
+                <button type="submit" class="btn-primary p-3 rounded-md font-semibold">创建用户并配置SSH</button>
             </form>
         </div>
-        
-        <p class="text-center text-sm text-gray-500 mt-8">
-            注意：流量和到期时间为模拟数据。实际限制需要通过手动配置 iptables 或系统定时任务实现。
-        </p>
-    </div>
+        <!-- End Index Template -->
+    {% endif %}
+
+</div>
 </body>
 </html>
-"""
+    """
+def render_template(template_name, **context):
+    from jinja2 import Environment, FileSystemLoader
+
+    # 创建一个虚拟的模板环境
+    env = Environment(loader=FileSystemLoader(os.path.dirname(__file__)))
+    
+    # 因为我们是内嵌的，所以直接从字符串加载
+    env = Environment(loader=FileSystemLoader(os.path.dirname(os.path.abspath(__file__))))
+    
+    # 这是一个简化的实现，直接将所有 HTML 作为一个模板处理
+    
+    # 获取 HTML 内容
+    html_content = html_template()
+    
+    # 修复 flash message 上下文缺失的问题 (Flask 在 index 和 login 路由会分别使用)
+    from flask import get_flashed_messages
+    context['get_flashed_messages'] = get_flashed_messages
+
+    # 模拟 Jinja 模板渲染
+    template = app.jinja_env.from_string(html_content)
+    
+    # 模拟 Flask 的 render_template 行为
+    try:
+        rendered = template.render(context)
+    except Exception as e:
+        # 如果渲染失败，返回错误提示
+        return f"JINJA RENDER ERROR: {e}"
+
+    return rendered
+
 
 if __name__ == '__main__':
+    # Flask 需要运行在 0.0.0.0 上才能从外部访问
+    # 注意：在 systemd 服务中，它会以 root 身份运行，所以 host='0.0.0.0' 是安全的。
     app.run(host='0.0.0.0', port=MANAGER_PORT, debug=False)
 
 EOF
