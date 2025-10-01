@@ -65,96 +65,103 @@ install_wss_script() {
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-import asyncio, ssl, sys, json, subprocess, os, time
+import asyncio, ssl, sys
 
 LISTEN_ADDR = '0.0.0.0'
+
+# 使用 sys.argv 获取命令行参数。如果未提供，则使用默认值
+try:
+    HTTP_PORT = int(sys.argv[1])
+except (IndexError, ValueError):
+    HTTP_PORT = 80        # 默认 HTTP 端口
+
+try:
+    TLS_PORT = int(sys.argv[2])
+except (IndexError, ValueError):
+    TLS_PORT = 443        # 默认 TLS 端口
+
+# 默认转发目标是本地 SSH 端口
 DEFAULT_TARGET = ('127.0.0.1', 41816) 
 BUFFER_SIZE = 65536
 TIMEOUT = 3600
 CERT_FILE = '/etc/stunnel/certs/stunnel.pem'
 KEY_FILE = '/etc/stunnel/certs/stunnel.key'
-PASS = ''  # WSS 隧道密钥 (X-Pass 验证)
+PASS = ''  # WSS 隧道密钥已禁用
 
 FIRST_RESPONSE = b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK\r\n\r\n'
 SWITCH_RESPONSE = b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'
-
-# 动态获取端口
-try:
-    HTTP_PORT = int(sys.argv[1])
-except (IndexError, ValueError):
-    HTTP_PORT = 80
-try:
-    TLS_PORT = int(sys.argv[2])
-except (IndexError, ValueError):
-    TLS_PORT = 443
+FORBIDDEN_RESPONSE = b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
     peer = writer.get_extra_info('peername')
     print(f"Connection from {peer} {'(TLS)' if tls else ''}")
     forwarding_started = False
-    full_request = b''
+    full_request = b'' # 用于累积 Payload 数据
 
-    # 流量统计初始化 (写入 JSON 文件)
-    start_time = time.time()
-    
     try:
         # --- 1. 握手循环 ---
         while not forwarding_started:
+            
             data = await asyncio.wait_for(reader.read(BUFFER_SIZE), timeout=TIMEOUT)
             if not data:
                 break
             
             full_request += data
+            
+            # 找到 HTTP 头部和实际数据之间的分隔符 (空行)
             header_end_index = full_request.find(b'\r\n\r\n')
             
+            # 如果尚未找到完整的头部，继续等待
             if header_end_index == -1:
-                # 头部不完整，继续等待或返回 200 OK
+                # 在没有找到完整头部时，检查是否有 WebSocket 升级关键词
                 headers_temp = full_request.decode(errors='ignore')
-                if 'Upgrade: websocket' in headers_temp:
-                    pass
+                
+                # 检查是否包含升级关键词，如果是，则继续等待完整头部
+                if 'Upgrade: websocket' in headers_temp or 'Connection: Upgrade' in headers_temp:
+                    pass # 继续累积数据，以便进行完整解析
                 else:
+                    # 如果头部不完整且没有 Upgrade，返回 200 OK，等待下一段
+                    # 这是为了兼容多段 Payload 的第一或中间几段
                     writer.write(FIRST_RESPONSE)
                     await writer.drain()
-                    full_request = b''
+                    full_request = b'' # 清空，等待下一段数据
                     continue
 
-            # 2. 头部解析
-            headers = full_request[:header_end_index].decode(errors='ignore')
-            data_to_forward = full_request[header_end_index + 4:]
+            # 头部和数据分离
+            headers = full_request[:header_end_index].decode(errors='ignore') if header_end_index != -1 else full_request.decode(errors='ignore')
+            data_to_forward = full_request[header_end_index + 4:] if header_end_index != -1 else b'' # 分离出 SSH 数据
 
             host_header = ''
             passwd_header = ''
             is_websocket_request = False
             
+            # 解析头部信息
             if 'Upgrade: websocket' in headers or 'Connection: Upgrade' in headers or 'GET-RAY' in headers:
-                 is_websocket_request = True
-                 
+                is_websocket_request = True
+            
             for line in headers.split('\r\n'):
                 if line.startswith('X-Real-Host:'):
                     host_header = line.split(':', 1)[1].strip()
                 if line.startswith('X-Pass:'):
                     passwd_header = line.split(':', 1)[1].strip()
 
-            # 3. 密码验证
-            if PASS and passwd_header != PASS:
-                writer.write(b'HTTP/1.1 400 WrongPass!\r\n\r\n')
-                await writer.drain()
-                return
-
+            # 3. 密码验证 (WSS 密钥) - 已移除
+            
             # 4. 转发触发
             if is_websocket_request:
                 writer.write(SWITCH_RESPONSE)
                 await writer.drain()
                 forwarding_started = True
             else:
+                # 如果是完整的 HTTP 请求但不是 WebSocket，返回 200 OK
                 writer.write(FIRST_RESPONSE)
                 await writer.drain()
-                full_request = b''
+                full_request = b'' # 清空，等待下一段数据
                 continue
         
         # --- 退出握手循环 ---
 
-        # 5. 解析目标 (保持对 X-Real-Host 的支持)
+        # 5. 解析目标
         if host_header:
             if ':' in host_header:
                 host, port = host_header.split(':')
@@ -162,7 +169,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             else:
                 target = (host_header.strip(), 22)
         else:
-            target = DEFAULT_TARGET
+            target = DEFAULT_TARGET # 127.0.0.1:41816
 
         # 6. 连接目标服务器
         target_reader, target_writer = await asyncio.open_connection(*target)
@@ -171,10 +178,9 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         if data_to_forward:
             target_writer.write(data_to_forward)
             await target_writer.drain()
-        
-        # 8. 转发后续数据流 (包含流量统计钩子)
-        async def pipe(src_reader, dst_writer, role):
-            bytes_transferred = 0
+            
+        # 8. 转发后续数据流
+        async def pipe(src_reader, dst_writer):
             try:
                 while True:
                     buf = await src_reader.read(BUFFER_SIZE)
@@ -182,30 +188,21 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                         break
                     dst_writer.write(buf)
                     await dst_writer.drain()
-                    bytes_transferred += len(buf)
             except Exception:
                 pass
-            
-            # --- 简易流量统计 ---
-            # 注意：这个统计是针对整个连接的，不能区分用户，仅作示例
-            # 真正的用户流量统计需要更复杂的 iptables 规则和用户身份识别
-            if role == 'upload':
-                pass # 忽略客户端上传流量
-            elif role == 'download':
-                 pass # 忽略客户端下载流量
-            # --- 简易流量统计 ---
-            
             finally:
                 dst_writer.close()
 
         await asyncio.gather(
-            pipe(reader, target_writer, 'upload'),
-            pipe(target_reader, writer, 'download')
+            pipe(reader, target_writer),
+            pipe(target_reader, writer)
         )
 
     except Exception as e:
+        # 打印异常，帮助调试
         print(f"Connection error {peer}: {e}")
-    finally:
+    
+    finally: # 修复了导致 SyntaxError 的 try/except/finally 结构
         writer.close()
         await writer.wait_closed()
         print(f"Closed {peer}")
@@ -223,6 +220,7 @@ async def main():
         print(f"ERROR loading certificate: {e}")
         return
 
+    # Start servers
     tls_server = await asyncio.start_server(
         lambda r, w: handle_client(r, w, tls=True), LISTEN_ADDR, TLS_PORT, ssl=ssl_ctx)
     http_server = await asyncio.start_server(
@@ -238,6 +236,7 @@ async def main():
 
 if __name__ == '__main__':
     asyncio.run(main())
+    
 EOF
   sudo chmod +x /usr/local/bin/wss
 
