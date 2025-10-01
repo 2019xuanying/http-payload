@@ -112,7 +112,7 @@ import time
 from datetime import datetime
 
 LISTEN_ADDR = '0.0.0.0'
-DEFAULT_TARGET = ('127.0.0.1', 41816) 
+DEFAULT_TARGET = ('127.0.0.1', 41816) # 自行配置SSH端口
 BUFFER_SIZE = 65536
 TIMEOUT = 3600
 CERT_FILE = '/etc/stunnel/certs/stunnel.pem'
@@ -300,6 +300,7 @@ accept = 0.0.0.0:$STUNNEL_PORT
 cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.pem
 connect = 127.0.0.1:41816
+# 自行配置SSH端口
 EOF
     
     log "==== 配置 SSHD (仅允许 127.0.0.1 登录) ===="
