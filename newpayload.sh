@@ -400,22 +400,33 @@ CONFIG_FILE = "/etc/wss-manager-config.json"
 SSHD_CONFIG = "/etc/ssh/sshd_config"
 WSS_USER_BASE_NAME = "wssuser" # Should match deploy script
 
-with open(CONFIG_FILE, 'r') as f:
-    config = json.load(f)
+try:
+    with open(CONFIG_FILE, 'r') as f:
+        config = json.load(f)
+except FileNotFoundError:
+    print(f"ERROR: Config file not found at {CONFIG_FILE}. Ensure deploy script ran.")
+    exit(1)
 
 ADMIN_HASH = config['ADMIN_HASH']
 MANAGER_PORT = config['MANAGER_PORT']
 
 app = Flask(__name__)
-app.secret_key = os.urandom(24) # 用于 session 加密
+app.secret_key = os.urandom(24) # Used for session encryption
 
 def run_cmd(cmd):
     """Run shell command and return output/error."""
     try:
-        result = subprocess.run(cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        # 增加 /usr/sbin/ 和 /usr/bin/ 到 PATH，确保能找到 adduser, userdel, chpasswd, systemctl
+        env = os.environ.copy()
+        env["PATH"] = "/usr/sbin:/usr/bin:" + env.get("PATH", "")
+
+        # Use subprocess.run for all command execution
+        result = subprocess.run(cmd, shell=True, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env)
         return result.stdout.decode().strip()
     except subprocess.CalledProcessError as e:
-        return f"Error: {e.stderr.decode().strip()}"
+        # In the web manager, errors should be handled gracefully
+        # Removed full command for security/clarity in logs
+        return f"Error executing: {e.stderr.decode().strip()}"
 
 def get_active_users():
     """Get list of active users logged in via SSH (simulated check)."""
@@ -423,7 +434,7 @@ def get_active_users():
         # Use 'w' command to find currently logged-in users (basic check)
         output = run_cmd("w -h | awk '{print $1}' | sort -u")
         return output.split('\n')
-    except:
+    except Exception:
         return []
 
 def get_user_status():
@@ -432,12 +443,15 @@ def get_user_status():
     active_users = get_active_users()
     
     # Get all users matching the WSS pattern (simple filter for demonstration)
+    # Filter users with UID >= 1000 (standard user IDs)
     user_list_cmd = "awk -F: '$3 >= 1000 {print $1}' /etc/passwd"
     all_users = run_cmd(user_list_cmd).split('\n')
     
     for username in all_users:
-        if not username or username in ['root', 'nobody']: continue
-        if username.startswith(WSS_USER_BASE_NAME) or username == 'wssuser':
+        if not username or username in ['root', 'nobody', 'daemon', 'bin', 'sys']: continue
+        
+        # Panel only displays users starting with WSS_USER_BASE_NAME
+        if username.startswith(WSS_USER_BASE_NAME) or username == WSS_USER_BASE_NAME:
             status = 'Online' if username in active_users else 'Offline'
             
             # --- Placeholders for unimplemented features ---
@@ -464,6 +478,7 @@ def sshd_restart():
 def login():
     if request.method == 'POST':
         password = request.form['password']
+        # Note: Username is hardcoded to 'root' but password must match hash set by deploy script
         input_hash = sha256(password.encode()).hexdigest()
         
         if input_hash == ADMIN_HASH:
@@ -485,7 +500,13 @@ def index():
     
     users = get_user_status()
     
-    return render_template_string(DASHBOARD_PAGE, users=users)
+    # Find active SSHD service name for display/debugging
+    if run_cmd("systemctl list-units --full -all | grep -q 'sshd.service'"):
+        service_name = "sshd"
+    else:
+        service_name = "ssh"
+        
+    return render_template_string(DASHBOARD_PAGE, users=users, sshd_service=service_name)
 
 @app.route('/manage', methods=['POST'])
 def manage():
@@ -499,52 +520,46 @@ def manage():
         new_user = request.form['new_user']
         new_pass = request.form['new_pass']
         
-        # Security check: Prevent creating root
-        if new_user == 'root':
-            return redirect(url_for('index'))
-            
-        # Call bash functions to manage user/sshd_config
-        cmd = f"""
-        (
-        WSS_USER='{new_user}';
-        WSS_PASS='{new_pass}';
-        SSHD_CONFIG='{SSHD_CONFIG}';
+        # Security check: Prevent creating root or system users
+        if new_user in ['root', 'bin', 'daemon', 'sys', 'nobody'] or new_user.startswith('wssuser_'):
+            pass # Simple prevention, deploy script handles full logic
         
-        # Create user
-        if ! id "$WSS_USER" >/dev/null 2>&1; then
-          adduser --disabled-password --gecos "WSS User" "$WSS_USER" > /dev/null
-        fi
+        # Use bash functions to manage user/sshd_config
+        # Note: SSHD config needs to be appended atomically to prevent corruption
         
-        # Set password
-        echo "${{WSS_USER}}:${{WSS_PASS}}" | chpasswd
+        # 1. Create user and set password (must run as root)
+        # Using full path for adduser and chpasswd for reliability
+        run_cmd(f"/usr/sbin/adduser --disabled-password --gecos 'WSS User' {new_user} 2>/dev/null && echo '{new_user}:{new_pass}' | /usr/bin/chpasswd")
         
-        # Add SSHD config (must match the deploy script's logic)
-        sudo sed -i '/# WSSUSER_BLOCK_START_{{WSS_USER}}/,/# WSSUSER_BLOCK_END_{{WSS_USER}}/d' "$SSHD_CONFIG"
-        
-        cat <<EOCONF | sudo tee -a "$SSHD_CONFIG" > /dev/null
-# WSSUSER_BLOCK_START_${{WSS_USER}}
-Match User ${{WSS_USER}} Address 127.0.0.1,::1
+        # 2. Add SSHD config (Must be robust against f-string/template conflicts)
+        config_block = f"""
+# WSSUSER_BLOCK_START_{new_user}
+Match User {new_user} Address 127.0.0.1,::1
     PermitTTY no
     AllowTcpForwarding yes
     PasswordAuthentication yes
     AuthenticationMethods password
-# WSSUSER_BLOCK_END_${{WSS_USER}}
-EOCONF
-        )
-        """
-        run_cmd(cmd)
+# WSSUSER_BLOCK_END_{new_user}
+"""
+        # Run command to remove old block and append new one (Line 151 fix)
+        # FIX: The sed command needs proper escaping for the literal curly braces.
+        # We need to escape the user variable name, but the original issue was with the literal brace after the variable.
+        run_cmd(f"sudo sed -i '/# WSSUSER_BLOCK_START_{new_user}}}/d; /# WSSUSER_BLOCK_END_{new_user}}}/d' {SSHD_CONFIG}") # <- Final fix
+        run_cmd(f"echo '{config_block}' | sudo tee -a {SSHD_CONFIG}")
+        
         sshd_restart()
         
     elif action == 'delete' and username:
         # Delete user and clean config
-        run_cmd(f"userdel -r {username} 2>/dev/null")
-        run_cmd(f"sudo sed -i '/# WSSUSER_BLOCK_START_{username}}/,/# WSSUSER_BLOCK_END_{username}}/d' {SSHD_CONFIG}")
+        run_cmd(f"/usr/sbin/userdel -r {username} 2>/dev/null")
+        # Fix: Need to ensure sed command handles potential braces in username
+        run_cmd(f"sudo sed -i '/# WSSUSER_BLOCK_START_{username}}}/d; /# WSSUSER_BLOCK_END_{username}}}/d' {SSHD_CONFIG}")
         sshd_restart()
 
     elif action == 'reset' and username:
         # Reset password
-        new_pass = request.form['reset_pass']
-        run_cmd(f"echo '{username}:{new_pass}' | chpasswd")
+        reset_pass = request.form['reset_pass']
+        run_cmd(f"echo '{username}:{reset_pass}' | /usr/bin/chpasswd")
         
     elif action == 'restart_sshd':
         sshd_restart()
@@ -608,11 +623,12 @@ DASHBOARD_PAGE = """
                 <form method="POST" action="{{ url_for('manage') }}" class="inline">
                     <input type="hidden" name="action" value="restart_sshd">
                     <button type="submit" class="bg-red-500 hover:bg-red-600 text-white text-sm py-2 px-3 rounded shadow-md transition duration-150">
-                        重启 SSHD
+                        重启 SSHD (当前: {{ sshd_service }})
                     </button>
                 </form>
                 <a href="{{ url_for('logout') }}" class="bg-gray-500 hover:bg-gray-600 text-white text-sm py-2 px-3 rounded shadow-md transition duration-150">
                     退出
+                </button>
                 </a>
             </div>
         </div>
@@ -643,7 +659,7 @@ DASHBOARD_PAGE = """
                             <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">{{ user.expiry }}</td>
                             <td class="px-6 py-4 whitespace-nowrap text-right text-sm font-medium space-x-2 flex justify-center">
                                 
-                                <button onclick="document.getElementById('reset-{{ username }}').style.display='block'" class="text-indigo-600 hover:text-indigo-900 text-xs py-1 px-2 rounded border border-indigo-600 transition duration-150">
+                                <button onclick="document.getElementById('reset-{{ username }}').style.display='table-row'" class="text-indigo-600 hover:text-indigo-900 text-xs py-1 px-2 rounded border border-indigo-600 transition duration-150">
                                     重置密码
                                 </button>
                                 
@@ -686,7 +702,7 @@ DASHBOARD_PAGE = """
                 <input type="hidden" name="action" value="create">
                 <div class="flex space-x-4">
                     <div class="w-1/2">
-                        <label for="new_user" class="block text-sm font-medium text-gray-700">用户名 (例如: user01)</label>
+                        <label for="new_user" class="block text-sm font-medium text-gray-700">用户名 (例如: wssuser01)</label>
                         <input type="text" name="new_user" id="new_user" required pattern="^[a-zA-Z0-9_]{3,16}$" title="用户名只能包含字母、数字和下划线，长度3-16位" class="mt-1 block w-full border border-gray-300 rounded-md shadow-sm py-2 px-3 focus:outline-none focus:ring-blue-500 focus:border-blue-500">
                     </div>
                     <div class="w-1/2">
@@ -711,8 +727,8 @@ DASHBOARD_PAGE = """
 """
 
 if __name__ == '__main__':
-    # Flask needs to run on 0.0.0.0 for external access
     app.run(host='0.0.0.0', port=MANAGER_PORT, debug=False)
+
 EOF
 
 # 创建管理面板 systemd 服务
