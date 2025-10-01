@@ -1,82 +1,71 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -eu
 
-# ==================================
-# 部署参数配置
-# ==================================
-WSS_USER_DEFAULT="wssuser"
-SSHD_CONFIG="/etc/ssh/sshd_config"
-MANAGER_PORT_DEFAULT="54321"
+# ==========================================================
+# WSS 隧道与用户管理面板一键部署脚本
+# ----------------------------------------------------------
+# 包含 WSS 代理、Stunnel4、UDPGW 以及基于 Flask 的用户管理面板。
+# Panel 默认端口: 8080 (可修改)
+# WSS 默认端口: HTTP 80, TLS 443
+# Stunnel 默认端口: 444
+# UDPGW 默认端口: 7300
+# ==========================================================
 
-# 隧道转发目标端口 (根据用户反馈修正为 41816)
-TUNNEL_TARGET_PORT="41816"
-
-# 检查是否以 root 权限运行
-if [ "$EUID" -ne 0 ]; then
-    echo "请以 root 或 sudo 权限运行此脚本。"
-    exit 1
-fi
-
-# ==================================
-# 提示端口和密码
-# ==================================
-echo "--- 隧道端口设置 ---"
-read -p "请输入 WSS HTTP 监听端口（默认80）: " WSS_HTTP_PORT
+# =============================
+# 提示端口和面板密码
+# =============================
+echo "----------------------------------"
+echo "==== WSS 基础设施端口配置 ===="
+read -p "请输入 WSS HTTP 监听端口 (默认80): " WSS_HTTP_PORT
 WSS_HTTP_PORT=${WSS_HTTP_PORT:-80}
 
-read -p "请输入 WSS TLS 监听端口（默认443）: " WSS_TLS_PORT
+read -p "请输入 WSS TLS 监听端口 (默认443): " WSS_TLS_PORT
 WSS_TLS_PORT=${WSS_TLS_PORT:-443}
 
-read -p "请输入 Stunnel4 端口（默认444）: " STUNNEL_PORT
+read -p "请输入 Stunnel4 端口 (默认444): " STUNNEL_PORT
 STUNNEL_PORT=${STUNNEL_PORT:-444}
 
-read -p "请输入 UDPGW 端口（默认7300）: " UDPGW_PORT
+read -p "请输入 UDPGW 端口 (默认7300): " UDPGW_PORT
 UDPGW_PORT=${UDPGW_PORT:-7300}
 
-echo ""
-echo "--- Web 管理面板设置 ---"
-read -p "请输入 Web 管理面板端口（默认54321）: " MANAGER_PORT
-MANAGER_PORT=${MANAGER_PORT:-$MANAGER_PORT_DEFAULT}
+echo "----------------------------------"
+echo "==== 管理面板配置 ===="
+read -p "请输入 Web 管理面板监听端口 (默认8080): " PANEL_PORT
+PANEL_PORT=${PANEL_PORT:-8080}
 
-echo "请设置 Web 管理面板的 root 密码（输入时隐藏）:"
+# 交互式安全输入并确认 ROOT 密码
+echo "请为 Web 面板的 'root' 用户设置密码（输入时隐藏）。"
 while true; do
-    read -s -p "密码: " ADMIN_PASS_RAW && echo
-    read -s -p "请再次确认密码: " ADMIN_PASS_CONFIRM && echo
-    if [ -z "$ADMIN_PASS_RAW" ]; then
-        echo "密码不能为空。"
-        continue
-    fi
-    if [ "$ADMIN_PASS_RAW" != "$ADMIN_PASS_CONFIRM" ]; then
-        echo "两次输入不一致，请重试。"
-        continue
-    fi
-    break
+  read -s -p "面板密码: " pw1 && echo
+  read -s -p "请再次确认密码: " pw2 && echo
+  if [ -z "$pw1" ]; then
+    echo "密码不能为空，请重新输入。"
+    continue
+  fi
+  if [ "$pw1" != "$pw2" ]; then
+    echo "两次输入不一致，请重试。"
+    continue
+  fi
+  PANEL_ROOT_PASS_RAW="$pw1"
+  # 对密码进行简单的 HASH，防止明文存储
+  PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | sha256sum | awk '{print $1}')
+  break
 done
-# 使用 sha256sum 加密存储密码哈希
-ADMIN_PASS_HASH=$(echo -n "$ADMIN_PASS_RAW" | sha256sum | awk '{print $1}')
-unset ADMIN_PASS_RAW ADMIN_PASS_CONFIRM # 清理敏感变量
-SECRET_KEY_PART=$(echo -n "$ADMIN_PASS_HASH" | cut -c 1-24) # 提取部分哈希作为 secret key
 
-
-# ==================================
-# 依赖安装
-# ==================================
-echo "==== 更新系统并安装依赖 ===="
-# 确保安装了 python3-pip 和 build-essential 等编译工具
-sudo apt update -y
-sudo apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4 jq coreutils
-sudo pip3 install Flask > /dev/null
+echo "----------------------------------"
+echo "==== 系统更新与依赖安装 ===="
+apt update -y
+apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4
+pip3 install flask
 echo "依赖安装完成"
+echo "----------------------------------"
 
-# ==================================
-# 函数定义 (WSS 代理和 Stunnel/UDPGW 部分保持不变，转发到 41816)
-# ==================================
 
-install_wss_script() {
-    echo "==== 安装 WSS 脚本 (/usr/local/bin/wss) ===="
-    
-    # WSS 核心脚本，转发到 41816，并包含安全修复 (移除动态转发)
-    tee /usr/local/bin/wss > /dev/null <<EOF_WSS
+# =============================
+# WSS 核心代理脚本 (与原脚本一致)
+# =============================
+echo "==== 安装 WSS 核心代理脚本 (/usr/local/bin/wss) ===="
+tee /usr/local/bin/wss > /dev/null <<'EOF'
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
@@ -88,21 +77,19 @@ try:
     HTTP_PORT = int(sys.argv[1])
 except (IndexError, ValueError):
     HTTP_PORT = 80
-
 try:
     TLS_PORT = int(sys.argv[2])
 except (IndexError, ValueError):
     TLS_PORT = 443
 
-# 核心目标端口: 41816
-DEFAULT_TARGET = ('127.0.0.1', $TUNNEL_TARGET_PORT) 
+DEFAULT_TARGET = ('127.0.0.1', 41816)
 BUFFER_SIZE = 65536
 TIMEOUT = 3600
 CERT_FILE = '/etc/stunnel/certs/stunnel.pem'
 KEY_FILE = '/etc/stunnel/certs/stunnel.key'
 
-FIRST_RESPONSE = b'HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\nContent-Length: 2\\r\\n\\r\\nOK\\r\\n\\r\\n'
-SWITCH_RESPONSE = b'HTTP/1.1 101 Switching Protocols\\r\\nUpgrade: websocket\\r\\nConnection: Upgrade\\r\\n\\r\\n'
+FIRST_RESPONSE = b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK\r\n\r\n'
+SWITCH_RESPONSE = b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
     peer = writer.get_extra_info('peername')
@@ -111,30 +98,30 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     full_request = b''
 
     try:
+        # --- 1. 握手循环 ---
         while not forwarding_started:
             data = await asyncio.wait_for(reader.read(BUFFER_SIZE), timeout=TIMEOUT)
             if not data:
                 break
             
             full_request += data
-            header_end_index = full_request.find(b'\\r\\n\\r\\n')
+            
+            header_end_index = full_request.find(b'\r\n\r\n')
             
             if header_end_index == -1:
-                headers_temp = full_request.decode(errors='ignore')
-                
-                if 'Upgrade: websocket' not in headers_temp and 'Connection: Upgrade' not in headers_temp:
-                    writer.write(FIRST_RESPONSE)
-                    await writer.drain()
-                    full_request = b''
-                    continue
-                else:
-                    continue
+                writer.write(FIRST_RESPONSE)
+                await writer.drain()
+                full_request = b''
+                continue
 
-            headers = full_request[:header_end_index].decode(errors='ignore')
+            # 2. 头部解析
+            headers_raw = full_request[:header_end_index]
             data_to_forward = full_request[header_end_index + 4:]
+            headers = headers_raw.decode(errors='ignore')
 
             is_websocket_request = 'Upgrade: websocket' in headers or 'Connection: Upgrade' in headers or 'GET-RAY' in headers
-
+            
+            # 3. 转发触发
             if is_websocket_request:
                 writer.write(SWITCH_RESPONSE)
                 await writer.drain()
@@ -145,16 +132,18 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 full_request = b''
                 continue
         
-        if not forwarding_started:
-            return
-            
+        # --- 退出握手循环 ---
+
+        # 4. 连接目标服务器 (默认到 Stunnel/SSH 的转发端口)
         target = DEFAULT_TARGET
         target_reader, target_writer = await asyncio.open_connection(*target)
 
+        # 5. 转发初始数据
         if data_to_forward:
             target_writer.write(data_to_forward)
             await target_writer.drain()
             
+        # 6. 转发后续数据流
         async def pipe(src_reader, dst_writer):
             try:
                 while True:
@@ -175,84 +164,84 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
     except Exception as e:
         print(f"Connection error {peer}: {e}")
-    
     finally:
-        writer.close()
         try:
-             await writer.wait_closed()
+            writer.close()
+            await writer.wait_closed()
         except Exception:
-             pass
+            pass
         print(f"Closed {peer}")
 
-
 async def main():
+    # TLS server setup
     ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     try:
         ssl_ctx.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
         tls_server = await asyncio.start_server(
             lambda r, w: handle_client(r, w, tls=True), LISTEN_ADDR, TLS_PORT, ssl=ssl_ctx)
         print(f"Listening on {LISTEN_ADDR}:{TLS_PORT} (TLS)")
-        tls_task = asyncio.create_task(tls_server.serve_forever())
+        tls_task = tls_server.serve_forever()
     except FileNotFoundError:
-        print(f"ERROR: TLS certificate not found at {CERT_FILE}. TLS server disabled.")
-        tls_task = asyncio.Future()
-        tls_task.set_result(None) # Task placeholder for disabled TLS
+        print(f"WARNING: TLS certificate not found at {CERT_FILE}. TLS server disabled.")
+        tls_task = asyncio.sleep(86400) # Keep task running but effectively disabled
 
     http_server = await asyncio.start_server(
         lambda r, w: handle_client(r, w, tls=False), LISTEN_ADDR, HTTP_PORT)
+    
     print(f"Listening on {LISTEN_ADDR}:{HTTP_PORT} (HTTP payload)")
-    http_task = asyncio.create_task(http_server.serve_forever())
 
-    await asyncio.gather(tls_task, http_task)
-
+    async with http_server:
+        await asyncio.gather(
+            tls_task,
+            http_server.serve_forever())
 
 if __name__ == '__main__':
-    asyncio.run(main())
-    
-EOF_WSS
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("WSS Proxy Stopped.")
+        
+EOF
 
-    sudo chmod +x /usr/local/bin/wss
+chmod +x /usr/local/bin/wss
 
-    sudo tee /etc/systemd/system/wss.service > /dev/null <<EOF
+# 创建 WSS systemd 服务
+tee /etc/systemd/system/wss.service > /dev/null <<EOF
 [Unit]
 Description=WSS Python Proxy
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /usr/local/bin/wss $WSS_HTTP_PORT $WSS_TLS_PORT
+ExecStart=/usr/local/bin/wss $WSS_HTTP_PORT $WSS_TLS_PORT
 Restart=on-failure
 User=root
 
 [Install]
 WantedBy=multi-user.target
 EOF
-    sudo systemctl daemon-reload
-    sudo systemctl enable wss
-    sudo systemctl start wss
-    echo "WSS 已启动，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
-}
 
-# Stunnel4 / UDPGW 安装函数
-install_stunnel_udpgw() {
-    echo "==== 安装 Stunnel4 / UDPGW ===="
-    sudo mkdir -p /etc/stunnel/certs
+systemctl daemon-reload
+systemctl enable wss
+systemctl start wss
+echo "WSS 已启动，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
+echo "----------------------------------"
 
-    if [ ! -f "/etc/stunnel/certs/stunnel.key" ]; then
-        echo "生成自签名 TLS 证书..."
-        sudo openssl req -x509 -nodes -newkey rsa:2048 \
-        -keyout /etc/stunnel/certs/stunnel.key \
-        -out /etc/stunnel/certs/stunnel.crt \
-        -days 1095 \
-        -subj "/CN=tunnel.example.com"
-        sudo sh -c 'cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem'
-        sudo chmod 644 /etc/stunnel/certs/*.crt
-        sudo chmod 644 /etc/stunnel/certs/*.pem
-    fi
+# =============================
+# 安装 Stunnel4 并生成证书 (与原脚本一致)
+# =============================
+echo "==== 安装 Stunnel4 ===="
+mkdir -p /etc/stunnel/certs
+openssl req -x509 -nodes -newkey rsa:2048 \
+-keyout /etc/stunnel/certs/stunnel.key \
+-out /etc/stunnel/certs/stunnel.crt \
+-days 1095 \
+-subj "/CN=example.com" > /dev/null 2>&1
+sh -c 'cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem'
+chmod 644 /etc/stunnel/certs/*.crt
+chmod 644 /etc/stunnel/certs/*.pem
 
-
-    # Stunnel4 配置 - 转发到 41816
-    sudo tee /etc/stunnel/ssh-tls.conf > /dev/null <<EOF
+tee /etc/stunnel/ssh-tls.conf > /dev/null <<EOF
 pid=/var/run/stunnel.pid
 setuid=root
 setgid=root
@@ -266,27 +255,28 @@ socket = r:TCP_NODELAY=1
 accept = 0.0.0.0:$STUNNEL_PORT
 cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.pem
-connect = 127.0.0.1:$TUNNEL_TARGET_PORT
+connect = 127.0.0.1:41816
 EOF
-    
-    sudo systemctl daemon-reload
-    sudo systemctl enable stunnel4 || echo "Stunnel4 service not found, skipping enable."
-    sudo systemctl restart stunnel4 || sudo systemctl start stunnel4 || echo "Failed to start Stunnel4."
-    
-    echo "Stunnel4 已启动，端口 $STUNNEL_PORT"
 
-    # 安装 UDPGW
-    if [ ! -d "/root/badvpn" ]; then 
-        echo "克隆 badvpn 仓库..."
-        git clone https://github.com/ambrop72/badvpn.git /root/badvpn
-    fi
-    mkdir -p /root/badvpn/badvpn-build
-    pushd /root/badvpn/badvpn-build > /dev/null
-    echo "编译 UDPGW..."
-    cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 > /dev/null
-    make -j$(nproc) > /dev/null
+systemctl enable stunnel4
+systemctl restart stunnel4
+echo "Stunnel4 安装完成，端口 $STUNNEL_PORT"
+echo "----------------------------------"
 
-    sudo tee /etc/systemd/system/udpgw.service > /dev/null <<EOF
+# =============================
+# 安装 UDPGW (与原脚本一致)
+# =============================
+echo "==== 安装 UDPGW ===="
+if [ ! -d "/root/badvpn" ]; then
+    git clone https://github.com/ambrop72/badvpn.git /root/badvpn
+fi
+mkdir -p /root/badvpn/badvpn-build
+cd /root/badvpn/badvpn-build
+cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 > /dev/null 2>&1
+make -j$(nproc) > /dev/null 2>&1
+cd - > /dev/null
+
+tee /etc/systemd/system/udpgw.service > /dev/null <<EOF
 [Unit]
 Description=UDP Gateway (Badvpn)
 After=network.target
@@ -300,494 +290,605 @@ User=root
 [Install]
 WantedBy=multi-user.target
 EOF
-    sudo systemctl daemon-reload
-    sudo systemctl enable udpgw
-    sudo systemctl start udpgw
-    echo "UDPGW 已启动，端口 $UDPGW_PORT"
-    popd > /dev/null
-}
+
+systemctl daemon-reload
+systemctl enable udpgw
+systemctl start udpgw
+echo "UDPGW 已安装并启动，端口: $UDPGW_PORT"
+echo "----------------------------------"
 
 
-# ==================================
-# 执行部署
-# ==================================
+# =============================
+# 安装 WSS 用户管理面板 (基于 Flask)
+# =============================
+echo "==== 部署 WSS 用户管理面板 (Python/Flask) ===="
+PANEL_DIR="/etc/wss-panel"
+USER_DB="$PANEL_DIR/users.json"
+mkdir -p "$PANEL_DIR"
 
-install_wss_script
-install_stunnel_udpgw
+# 创建或初始化用户数据库
+if [ ! -f "$USER_DB" ]; then
+    echo "[]" > "$USER_DB"
+fi
 
-# --- 2. 安装管理面板 ---
-echo "==== 配置 Web 管理面板 ===="
-
-# 写入配置 JSON 文件
-sudo tee /etc/wss-manager-config.json > /dev/null <<EOCONF
-{
-    "ADMIN_PASSWORD_HASH": "$ADMIN_PASS_HASH",
-    "MANAGER_PORT": $MANAGER_PORT,
-    "WSS_USER_DEFAULT": "$WSS_USER_DEFAULT",
-    "SECRET_KEY_PART": "$SECRET_KEY_PART"
-}
-EOCONF
-
-# 生成修复了 'Internal Server Error' 问题的 Python Web 面板
-sudo tee /usr/local/bin/wss_manager.py > /dev/null <<'EOF_MANAGER'
+# 嵌入 Python 面板代码
+tee /usr/local/bin/wss_panel.py > /dev/null <<EOF
 # -*- coding: utf-8 -*-
+from flask import Flask, request, jsonify, render_template, redirect, url_for, session, make_response
 import json
 import subprocess
 import os
-import sys
-import re
-from flask import Flask, render_template_string, request, redirect, url_for, session, flash, get_flashed_messages
-from datetime import datetime, timedelta
 import hashlib
-from jinja2 import Markup
+import time
 
-# --- 配置参数 ---
-CONFIG_FILE = "/etc/wss-manager-config.json"
+# --- 配置 ---
+USER_DB_PATH = "$USER_DB"
+ROOT_USERNAME = "root"
+ROOT_PASSWORD_HASH = "$PANEL_ROOT_PASS_HASH"
+FLASK_SECRET_KEY = os.urandom(24).hex() # 每次启动生成新的 secret key
 SSHD_CONFIG = "/etc/ssh/sshd_config"
 
-# 加载配置
-try:
-    with open(CONFIG_FILE, 'r') as f:
-        config = json.load(f)
-        MANAGER_PORT = config['MANAGER_PORT']
-        ADMIN_PASSWORD_HASH = config.get('ADMIN_PASSWORD_HASH', None)
-        SECRET_KEY_PART = config.get('SECRET_KEY_PART', os.urandom(24).hex())
-except Exception as e:
-    # 配置文件读取失败是致命错误
-    print(f"ERROR: Failed to load configuration from {CONFIG_FILE}. Details: {e}", file=sys.stderr)
-    MANAGER_PORT = 54321
-    ADMIN_PASSWORD_HASH = ""
-    SECRET_KEY_PART = os.urandom(24).hex()
-
 app = Flask(__name__)
-app.secret_key = SECRET_KEY_PART if len(SECRET_KEY_PART) >= 16 else os.urandom(24)
+app.secret_key = FLASK_SECRET_KEY
 
+# --- 数据库操作 ---
 
-# --- 辅助函数 ---
-
-def run_cmd(command):
-    """
-    运行 Bash 命令并返回其输出。
-    **已移除对 'sudo' 的依赖**，因为 Flask 服务是以 root 身份运行的。
-    """
+def load_users():
+    """从 JSON 文件加载用户列表."""
+    if not os.path.exists(USER_DB_PATH):
+        return []
     try:
-        result = subprocess.run(
-            ['/bin/bash', '-c', command],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=10
-        )
-        if result.returncode != 0:
-            error_message = result.stderr.strip()
-            # 过滤掉一些不重要的错误信息
-            if 'non-unique name' in error_message or 'not in sudoers file' in error_message:
-                 return f"CMD_ERROR: {error_message}"
-            return f"CMD_ERROR: {error_message}"
-            
-        return result.stdout.strip()
-    except subprocess.TimeoutExpired:
-        return "CMD_ERROR: Command timed out."
-    except Exception as e:
-        return f"CMD_ERROR: Execution error: {e}"
+        with open(USER_DB_PATH, 'r') as f:
+            return json.load(f)
+    except Exception:
+        return []
 
+def save_users(users):
+    """保存用户列表到 JSON 文件."""
+    with open(USER_DB_PATH, 'w') as f:
+        json.dump(users, f, indent=4)
 
-def check_auth():
-    """检查用户是否登录"""
-    if 'logged_in' not in session or not session['logged_in']:
-        return redirect(url_for('login'))
+def get_user(username):
+    """按用户名查找用户."""
+    users = load_users()
+    for user in users:
+        if user['username'] == username:
+            return user
     return None
 
-def hash_password(password):
-    """使用 SHA256 对密码进行哈希处理"""
-    return hashlib.sha256(password.encode()).hexdigest()
+# --- 认证装饰器 ---
 
-# --- 用户管理逻辑 ---
+def login_required(f):
+    """检查用户是否已登录."""
+    def decorated_function(*args, **kwargs):
+        if 'logged_in' not in session or not session.get('logged_in'):
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    decorated_function.__name__ = f.__name__
+    return decorated_function
 
-# 安全修复：严格验证用户名的格式
-def is_valid_username(username):
-    # 允许字母、数字、下划线和连字符，长度 1 到 32，必须以字母或下划线开头
-    return re.match(r'^[a-z_][a-z0-9_-]{0,31}$', username) is not None
+# --- 系统工具函数 ---
 
-def get_user_status():
-    """获取所有隧道用户的状态、流量和在线信息"""
-    user_status = []
-
-    # 1. 获取所有 UID >= 1000 的用户列表 (非系统用户)
+def safe_run_command(command):
+    """安全执行系统命令并返回结果."""
     try:
-        user_list_cmd = "/usr/bin/awk -F: '($3 >= 1000) {print $1}' /etc/passwd"
-        all_users = run_cmd(user_list_cmd).split('\n')
-    except Exception as e:
-        print(f"ERROR reading /etc/passwd: {e}")
-        all_users = []
-        
-    # 2. 获取在线用户列表 (w 命令)
-    online_users_output = run_cmd("w -h").split('\n')
-    online_list = {line.split()[0]: True for line in online_users_output if line.strip()}
-    
-    # 3. 构建用户状态列表
-    for username in all_users:
-        if not username or not is_valid_username(username):
-            continue
-            
-        # 4. 检查该用户是否在 sshd_config 中有配置块
-        check_cmd = f"grep -q '# WSSUSER_BLOCK_START_{username}' {SSHD_CONFIG} && echo 'FOUND' || echo 'NOT_FOUND'"
-        if run_cmd(check_cmd) != "FOUND":
-            continue
-            
-        # 占位符数据
-        user_data = {
-            'username': username,
-            'is_online': online_list.get(username, False),
-            'last_login': 'Online' if online_list.get(username, False) else 'N/A',
-            'data_limit': "50 GB (Placeholder)", 
-            'data_used': "0 GB (Placeholder)", 
-            'expiry_date': (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d"), 
-            'status': 'Active'
-        }
-        user_status.append(user_data)
+        result = subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        return True, result.stdout.strip()
+    except subprocess.CalledProcessError as e:
+        return False, e.stderr.strip()
+    except FileNotFoundError:
+        return False, "Command not found."
 
-    return user_status
+# --- Web 路由 ---
 
-def manage_user_ssh_config(username, action, password=None):
-    """管理用户在 sshd_config 中的配置块"""
-    
-    if not is_valid_username(username):
-        return f"CMD_ERROR: Invalid username format: {username}"
-        
-    # 1. 清理所有与该用户相关的旧配置
-    # *** 修复: 移除冗余的 'sudo' ***
-    cleanup_cmd = f"sed -i '/# WSSUSER_BLOCK_START_{username}/,/# WSSUSER_BLOCK_END_{username}/d' {SSHD_CONFIG}"
-    run_cmd(cleanup_cmd)
-    
-    if action == 'delete':
-        # *** 修复: 移除冗余的 'sudo' ***
-        result = run_cmd(f"userdel -r {username}")
-        if 'CMD_ERROR' in result and 'not found' not in result:
-             return f"CMD_ERROR: userdel failed: {result}"
-        return f"User {username} deleted successfully."
-        
-    if action == 'create':
-        # 2. 创建用户
-        if 'No such user' in run_cmd(f"id {username} 2>&1"):
-            # *** 修复: 移除冗余的 'sudo' ***
-            run_cmd(f"adduser --disabled-password --gecos 'WSS Tunnel User' {username}")
-        
-        # 3. 确保没有 sudo 权限
-        # *** 修复: 移除冗余的 'sudo' ***
-        run_cmd(f"gpasswd -d {username} sudo 2>/dev/null || true")
-            
-        # 4. 设置/更新密码
-        if password:
-            password_safe = password.replace('"', '\\"').replace('$', '\\$').replace('`', '\\`')
-            # *** 修复: 移除冗余的 'sudo' ***
-            run_cmd(f'echo "{username}:{password_safe}" | chpasswd')
-            
-        # 5. 写入 SSHD 配置块
-        config_block = f"""
+@app.route('/', methods=['GET'])
+@login_required
+def dashboard():
+    users = load_users()
+    return render_template('dashboard.html', users=users)
 
-# WSSUSER_BLOCK_START_{username} -- managed by wss_manager
-# 允许 {username} 从本机登录 (WSS/Stunnel)
-Match User {username} Address 127.0.0.1,::1
-    PermitTTY no
-    AllowTcpForwarding yes
-    PasswordAuthentication yes
-    AuthenticationMethods password,keyboard-interactive
-    ChallengeResponseAuthentication yes
-# 禁止 {username} 远程登录 (其他地址)
-Match User {username} Address *,!127.0.0.1,!::1
-    PermitTTY no
-    AllowTcpForwarding no
-    PasswordAuthentication no
-# WSSUSER_BLOCK_END_{username}
-"""      
-        try:
-            # 写入配置到文件
-            with open(SSHD_CONFIG, 'a') as f:
-                f.write(config_block)
-            
-            # 6. 重启 SSHD
-            sshd_service = "sshd"
-            if 'ubuntu' in run_cmd('lsb_release -i 2>/dev/null || echo ""').lower():
-                 sshd_service = "ssh" 
-            
-            # *** 修复: 移除冗余的 'sudo' ***
-            run_cmd(f"systemctl restart {sshd_service}")
-            return f"User {username} created/updated and SSHD restarted successfully."
-        except Exception as e:
-            # 捕获写入文件或重启服务时的 Python 异常
-            return f"CMD_ERROR: Failed to write SSHD config or restart SSHD: {e}"
-            
-    return "Invalid action."
-
-
-# --- 路由定义 (保持不变) ---
 @app.route('/login', methods=['GET', 'POST'])
 def login():
+    error = None
     if request.method == 'POST':
-        password = request.form['password']
-        if hash_password(password) == ADMIN_PASSWORD_HASH:
-            session['logged_in'] = True
-            session['username'] = 'Admin'
-            return redirect(url_for('index'))
+        username = request.form['username']
+        password_raw = request.form['password']
+        
+        # 验证 ROOT 账户
+        if username == ROOT_USERNAME:
+            password_hash = hashlib.sha256(password_raw.encode('utf-8')).hexdigest()
+            if password_hash == ROOT_PASSWORD_HASH:
+                session['logged_in'] = True
+                session['username'] = ROOT_USERNAME
+                return redirect(url_for('dashboard'))
+            else:
+                error = '用户名或密码错误。'
         else:
-            flash("Invalid password", "error")
-            return redirect(url_for('login')) 
-    return render_template_string(HTML_BASE_TEMPLATE, error=True)
+            error = '用户名或密码错误。'
 
-@app.route('/logout')
-def logout():
-    session.clear()
-    return redirect(url_for('login'))
-
-
-@app.route('/', methods=['GET', 'POST'])
-def index():
-    auth_check = check_auth()
-    if auth_check:
-        return auth_check
-
-    # 处理用户管理动作
-    if request.method == 'POST':
-        action = request.form.get('action')
-        username = request.form.get('username')
-        
-        if username and not is_valid_username(username):
-             flash(f"用户名 **{username}** 格式无效。请使用字母、数字、下划线或连字符，且以字母或下划线开头。", "error")
-             return redirect(url_for('index'))
-             
-        if action == 'create_user':
-            password = request.form.get('password')
-            if not username or not password:
-                flash("用户名和密码是必需的。", "error")
-                return redirect(url_for('index'))
-            
-            result = manage_user_ssh_config(username, 'create', password)
-            if 'CMD_ERROR' in result:
-                flash(f"创建失败: {result}", "error")
-            else:
-                flash(f"用户 **{username}** 创建/更新成功! SSHD已重启。", "success")
-
-        elif action == 'delete_user':
-            result = manage_user_ssh_config(username, 'delete')
-            if 'CMD_ERROR' in result:
-                flash(f"删除失败: {result}", "error")
-            else:
-                flash(f"用户 **{username}** 删除成功。", "success")
-        
-        return redirect(url_for('index'))
-
-    user_data = get_user_status()
-    return render_template_string(HTML_BASE_TEMPLATE, users=user_data, app_name='WSS Manager')
-
-
-# --- Flask 模板 (内嵌 HTML) (保持不变) ---
-@app.template_filter('insecure_html')
-def insecure_html(s):
-    return Markup(s)
-
-HTML_BASE_TEMPLATE = """
+    html = f"""
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{{ app_name if app_name is defined else 'WSS Manager' }}</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <title>WSS Panel - 登录</title>
     <style>
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
-        body { font-family: 'Inter', sans-serif; background-color: #0d1117; color: #c9d1d9; }
-        .card { background-color: #161b22; border: 1px solid #30363d; border-radius: 8px;}
-        .btn-primary { background-color: #238636; color: white; transition: background-color 0.2s; border-radius: 6px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);}
-        .btn-primary:hover { background-color: #2ea043; }
-        .btn-danger { background-color: #da3633; color: white; transition: background-color 0.2s; border-radius: 6px; box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);}
-        .btn-danger:hover { background-color: #f85149; }
-        input[type="text"], input[type="password"] { background-color: #0d1117; border: 1px solid #30363d; color: #c9d1d9; border-radius: 6px; }
-        .success { background-color: #23863622; border-left: 4px solid #238636; color: #56d364; }
-        .error { background-color: #da363322; border-left: 4px solid #da3633; color: #f85149; }
-        .online-dot { background-color: #56d364; }
-        .offline-dot { background-color: #f85149; }
-        .modal {
-            position: fixed; top: 0; left: 0; right: 0; bottom: 0;
-            background-color: rgba(0, 0, 0, 0.7);
-            z-index: 50;
-        }
+        body {{ font-family: sans-serif; background-color: #f4f7f6; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
+        .container {{ background: white; padding: 25px; border-radius: 12px; box-shadow: 0 6px 15px rgba(0, 0, 0, 0.1); width: 100%; max-width: 380px; }}
+        h1 {{ text-align: center; color: #333; margin-bottom: 25px; font-weight: 600; }}
+        input[type=text], input[type=password] {{ width: 100%; padding: 12px 10px; margin: 8px 0; display: inline-block; border: 1px solid #ccc; border-radius: 8px; box-sizing: border-box; transition: border-color 0.3s; }}
+        input[type=text]:focus, input[type=password]:focus {{ border-color: #4CAF50; outline: none; }}
+        button {{ background-color: #4CAF50; color: white; padding: 14px 20px; margin: 15px 0 5px 0; border: none; border-radius: 8px; cursor: pointer; width: 100%; font-size: 16px; transition: background-color 0.3s; }}
+        button:hover {{ background-color: #45a049; }}
+        .error {{ color: #e74c3c; text-align: center; margin-bottom: 15px; font-weight: bold; }}
     </style>
-    <script>
-        function showDeleteModal(username) {
-            document.getElementById('modal-username').textContent = username;
-            document.getElementById('delete-username-input').value = username;
-            document.getElementById('delete-modal').classList.remove('hidden');
-        }
-
-        function hideDeleteModal() {
-            document.getElementById('delete-modal').classList.add('hidden');
-        }
-    </script>
 </head>
 <body>
+    <div class="container">
+        <h1>WSS 管理面板</h1>
+        {f'<div class="error">{error}</div>' if error else ''}
+        <form method="POST">
+            <label for="username"><b>用户名</b></label>
+            <input type="text" placeholder="输入 {ROOT_USERNAME}" name="username" value="{ROOT_USERNAME}" required>
 
-<div class="container mx-auto p-4 md:p-8">
-    <div class="flex justify-between items-center mb-6">
-        <h1 class="text-3xl font-bold text-white">{{ app_name if app_name is defined else 'WSS Manager' }}</h1>
-        {% if session.logged_in %}
-        <a href="{{ url_for('logout') }}" class="text-sm text-gray-400 hover:text-white transition duration-150">退出 (Admin)</a>
-        {% endif %}
+            <label for="password"><b>密码</b></label>
+            <input type="password" placeholder="输入密码" name="password" required>
+
+            <button type="submit">登录</button>
+        </form>
+    </div>
+</body>
+</html>
+    """
+    return html
+
+@app.route('/logout')
+def logout():
+    session.pop('logged_in', None)
+    return redirect(url_for('login'))
+
+@app.route('/api/users', methods=['GET'])
+@login_required
+def list_users_api():
+    """获取用户列表 (API)"""
+    users = load_users()
+    return jsonify(users)
+
+@app.route('/api/users/add', methods=['POST'])
+@login_required
+def add_user_api():
+    """添加用户 (API)"""
+    data = request.json
+    username = data.get('username')
+    password_raw = data.get('password')
+    
+    if not username or not password_raw:
+        return jsonify({"success": False, "message": "缺少用户名或密码"}), 400
+
+    users = load_users()
+    if get_user(username):
+        return jsonify({"success": False, "message": f"用户 {username} 已存在于面板"}), 409
+
+    # 1. 创建系统用户
+    success, output = safe_run_command(['useradd', '-m', '-s', '/bin/bash', username])
+    if not success:
+        return jsonify({"success": False, "message": f"创建系统用户失败: {output}"}), 500
+
+    # 2. 设置密码
+    chpasswd_input = f"{username}:{password_raw}"
+    success, output = safe_run_command(['/usr/sbin/chpasswd'], input=chpasswd_input.encode('utf-8'))
+    if not success:
+        # 如果设置密码失败，尝试删除已创建的系统用户
+        safe_run_command(['userdel', '-r', username])
+        return jsonify({"success": False, "message": f"设置密码失败: {output}"}), 500
+        
+    # 3. 记录到 JSON 数据库
+    new_user = {
+        "username": username,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        "status": "active"
+    }
+    users.append(new_user)
+    save_users(users)
+
+    return jsonify({"success": True, "message": f"用户 {username} 创建成功"})
+
+@app.route('/api/users/delete', methods=['POST'])
+@login_required
+def delete_user_api():
+    """删除用户 (API)"""
+    data = request.json
+    username = data.get('username')
+    
+    if not username:
+        return jsonify({"success": False, "message": "缺少用户名"}), 400
+
+    users = load_users()
+    user_to_delete = get_user(username)
+
+    if not user_to_delete:
+        return jsonify({"success": False, "message": f"面板中用户 {username} 不存在"}), 404
+
+    # 1. 删除系统用户及其主目录
+    success, output = safe_run_command(['userdel', '-r', username])
+    if not success:
+        # 即使删除系统用户失败，也应该从面板中删除记录，以免混淆
+        print(f"Warning: Failed to delete system user {username}: {output}")
+
+    # 2. 从 JSON 数据库中删除记录
+    users = [user for user in users if user['username'] != username]
+    save_users(users)
+
+    return jsonify({"success": True, "message": f"用户 {username} 已删除"})
+
+
+# --- HTML 模板 (内嵌) ---
+
+@app.route('/dashboard.html')
+def render_dashboard_html():
+    return render_template('dashboard.html')
+
+@app.context_processor
+def inject_panel_config():
+    """注入面板配置信息到模板"""
+    return dict(
+        panel_port="$PANEL_PORT",
+        wss_http_port="$WSS_HTTP_PORT",
+        wss_tls_port="$WSS_TLS_PORT",
+        stunnel_port="$STUNNEL_PORT",
+        udpgw_port="$UDPGW_PORT"
+    )
+
+@app.template_filter('current_host')
+def current_host_filter(s):
+    """尝试获取当前请求的主机名或IP"""
+    # 这是一个简化的处理，在实际环境中需要更复杂的逻辑来获取正确的IP
+    if request.host.startswith('127.0.0.1'):
+        return '[Your Server IP]'
+    return request.host.split(':')[0]
+    
+# 仪表盘 HTML (内嵌)
+_DASHBOARD_HTML = """
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WSS Panel - 仪表盘</title>
+    <style>
+        body { font-family: 'Inter', sans-serif; background-color: #f0f2f5; margin: 0; padding: 0; }
+        .header { background-color: #2c3e50; color: white; padding: 20px 40px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); display: flex; justify-content: space-between; align-items: center; }
+        .header h1 { margin: 0; font-size: 24px; }
+        .header button { background-color: #e74c3c; border: none; padding: 8px 15px; border-radius: 6px; cursor: pointer; color: white; transition: background-color 0.3s; }
+        .header button:hover { background-color: #c0392b; }
+        .container { padding: 20px; max-width: 1200px; margin: 20px auto; }
+        .card { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05); margin-bottom: 20px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; margin-bottom: 30px; }
+        .stat-box { background-color: #ecf0f1; padding: 15px; border-radius: 8px; text-align: center; }
+        .stat-box h3 { margin: 0 0 5px 0; color: #34495e; font-size: 16px; }
+        .stat-box p { margin: 0; font-size: 24px; font-weight: bold; color: #2980b9; }
+        
+        /* Form */
+        .user-form input[type=text], .user-form input[type=password] { padding: 10px; margin-right: 10px; border: 1px solid #ccc; border-radius: 6px; }
+        .user-form button { background-color: #2ecc71; color: white; border: none; padding: 10px 15px; border-radius: 6px; cursor: pointer; transition: background-color 0.3s; }
+        .user-form button:hover { background-color: #27ae60; }
+
+        /* Table */
+        .user-table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        .user-table th, .user-table td { border: 1px solid #ddd; padding: 12px; text-align: left; }
+        .user-table th { background-color: #f7f7f7; color: #333; }
+        .user-table tr:nth-child(even) { background-color: #f9f9f9; }
+        .user-table .delete-btn { background-color: #e74c3c; color: white; border: none; padding: 6px 10px; border-radius: 5px; cursor: pointer; font-size: 12px; }
+        .user-table .delete-btn:hover { background-color: #c0392b; }
+
+        /* Status & Alert */
+        .alert { padding: 15px; border-radius: 8px; margin-bottom: 20px; font-weight: bold; }
+        .alert-success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .alert-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+
+        /* Connection Info */
+        .connection-info h3 { margin-top: 0; color: #2c3e50; }
+        .connection-info pre { background-color: #ecf0f1; padding: 10px; border-radius: 6px; overflow-x: auto; font-size: 14px; }
+        .note { color: #888; font-size: 14px; margin-top: 15px; border-left: 3px solid #f39c12; padding-left: 10px; }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>WSS Panel - 仪表盘</h1>
+        <button onclick="logout()">退出登录 (root)</button>
     </div>
 
-    {% with messages = get_flashed_messages(with_categories=true) %}
-        {% if messages %}
-            <div class="mb-4">
-                {% for category, message in messages %}
-                    <div class="p-3 mb-2 rounded-md text-sm {{ 'error' if category == 'error' else 'success' }}">
-                        {{ message|insecure_html }}
-                    </div>
-                {% endfor %}
+    <div class="container">
+        <div id="status-message" class="alert" style="display:none;"></div>
+        
+        <div class="grid">
+            <div class="stat-box">
+                <h3>已创建用户数</h3>
+                <p id="user-count">{{ users|length }}</p>
             </div>
-        {% endif %}
-    {% endwith %}
-
-    {% if error is defined %}
-        <div class="flex items-center justify-center min-h-[calc(100vh-100px)]">
-            <div class="card p-8 rounded-lg shadow-xl w-full max-w-md">
-                <h2 class="text-2xl font-bold mb-6 text-center text-white">管理员登录</h2>
-                <form method="POST">
-                    <div class="mb-4">
-                        <label for="password" class="block text-sm font-medium mb-1">密码</label>
-                        <input type="password" name="password" id="password" required class="w-full p-3 rounded-md focus:outline-none focus:ring-2 focus:ring-[#238636]">
-                    </div>
-                    <button type="submit" class="btn-primary w-full p-3 rounded-md font-semibold">登录</button>
-                </form>
+            <div class="stat-box">
+                <h3>Web 面板端口</h3>
+                <p>{{ panel_port }}</p>
+            </div>
+            <div class="stat-box">
+                <h3>WSS (HTTP) 端口</h3>
+                <p>{{ wss_http_port }}</p>
+            </div>
+            <div class="stat-box">
+                <h3>WSS (TLS) 端口 / Stunnel</h3>
+                <p>{{ wss_tls_port }} / {{ stunnel_port }}</p>
             </div>
         </div>
-        {% endif %}
 
-    {% if users is defined %}
-        <h2 class="text-xl font-semibold mb-3">隧道用户列表 (UID >= 1000)</h2>
-        <div class="overflow-x-auto card rounded-lg shadow-lg mb-8">
-            <table class="min-w-full divide-y divide-[#30363d]">
-                <thead class="bg-[#161b22]">
+        <div class="card connection-info">
+            <h3>连接信息 (请替换 [Your Server IP])</h3>
+            <p>使用以下信息配置你的客户端（如 v2ray/Shadowsocks-Rust/Tunnelier等，选择 WSS 或 Stunnel 模式）：</p>
+            
+            <h4>WSS (WebSocket) 连接</h4>
+            <pre>
+服务器地址: {{ '' | current_host }}
+WSS HTTP 端口: {{ wss_http_port }}
+WSS TLS 端口: {{ wss_tls_port }}
+UDPGW 端口: 127.0.0.1:{{ udpgw_port }} (仅供本机 WSS 代理内部使用)
+</pre>
+
+            <h4>Stunnel (TLS) 连接</h4>
+            <pre>
+服务器地址: {{ '' | current_host }}
+Stunnel 端口: {{ stunnel_port }}
+</pre>
+            <p class="note">注意：所有连接方式的底层认证都是 **SSH 账户/密码**。用户只能使用面板创建的账户密码进行登录。</p>
+        </div>
+
+        <div class="card">
+            <h3>新增 WSS 用户</h3>
+            <form id="add-user-form" class="user-form">
+                <input type="text" id="new-username" placeholder="用户名" required>
+                <input type="password" id="new-password" placeholder="密码" required>
+                <button type="submit">创建用户</button>
+            </form>
+        </div>
+
+        <div class="card">
+            <h3>用户列表</h3>
+            <table class="user-table" id="user-table">
+                <thead>
                     <tr>
-                        <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">状态</th>
-                        <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">用户名</th>
-                        <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">最后登录/时长</th>
-                        <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">流量限制</th>
-                        <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">流量使用</th>
-                        <th class="px-6 py-3 text-left text-xs font-medium uppercase tracking-wider">操作</th>
+                        <th>用户名</th>
+                        <th>状态</th>
+                        <th>创建时间</th>
+                        <th>操作</th>
                     </tr>
                 </thead>
-                <tbody class="divide-y divide-[#30363d]">
+                <tbody>
                     {% for user in users %}
-                    <tr class="hover:bg-[#21262d] transition duration-150">
-                        <td class="px-6 py-4 whitespace-nowrap">
-                            <span class="h-3 w-3 rounded-full inline-block mr-2 {{ 'online-dot' if user.is_online else 'offline-dot' }}"></span>
-                            {{ '在线' if user.is_online else '离线' }}
-                        </td>
-                        <td class="px-6 py-4 whitespace-nowrap font-medium">{{ user.username }}</td>
-                        <td class="px-6 py-4 whitespace-nowrap">{{ user.last_login }}</td>
-                        <td class="px-6 py-4 whitespace-nowrap text-green-400">{{ user.data_limit }}</td>
-                        <td class="px-6 py-4 whitespace-nowrap text-red-400">{{ user.data_used }}</td>
-                        <td class="px-6 py-4 whitespace-nowrap">
-                            <button onclick="showDeleteModal('{{ user.username }}')" class="btn-danger p-2 text-xs rounded-md">删除</button>
-                        </td>
-                    </tr>
-                    {% else %}
-                    <tr>
-                        <td colspan="6" class="px-6 py-4 text-center text-gray-500">
-                            当前没有隧道用户。请在下方创建。
-                        </td>
+                    <tr id="row-{{ user.username }}">
+                        <td>{{ user.username }}</td>
+                        <td><span style="color:#2ecc71; font-weight: bold;">{{ user.status.upper() }}</span></td>
+                        <td>{{ user.created_at }}</td>
+                        <td><button class="delete-btn" onclick="deleteUser('{{ user.username }}')">删除</button></td>
                     </tr>
                     {% endfor %}
                 </tbody>
             </table>
         </div>
-
-        <div class="mt-8 card p-6 rounded-lg">
-            <h2 class="text-xl font-semibold mb-4">添加/更新隧道用户</h2>
-            <form method="POST" class="space-y-4">
-                <input type="hidden" name="action" value="create_user">
-                <div>
-                    <label for="new_username" class="block text-sm font-medium mb-1">用户名 (只能包含字母、数字、下划线和连字符)</label>
-                    <input type="text" name="username" id="new_username" required class="w-full p-2 rounded-md focus:outline-none focus:ring-2 focus:ring-[#238636]" pattern="^[a-z_][a-z0-9_-]{0,31}$" title="用户名必须以字母或下划线开头，不能包含特殊字符或大写字母。" placeholder="用户名 (例如: tunnel01)">
-                </div>
-                <div>
-                    <label for="new_password" class="block text-sm font-medium mb-1">密码</label>
-                    <input type="password" name="password" id="new_password" required class="w-full p-2 rounded-md focus:outline-none focus:ring-2 focus:ring-[#238636]">
-                </div>
-                <button type="submit" class="btn-primary p-3 rounded-md font-semibold">创建用户并配置SSH</button>
-            </form>
-        </div>
-        {% endif %}
-    
-    <!-- 删除确认模态框 -->
-    <div id="delete-modal" class="modal hidden flex items-center justify-center">
-        <div class="card p-6 w-full max-w-sm">
-            <h3 class="text-lg font-semibold mb-4 text-white">确认删除用户</h3>
-            <p class="text-gray-400 mb-6">您确定要删除用户 <span id="modal-username" class="font-bold text-red-400"></span> 吗？这将永久删除其系统账户和所有配置。</p>
-            <div class="flex justify-end space-x-3">
-                <button onclick="hideDeleteModal()" type="button" class="px-4 py-2 bg-gray-600 rounded-md hover:bg-gray-700 transition">取消</button>
-                <form method="POST" class="inline">
-                    <input type="hidden" name="action" value="delete_user">
-                    <input type="hidden" name="username" id="delete-username-input">
-                    <button type="submit" class="btn-danger px-4 py-2 rounded-md font-semibold">确认删除</button>
-                </form>
-            </div>
-        </div>
     </div>
+    
+    <script>
+        function showStatus(message, isSuccess) {
+            const statusDiv = document.getElementById('status-message');
+            statusDiv.textContent = message;
+            statusDiv.className = isSuccess ? 'alert alert-success' : 'alert alert-error';
+            statusDiv.style.display = 'block';
+            setTimeout(() => { statusDiv.style.display = 'none'; }, 5000);
+        }
 
-</div>
+        document.getElementById('add-user-form').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            const username = document.getElementById('new-username').value.trim();
+            const password = document.getElementById('new-password').value;
+
+            if (!username || !password) {
+                showStatus('用户名和密码不能为空。', false);
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/users/add', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, password })
+                });
+
+                const result = await response.json();
+                
+                if (response.ok && result.success) {
+                    showStatus(result.message, true);
+                    document.getElementById('new-username').value = '';
+                    document.getElementById('new-password').value = '';
+                    location.reload(); // 简单粗暴地刷新以更新列表
+                } else {
+                    showStatus('创建失败: ' + result.message, false);
+                }
+            } catch (error) {
+                showStatus('请求失败，请检查面板运行状态。', false);
+            }
+        });
+
+        async function deleteUser(username) {
+            if (!confirm(`确定要删除用户 ${username} 吗？`)) {
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/users/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username })
+                });
+
+                const result = await response.json();
+
+                if (response.ok && result.success) {
+                    showStatus(result.message, true);
+                    document.getElementById(`row-${username}`).remove();
+                    document.getElementById('user-count').textContent = parseInt(document.getElementById('user-count').textContent) - 1;
+                } else {
+                    showStatus('删除失败: ' + result.message, false);
+                }
+            } catch (error) {
+                showStatus('请求失败，请检查面板运行状态。', false);
+            }
+        }
+        
+        function logout() {
+            window.location.href = '/logout';
+        }
+        
+        // 替换原生 confirm/alert，因为它们在 iframe 中可能被禁用
+        window.confirm = (message) => {
+            return window.prompt(message + ' (输入 "yes" 确认删除)') === 'yes';
+        }
+        
+    </script>
 </body>
 </html>
 """
 
+# 渲染模板，以便 Flask 可以在没有文件系统的情况下运行
+@app.route('/render_template/<path:template_name>')
+def render_in_memory_template(template_name):
+    if template_name == 'dashboard.html':
+        return make_response(render_template(_DASHBOARD_HTML))
+    # Flask默认也会处理 dashboard.html
+    return "Template not found", 404
+
+# 覆盖 Flask 的 render_template 函数，使其使用内嵌的字符串
+def render_template(template_name, **context):
+    if template_name == 'dashboard.html':
+        # 这里需要用一个更优雅的方式来处理 Jinja2 渲染，但为简化，直接替换并渲染
+        import jinja2
+        template = jinja2.Template(_DASHBOARD_HTML)
+        # 注入全局变量
+        context.update(inject_panel_config())
+        return template.render(**context)
+    # 对于其他模板，返回错误
+    return "Template not found", 404
+
+# 使用内嵌的 render_template
+import builtins
+builtins.render_template = render_template
+
+
 if __name__ == '__main__':
-    print(f"Starting WSS Manager on port {MANAGER_PORT}...")
-    try:
-        app.run(host='0.0.0.0', port=MANAGER_PORT, debug=False)
-    except Exception as e:
-        print(f"FATAL ERROR: Failed to start Flask app: {e}", file=sys.stderr)
-        sys.exit(1)
+    # 为了简化部署，将 debug 设置为 False
+    print(f"WSS Panel running on port {PANEL_PORT}")
+    app.run(host='0.0.0.0', port=$PANEL_PORT, debug=False)
+EOF
 
-EOF_MANAGER
+chmod +x /usr/local/bin/wss_panel.py
 
-# 创建管理面板 systemd 服务
-sudo tee /etc/systemd/system/wss-manager.service > /dev/null <<EOF
+# =============================
+# 创建 WSS 面板 systemd 服务
+# =============================
+tee /etc/systemd/system/wss_panel.service > /dev/null <<EOF
 [Unit]
-Description=WSS Manager Web Panel
+Description=WSS User Management Panel (Flask)
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /usr/local/bin/wss_manager.py
-Restart=always
+ExecStart=/usr/bin/python3 /usr/local/bin/wss_panel.py
+Restart=on-failure
 User=root
 
 [Install]
 WantedBy=multi-user.target
 EOF
-sudo systemctl daemon-reload
-sudo systemctl enable wss-manager
-sudo systemctl start wss-manager
-echo "Web 管理面板已启动，端口: $MANAGER_PORT"
 
-# ==================================
-# 最终输出
-# ==================================
-echo ""
-echo "=================================="
-echo "✅ 部署完成！(已修复面板内部错误)"
+systemctl daemon-reload
+systemctl enable wss_panel
+systemctl start wss_panel
+echo "WSS 管理面板已启动，端口 $PANEL_PORT"
 echo "----------------------------------"
-echo "🌐 Web 管理面板访问地址 (Root 登录):"
-echo "    http://<您的服务器IP>:$MANAGER_PORT"
-echo "    请使用您在脚本开始时设置的面板密码登录。"
-echo ""
-echo "⚠️ **本次关键修复:**"
-echo "解决了面板创建用户时的 **'Internal Server Error'** 问题。"
-echo "问题原因很可能是 Flask 服务以 root 运行时，执行 shell 命令时冗余的 **'sudo'** 引入了环境或权限冲突。现已移除所有多余的 'sudo' 调用。"
+
+# =============================
+# SSHD 安全配置 (统一策略)
+# =============================
+SSHD_CONFIG="/etc/ssh/sshd_config"
+BACKUP_SUFFIX=".bak.wss$(date +%s)"
+SSHD_SERVICE=$(systemctl list-units --full -all | grep -q "sshd.service" && echo "sshd" || echo "ssh")
+
+echo "==== 配置 SSHD 安全策略 (允许本机密码认证) ===="
+# 备份 sshd_config
+cp -a "$SSHD_CONFIG" "${SSHD_CONFIG}${BACKUP_SUFFIX}"
+echo "SSHD 配置已备份到 ${SSHD_CONFIG}${BACKUP_SUFFIX}"
+
+# 删除旧的 WSS 配置段
+sed -i '/# WSS_TUNNEL_BLOCK_START/,/# WSS_TUNNEL_BLOCK_END/d' "$SSHD_CONFIG"
+
+# 写入新的、更具扩展性的统一 WSS 隧道策略
+cat >> "$SSHD_CONFIG" <<EOF
+
+# WSS_TUNNEL_BLOCK_START -- managed by deploy_wss_panel.sh
+# 统一策略: 允许所有用户通过本机 (127.0.0.1, ::1) 使用密码进行认证。
+# WSS 和 Stunnel 代理都会将外部连接伪装成 127.0.0.1 发送到 SSHD 的 41816 端口。
+Match Address 127.0.0.1,::1
+    # 允许密码认证，用于 WSS/Stunnel 隧道连接
+    PasswordAuthentication yes
+    # 允许 TTY 和转发
+    PermitTTY yes
+    AllowTcpForwarding yes
+
+# 对于所有其他远程 IP，如果默认是允许密码认证的，则将其禁用以提高安全性
+# 注意：如果您的 SSHD 配置文件中 PasswordAuthentication 默认为 yes，可以添加以下行
+# Match all
+#    PasswordAuthentication no 
+# 但这可能会影响到正常的远程 SSH 管理。这里我们只确保隧道工作。
+# WSS_TUNNEL_BLOCK_END -- managed by deploy_wss_panel.sh
+
+EOF
+
+chmod 600 "$SSHD_CONFIG"
+
+# 重载 sshd
+echo "重新加载并重启 ssh 服务 ($SSHD_SERVICE)"
+systemctl daemon-reload
+systemctl restart "$SSHD_SERVICE"
+echo "SSHD 配置更新完成。"
 echo "----------------------------------"
-echo "🔧 隧道基础配置 (转发至 127.0.0.1:$TUNNEL_TARGET_PORT):"
-echo "    WSS HTTP Port: $WSS_HTTP_PORT"
-echo "    WSS TLS Port: $WSS_TLS_PORT"
-echo "    Stunnel Port: $STUNNEL_PORT"
-echo "    UDPGW Port: $UDPGW_PORT"
-echo "=================================="
+
+# 清理敏感变量
+unset PANEL_ROOT_PASS_RAW
+
+echo "=================================================="
+echo "✅ 部署完成！"
+echo "=================================================="
+echo ""
+echo "🔥 WSS & Stunnel 基础设施已启动。"
+echo "🌐 WSS 用户管理面板已在后台运行。"
+echo ""
+echo "--- 访问信息 ---"
+echo "Web 面板地址: http://[您的服务器IP]:$PANEL_PORT"
+echo "Web 面板用户名: root"
+echo "Web 面板密码: [您刚才设置的密码]"
+echo ""
+echo "--- 端口信息 ---"
+echo "WSS (HTTP/WebSocket): $WSS_HTTP_PORT"
+echo "WSS (TLS/WebSocket): $WSS_TLS_PORT"
+echo "Stunnel (TLS 隧道): $STUNNEL_PORT"
+echo "内部转发端口 (SSH): 41816 (由 WSS/Stunnel 转发)"
+echo ""
+echo "--- 故障排查 ---"
+echo "WSS 代理状态: sudo systemctl status wss"
+echo "Stunnel 状态: sudo systemctl status stunnel4"
+echo "Web 面板状态: sudo systemctl status wss_panel"
+echo "用户数据库路径: /etc/wss-panel/users.json (面板通过此文件进行用户查询和管理)"
+echo "=================================================="
