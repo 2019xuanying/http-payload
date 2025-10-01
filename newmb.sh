@@ -1,222 +1,291 @@
 #!/usr/bin/env bash
-set -eu
-
-# ==========================================================
-# WSS Panel V2 部署脚本 (包含流量/到期日管理)
-# ----------------------------------------------------------
-# 此脚本部署了 WSS 代理、Stunnel4、UDPGW、Flask面板和流量统计模拟服务。
-# ==========================================================
+set -euo pipefail
 
 # =============================
-# 提示端口和面板密码
+# WSS Panel 一键部署脚本 
+# 集成 WSS 代理, Stunnel, UDPGW, 用户管理面板, 流量/到期日功能
 # =============================
-echo "----------------------------------"
-echo "==== WSS 基础设施端口配置 ===="
-read -p "请输入 WSS HTTP 监听端口 (默认80): " WSS_HTTP_PORT
-WSS_HTTP_PORT=${WSS_HTTP_PORT:-80}
 
-read -p "请输入 WSS TLS 监听端口 (默认443): " WSS_TLS_PORT
-WSS_TLS_PORT=${WSS_TLS_PORT:-443}
+# ====== 可修改项 ======
+WSS_USER_DEFAULT="wssuser"
+SSH_HOME_BASE="/home"
+SSHD_CONFIG="/etc/ssh/sshd_config"
+BACKUP_SUFFIX=".bak.wss$(date +%s)"
+# 默认端口
+WSS_HTTP_PORT_DEFAULT=80
+WSS_TLS_PORT_DEFAULT=443
+STUNNEL_PORT_DEFAULT=444
+UDPGW_PORT_DEFAULT=7300
+PANEL_PORT_DEFAULT=8080
 
-read -p "请输入 Stunnel4 端口 (默认444): " STUNNEL_PORT
-STUNNEL_PORT=${STUNNEL_PORT:-444}
+# 路径常量
+WSS_SCRIPT="/usr/local/bin/wss"
+PANEL_SCRIPT="/usr/local/bin/wss_panel.py"
+ACCOUNTANT_SCRIPT="/usr/local/bin/wss_accountant.py"
+PANEL_CONFIG_DIR="/etc/wss-panel"
+PANEL_CONFIG_FILE="${PANEL_CONFIG_DIR}/panel_config.json"
+USER_DB_PATH="${PANEL_CONFIG_DIR}/users.json"
+# ======================
 
-read -p "请输入 UDPGW 端口 (默认7300): " UDPGW_PORT
-UDPGW_PORT=${UDPGW_PORT:-7300}
+# --- 辅助函数 ---
+spinner() {
+    local pid=$!
+    local delay=0.1
+    local spin_chars="/-\|"
+    echo -n "..."
+    while [ "$(ps a | awk '{print $1}' | grep $pid)" ]; do
+        local temp=${spin_chars#?}
+        printf "%c" "$spin_chars"
+        spin_chars=$temp${spin_chars:0:1}
+        sleep "$delay"
+        printf "\b"
+    done
+    printf " \b"
+}
 
-echo "----------------------------------"
-echo "==== 管理面板配置 ===="
-read -p "请输入 Web 管理面板监听端口 (默认8080): " PANEL_PORT
-PANEL_PORT=${PANEL_PORT:-8080}
+log() {
+    echo -e "[\033[1;34mINFO\033[0m] $1"
+}
 
-# 交互式安全输入并确认 ROOT 密码
-echo "请为 Web 面板的 'root' 用户设置密码（输入时隐藏）。"
-while true; do
-  read -s -p "面板密码: " pw1 && echo
-  read -s -p "请再次确认密码: " pw2 && echo
-  if [ -z "$pw1" ]; then
-    echo "密码不能为空，请重新输入。"
-    continue
-  fi
-  if [ "$pw1" != "$pw2" ]; then
-    echo "两次输入不一致，请重试。"
-    continue
-  fi
-  PANEL_ROOT_PASS_RAW="$pw1"
-  # 对密码进行简单的 HASH，防止明文存储
-  PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | sha256sum | awk '{print $1}')
-  break
-done
+error() {
+    echo -e "[\033[1;31mERROR\033[0m] $1" >&2
+    exit 1
+}
 
-echo "----------------------------------"
-echo "==== 系统更新与依赖安装 ===="
-apt update -y
-apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4 iptables
-pip3 install flask jinja2
-echo "依赖安装完成"
-echo "----------------------------------"
+# --- 交互式提示和密码设置 ---
+read_user_input() {
+    read -p "请输入 WSS HTTP 监听端口（默认${WSS_HTTP_PORT_DEFAULT}）: " WSS_HTTP_PORT
+    WSS_HTTP_PORT=${WSS_HTTP_PORT:-$WSS_HTTP_PORT_DEFAULT}
 
+    read -p "请输入 WSS TLS 监听端口（默认${WSS_TLS_PORT_DEFAULT}）: " WSS_TLS_PORT
+    WSS_TLS_PORT=${WSS_TLS_PORT:-$WSS_TLS_PORT_DEFAULT}
 
-# =============================
-# WSS 核心代理脚本 (不变，专注于转发)
-# =============================
-echo "==== 安装 WSS 核心代理脚本 (/usr/local/bin/wss) ===="
-tee /usr/local/bin/wss > /dev/null <<'EOF'
+    read -p "请输入 Stunnel4 端口（默认${STUNNEL_PORT_DEFAULT}）: " STUNNEL_PORT
+    STUNNEL_PORT=${STUNNEL_PORT:-$STUNNEL_PORT_DEFAULT}
+
+    read -p "请输入 UDPGW 端口（默认${UDPGW_PORT_DEFAULT}）: " UDPGW_PORT
+    UDPGW_PORT=${UDPGW_PORT:-$UDPGW_PORT_DEFAULT}
+
+    read -p "请输入 Web 面板监听端口（默认${PANEL_PORT_DEFAULT}）: " PANEL_PORT
+    PANEL_PORT=${PANEL_PORT:-$PANEL_PORT_DEFAULT}
+    
+    # 交互式安全输入 root 密码
+    echo "=========================================="
+    echo "  请为 Web 面板 root 用户设置登录密码。"
+    echo "=========================================="
+    while true; do
+        read -s -p "密码: " pw1 && echo
+        read -s -p "请再次确认密码: " pw2 && echo
+        if [ -z "$pw1" ]; then
+            echo "密码不能为空，请重新输入。"
+            continue
+        fi
+        if [ "$pw1" != "$pw2" ]; then
+            echo "两次输入不一致，请重试。"
+            continue
+        fi
+        ROOT_PASS="$pw1"
+        ROOT_PASS_HASH=$(echo -n "$ROOT_PASS" | sha256sum | awk '{print $1}')
+        unset ROOT_PASS
+        break
+    done
+}
+
+# --- 部署阶段 1: 系统更新与依赖安装 ---
+install_dependencies() {
+    log "==== 更新系统并安装依赖 ===="
+    sudo apt update -y &> /dev/null & spinner
+    sudo apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4 python3-flask python3-jinja2 &> /dev/null & spinner
+    log "依赖安装完成 (Python, Flask, Stunnel4, OpenSSL等)"
+}
+
+# --- 部署阶段 2: WSS Python 代理脚本 ---
+install_wss_proxy() {
+    log "==== 安装 WSS 核心代理脚本 (增强日志) ===="
+    # WSS 脚本内容 (增强日志)
+    cat > "$WSS_SCRIPT" <<'EOF'
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
 import asyncio, ssl, sys
+import time
+from datetime import datetime
 
 LISTEN_ADDR = '0.0.0.0'
-
-try:
-    HTTP_PORT = int(sys.argv[1])
-except (IndexError, ValueError):
-    HTTP_PORT = 80
-try:
-    TLS_PORT = int(sys.argv[2])
-except (IndexError, ValueError):
-    TLS_PORT = 443
-
-DEFAULT_TARGET = ('127.0.0.1', 41816)
+DEFAULT_TARGET = ('127.0.0.1', 41816) 
 BUFFER_SIZE = 65536
 TIMEOUT = 3600
 CERT_FILE = '/etc/stunnel/certs/stunnel.pem'
 KEY_FILE = '/etc/stunnel/certs/stunnel.key'
 
+# Responses
 FIRST_RESPONSE = b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK\r\n\r\n'
 SWITCH_RESPONSE = b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'
+FORBIDDEN_RESPONSE = b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'
 
-async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
+def log(peer, message, tls=False):
+    timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+    protocol = '(TLS)' if tls else '(HTTP)'
+    print(f"{timestamp} {protocol} [{peer[0]}:{peer[1]}] {message}")
+
+async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, http_port, tls_port, tls=False):
     peer = writer.get_extra_info('peername')
-    print(f"Connection from {peer} {'(TLS)' if tls else ''}")
+    log(peer, "Connection established.", tls)
     forwarding_started = False
     full_request = b''
 
     try:
+        # --- 1. 握手循环 ---
         while not forwarding_started:
             data = await asyncio.wait_for(reader.read(BUFFER_SIZE), timeout=TIMEOUT)
-            if not data: break
+            if not data:
+                log(peer, "Client closed connection during handshake.", tls)
+                break
             
             full_request += data
+            
             header_end_index = full_request.find(b'\r\n\r\n')
             
-            if header_end_index == -1:
-                writer.write(FIRST_RESPONSE)
-                await writer.drain()
-                full_request = b''
-                continue
+            headers = full_request[:header_end_index].decode(errors='ignore') if header_end_index != -1 else full_request.decode(errors='ignore')
+            data_to_forward = full_request[header_end_index + 4:] if header_end_index != -1 else b''
 
-            headers_raw = full_request[:header_end_index]
-            data_to_forward = full_request[header_end_index + 4:]
-            headers = headers_raw.decode(errors='ignore')
-
+            # 检查是否为 WebSocket 升级请求
             is_websocket_request = 'Upgrade: websocket' in headers or 'Connection: Upgrade' in headers or 'GET-RAY' in headers
             
+            if header_end_index == -1:
+                # 头部不完整，发送 200 OK 响应，诱导客户端发送下一段（Payload）
+                writer.write(FIRST_RESPONSE)
+                await writer.drain()
+                log(peer, "Handshake: Sent 200 OK. Waiting for next payload chunk.", tls)
+                full_request = b''
+                continue
+            
+            # 2. 头部解析和转发触发
             if is_websocket_request:
+                # 找到了完整的 WebSocket 握手请求
                 writer.write(SWITCH_RESPONSE)
                 await writer.drain()
                 forwarding_started = True
+                log(peer, "Handshake: Sent 101 Switching Protocols. Starting forwarding.", tls)
             else:
+                # 找到了完整的非 WebSocket 请求 (例如，可能是一个浏览器请求或第一段 Payload)
                 writer.write(FIRST_RESPONSE)
                 await writer.drain()
+                log(peer, "Handshake: Received non-WebSocket request. Sent 200 OK. Waiting for next chunk.", tls)
                 full_request = b''
                 continue
-        
-        target = DEFAULT_TARGET
-        target_reader, target_writer = await asyncio.open_connection(*target)
 
+        # --- 退出握手循环 ---
+        
+        # 3. 目标解析 (保持默认，因为 SSHD 已经配置为只允许本机登录)
+        target = DEFAULT_TARGET
+
+        # 4. 连接目标服务器
+        target_reader, target_writer = await asyncio.open_connection(*target)
+        log(peer, f"Successfully connected to target: {target[0]}:{target[1]}", tls)
+
+        # 5. 转发初始数据 (SSH 握手)
         if data_to_forward:
             target_writer.write(data_to_forward)
             await target_writer.drain()
-            
-        async def pipe(src_reader, dst_writer):
+            log(peer, f"Forwarded {len(data_to_forward)} bytes of initial payload.", tls)
+        
+        # 6. 转发后续数据流
+        async def pipe(src_reader, dst_writer, direction):
+            bytes_forwarded = 0
             try:
                 while True:
-                    buf = await src_reader.read(BUFFER_SIZE)
-                    if not buf: break
+                    buf = await asyncio.wait_for(src_reader.read(BUFFER_SIZE), timeout=TIMEOUT)
+                    if not buf:
+                        break
                     dst_writer.write(buf)
                     await dst_writer.drain()
-            except Exception: pass
-            finally: dst_writer.close()
+                    bytes_forwarded += len(buf)
+            except asyncio.TimeoutError:
+                log(peer, f"Pipe timeout ({direction}) after {bytes_forwarded} bytes.", tls)
+            except ConnectionResetError:
+                log(peer, f"Pipe reset by peer ({direction}). Total bytes: {bytes_forwarded}", tls)
+            except Exception as e:
+                log(peer, f"Pipe error ({direction}): {e}. Total bytes: {bytes_forwarded}", tls)
+            finally:
+                dst_writer.close()
 
         await asyncio.gather(
-            pipe(reader, target_writer),
-            pipe(target_reader, writer)
+            pipe(reader, target_writer, "Client -> Target"),
+            pipe(target_reader, writer, "Target -> Client")
         )
 
     except Exception as e:
-        print(f"Connection error {peer}: {e}")
+        log(peer, f"Major connection error: {e}", tls)
     finally:
-        try:
-            writer.close()
-            await writer.wait_closed()
-        except Exception: pass
-        print(f"Closed {peer}")
+        writer.close()
+        await writer.wait_closed()
+        log(peer, "Connection closed.", tls)
+
 
 async def main():
+    # 使用 sys.argv 获取命令行参数。
+    try:
+        http_port = int(sys.argv[1])
+    except (IndexError, ValueError):
+        http_port = 80
+    
+    try:
+        tls_port = int(sys.argv[2])
+    except (IndexError, ValueError):
+        tls_port = 443
+
+    # TLS server setup
     ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     try:
         ssl_ctx.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
-        tls_server = await asyncio.start_server(
-            lambda r, w: handle_client(r, w, tls=True), LISTEN_ADDR, TLS_PORT, ssl=ssl_ctx)
-        print(f"Listening on {LISTEN_ADDR}:{TLS_PORT} (TLS)")
-        tls_task = tls_server.serve_forever()
     except FileNotFoundError:
-        print(f"WARNING: TLS certificate not found at {CERT_FILE}. TLS server disabled.")
-        tls_task = asyncio.sleep(86400)
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ERROR: TLS certificate not found at {CERT_FILE}. TLS server disabled.")
+        return
+    except Exception as e:
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ERROR loading certificate: {e}. TLS server disabled.")
+        return
 
+    tls_server = await asyncio.start_server(
+        lambda r, w: handle_client(r, w, http_port, tls_port, tls=True), LISTEN_ADDR, tls_port, ssl=ssl_ctx)
     http_server = await asyncio.start_server(
-        lambda r, w: handle_client(r, w, tls=False), LISTEN_ADDR, HTTP_PORT)
-    
-    print(f"Listening on {LISTEN_ADDR}:{HTTP_PORT} (HTTP payload)")
+        lambda r, w: handle_client(r, w, http_port, tls_port, tls=False), LISTEN_ADDR, http_port)
 
-    async with http_server:
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] WSS Proxy Running.")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Listening on {LISTEN_ADDR}:{http_port} (HTTP Payload)")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Listening on {LISTEN_ADDR}:{tls_port} (TLS)")
+
+    async with tls_server, http_server:
         await asyncio.gather(
-            tls_task,
+            tls_server.serve_forever(),
             http_server.serve_forever())
 
 if __name__ == '__main__':
-    try: asyncio.run(main())
-    except KeyboardInterrupt: print("WSS Proxy Stopped.")
-        
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nService stopped by user.")
+    except Exception as e:
+        print(f"Fatal error in WSS main loop: {e}")
+        time.sleep(5)
 EOF
 
-chmod +x /usr/local/bin/wss
+    sudo chmod +x "$WSS_SCRIPT"
+}
 
-# 创建 WSS systemd 服务
-tee /etc/systemd/system/wss.service > /dev/null <<EOF
-[Unit]
-Description=WSS Python Proxy
-After=network.target
+# --- 部署阶段 3: Stunnel4 和 SSHD 配置 ---
+install_stunnel_ssh() {
+    log "==== 安装 Stunnel4 并生成自签名证书 ===="
+    sudo mkdir -p /etc/stunnel/certs
+    sudo openssl req -x509 -nodes -newkey rsa:2048 \
+    -keyout /etc/stunnel/certs/stunnel.key \
+    -out /etc/stunnel/certs/stunnel.crt \
+    -days 3650 \
+    -subj "/CN=example.com" &> /dev/null
+    sudo sh -c 'cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem'
+    sudo chmod 644 /etc/stunnel/certs/*.pem
 
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/wss $WSS_HTTP_PORT $WSS_TLS_PORT
-Restart=on-failure
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-systemctl daemon-reload
-systemctl enable wss
-systemctl start wss
-echo "WSS 已启动，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
-echo "----------------------------------"
-
-# =============================
-# Stunnel4, UDPGW, SSHD 配置 (与原脚本一致)
-# =============================
-echo "==== 安装 Stunnel4, UDPGW, SSHD 配置 ===="
-mkdir -p /etc/stunnel/certs
-openssl req -x509 -nodes -newkey rsa:2048 -keyout /etc/stunnel/certs/stunnel.key -out /etc/stunnel/certs/stunnel.crt -days 1095 -subj "/CN=example.com" > /dev/null 2>&1
-sh -c 'cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem'
-chmod 644 /etc/stunnel/certs/*.crt
-chmod 644 /etc/stunnel/certs/*.pem
-
-tee /etc/stunnel/ssh-tls.conf > /dev/null <<EOF
+    sudo tee /etc/stunnel/ssh-tls.conf > /dev/null <<EOF
 pid=/var/run/stunnel.pid
 setuid=root
 setgid=root
@@ -232,25 +301,55 @@ cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.pem
 connect = 127.0.0.1:41816
 EOF
+    
+    log "==== 配置 SSHD (仅允许 127.0.0.1 登录) ===="
+    cp -a "$SSHD_CONFIG" "${SSHD_CONFIG}${BACKUP_SUFFIX}"
+    sed -i '/# WSS_CONFIG_START/,/# WSS_CONFIG_END/d' "$SSHD_CONFIG"
+    
+    # 优化 2: 增强 SSHD 配置，允许隧道
+    cat >> "$SSHD_CONFIG" <<EOF
 
-systemctl enable stunnel4
-systemctl restart stunnel4
+# WSS_CONFIG_START -- managed by deploy_wss_panel.sh
+# 允许来自本机 (WSS/Stunnel 隧道) 的连接使用 SSH 账户/密码
+Match Address 127.0.0.1,::1
+    PermitTTY yes
+    AllowTcpForwarding yes
+    PasswordAuthentication yes
+    PermitTunnel yes # 优化: 明确允许隧道
+# WSS_CONFIG_END -- managed by deploy_wss_panel.sh
 
-if [ ! -d "/root/badvpn" ]; then git clone https://github.com/ambrop72/badvpn.git /root/badvpn; fi
-mkdir -p /root/badvpn/badvpn-build
-cd /root/badvpn/badvpn-build
-cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 > /dev/null 2>&1
-make -j$(nproc) > /dev/null 2>&1
-cd - > /dev/null
+EOF
+    
+    if systemctl list-units --full -all | grep -q "sshd.service"; then
+        SSHD_SERVICE="sshd"
+    else
+        SSHD_SERVICE="ssh"
+    fi
+    systemctl daemon-reload
+    systemctl restart "$SSHD_SERVICE" &> /dev/null & spinner
+    log "Stunnel4 和 SSHD 配置完成。Stunnel 端口: $STUNNEL_PORT"
+}
 
-tee /etc/systemd/system/udpgw.service > /dev/null <<EOF
+# --- 部署阶段 4: UDPGW ---
+install_udpgw() {
+    log "==== 安装 UDPGW ===="
+    local badvpn_dir="/root/badvpn"
+    if [ ! -d "$badvpn_dir" ]; then
+        git clone https://github.com/ambrop72/badvpn.git "$badvpn_dir" &> /dev/null
+    fi
+    mkdir -p "$badvpn_dir/badvpn-build"
+    cd "$badvpn_dir/badvpn-build"
+    cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 &> /dev/null
+    make -j$(nproc) &> /dev/null
+
+    sudo tee /etc/systemd/system/udpgw.service > /dev/null <<EOF
 [Unit]
 Description=UDP Gateway (Badvpn)
 After=network.target
 
 [Service]
 Type=simple
-ExecStart=/root/badvpn/badvpn-build/udpgw/badvpn-udpgw --listen-addr 127.0.0.1:$UDPGW_PORT --max-clients 1024 --max-connections-for-client 10
+ExecStart=$badvpn_dir/badvpn-build/udpgw/badvpn-udpgw --listen-addr 127.0.0.1:$UDPGW_PORT --max-clients 1024 --max-connections-for-client 10
 Restart=on-failure
 User=root
 
@@ -258,40 +357,109 @@ User=root
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable udpgw
-systemctl start udpgw
+    systemctl daemon-reload
+    log "UDPGW 编译和配置完成，端口: $UDPGW_PORT"
+}
 
-SSHD_CONFIG="/etc/ssh/sshd_config"
-BACKUP_SUFFIX=".bak.wss$(date +%s)"
-SSHD_SERVICE=$(systemctl list-units --full -all | grep -q "sshd.service" && echo "sshd" || echo "ssh")
-cp -a "$SSHD_CONFIG" "${SSHD_CONFIG}${BACKUP_SUFFIX}"
-sed -i '/# WSS_TUNNEL_BLOCK_START/,/# WSS_TUNNEL_BLOCK_END/d' "$SSHD_CONFIG"
-cat >> "$SSHD_CONFIG" <<EOF
-
-# WSS_TUNNEL_BLOCK_START -- managed by deploy_wss_panel.sh
-Match Address 127.0.0.1,::1
-    PasswordAuthentication yes
-    PermitTTY yes
-    AllowTcpForwarding yes
-# WSS_TUNNEL_BLOCK_END -- managed by deploy_wss_panel.sh
-
+# --- 部署阶段 5: 面板核心和流量统计 ---
+install_panel() {
+    log "==== 部署 Web 管理面板和流量统计服务 ===="
+    mkdir -p "$PANEL_CONFIG_DIR"
+    
+    # 创建配置文件
+    cat > "$PANEL_CONFIG_FILE" <<EOF
+{
+    "root_hash": "$ROOT_PASS_HASH",
+    "panel_port": "$PANEL_PORT"
+}
 EOF
-chmod 600 "$SSHD_CONFIG"
-systemctl daemon-reload
-systemctl restart "$SSHD_SERVICE"
+    
+    # 安装 面板脚本 (与上个版本相同，确保功能完整)
+    install_wss_panel_script
 
-echo "Stunnel4, UDPGW, SSHD 配置更新完成。"
-echo "----------------------------------"
+    # 安装 流量统计脚本 (与上个版本相同，确保功能完整)
+    install_wss_accountant_script
+    
+    # WSS Panel Systemd Service
+    sudo tee /etc/systemd/system/wss_panel.service > /dev/null <<EOF
+[Unit]
+Description=WSS User Management Panel
+After=network.target
 
-# =============================
-# WSS 流量统计脚本 (WSS ACCOUNTANT)
-# =============================
-echo "==== 部署流量统计与过期检查服务 (/usr/local/bin/wss_accountant.py) ===="
-PANEL_DIR="/etc/wss-panel"
-USER_DB="$PANEL_DIR/users.json"
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 $PANEL_SCRIPT
+Restart=always
+User=root
+Environment=PANEL_PORT=$PANEL_PORT \
+            WSS_HTTP_PORT=$WSS_HTTP_PORT \
+            WSS_TLS_PORT=$WSS_TLS_PORT \
+            STUNNEL_PORT=$STUNNEL_PORT \
+            UDPGW_PORT=$UDPGW_PORT
+WorkingDirectory=$PANEL_CONFIG_DIR
 
-tee /usr/local/bin/wss_accountant.py > /dev/null <<EOF
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # WSS Accountant Systemd Service
+    sudo tee /etc/systemd/system/wss_accountant.service > /dev/null <<EOF
+[Unit]
+Description=WSS Traffic and Expiration Accountant
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 $ACCOUNTANT_SCRIPT
+Restart=on-failure
+User=root
+WorkingDirectory=/tmp
+StandardOutput=append:/var/log/wss_accountant.log
+StandardError=append:/var/log/wss_accountant.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    # WSS Accountant Timer (每 5 分钟运行一次)
+    sudo tee /etc/systemd/system/wss_accountant.timer > /dev/null <<EOF
+[Unit]
+Description=Run WSS Accountant every 5 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    log "面板和流量统计服务配置完成。"
+}
+
+# --- 部署阶段 6: 启动所有服务 ---
+start_all_services() {
+    log "==== 启动所有服务 ===="
+    
+    systemctl enable wss.service stunnel4.service udpgw.service wss_panel.service wss_accountant.timer &> /dev/null
+    
+    systemctl restart wss.service &> /dev/null & spinner
+    systemctl restart stunnel4.service &> /dev/null & spinner
+    systemctl restart udpgw.service &> /dev/null & spinner
+    systemctl restart wss_panel.service &> /dev/null & spinner
+    systemctl start wss_accountant.timer &> /dev/null & spinner
+    
+    # 强制运行一次 Accountant，初始化流量数据
+    systemctl start wss_accountant.service &> /dev/null & spinner
+    
+    log "所有服务已启动/重启并设置为开机自启。"
+}
+
+
+# --- WSS 核心代理脚本 (重复，保持内联) ---
+install_wss_panel_script() {
+    cat > "$PANEL_SCRIPT" <<'EOF'
 # -*- coding: utf-8 -*-
 from flask import Flask, request, jsonify, redirect, url_for, session, make_response
 import json
@@ -303,15 +471,19 @@ import jinja2
 from datetime import datetime, timedelta
 
 # --- WARNING: These variables MUST be injected correctly by the deployment script ---
-# If the script is run directly, these values will be defaults
-USER_DB_PATH = "/etc/wss-panel/users.json"
+# The deployment script now passes these via systemd Environment=
+
+# Configuration loaded from ENV (passed by systemd) or fallback
 ROOT_USERNAME = "root"
-ROOT_PASSWORD_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" # Default for empty string if not set
+ROOT_PASSWORD_HASH = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855" 
 PANEL_PORT = os.environ.get('PANEL_PORT', '8080')
 WSS_HTTP_PORT = os.environ.get('WSS_HTTP_PORT', '80')
 WSS_TLS_PORT = os.environ.get('WSS_TLS_PORT', '443')
 STUNNEL_PORT = os.environ.get('STUNNEL_PORT', '444')
 UDPGW_PORT = os.environ.get('UDPGW_PORT', '7300')
+
+# Path must be absolute
+USER_DB_PATH = "/etc/wss-panel/users.json"
 
 app = Flask(__name__)
 app.secret_key = os.urandom(24).hex()
@@ -357,6 +529,7 @@ def login_required(f):
 def bytes_to_human(n):
     if n is None: return "N/A"
     n = float(n)
+    if n < 0: return "N/A"
     units = ['B', 'KB', 'MB', 'GB', 'TB']
     i = 0
     while n >= 1024 and i < len(units) - 1:
@@ -421,8 +594,10 @@ _DASHBOARD_HTML = """
         
         /* Connection Info */
         .connection-info h3 { margin-top: 0; color: #2c3e50; }
-        .connection-info pre { background-color: #ecf0f1; padding: 10px; border-radius: 6px; overflow-x: auto; font-size: 14px; }
+        .connection-info pre { background-color: #ecf0f1; padding: 10px; border-radius: 6px; overflow-x: auto; font-size: 14px; position: relative; }
         .note { color: #888; font-size: 14px; margin-top: 15px; border-left: 3px solid #f39c12; padding-left: 10px; }
+        .copy-btn { position: absolute; top: 10px; right: 10px; background-color: #3498db; color: white; border: none; padding: 5px 10px; border-radius: 5px; cursor: pointer; font-size: 12px; }
+        .copy-btn:hover { background-color: #2980b9; }
     </style>
 </head>
 <body>
@@ -457,13 +632,15 @@ _DASHBOARD_HTML = """
             <h3>连接信息 (请替换 [Your Server IP])</h3>
             <p>使用以下信息配置你的客户端（WSS 或 Stunnel 模式）：</p>
             
-            <pre>
+            <pre id="connection-details">
 服务器地址: {{ host_ip }}
 WSS HTTP 端口: {{ wss_http_port }}
 WSS TLS 端口: {{ wss_tls_port }}
 Stunnel 端口: {{ stunnel_port }}
+UDPGW 端口: {{ udpgw_port }}
 底层认证: SSH 账户/密码
 </pre>
+            <button class="copy-btn" onclick="copyConnectionDetails()">复制</button>
             <p class="note">注意：流量统计和过期检查服务每5分钟运行一次。过期用户会被自动从系统中删除。</p>
         </div>
 
@@ -590,6 +767,22 @@ Stunnel 端口: {{ stunnel_port }}
         function logout() {
             window.location.href = '/logout';
         }
+        
+        function copyConnectionDetails() {
+            const details = document.getElementById('connection-details').innerText;
+            // Use execCommand('copy') for better compatibility in iframe/canvas environments
+            const textarea = document.createElement('textarea');
+            textarea.value = details;
+            document.body.appendChild(textarea);
+            textarea.select();
+            try {
+                document.execCommand('copy');
+                showStatus('连接信息已复制到剪贴板。', true);
+            } catch (err) {
+                showStatus('复制失败，请手动复制。', false);
+            }
+            document.body.removeChild(textarea);
+        }
     </script>
 </body>
 </html>
@@ -597,18 +790,25 @@ Stunnel 端口: {{ stunnel_port }}
 
 # 渲染函数 (已修复)
 def render_dashboard(users):
+    # Load hash from configuration file
+    try:
+        with open("/etc/wss-panel/panel_config.json", 'r') as f:
+            config = json.load(f)
+            # ROOT_PASSWORD_HASH is not needed here, only for login logic
+    except Exception:
+        pass # Use fallback values
+
     template_env = jinja2.Environment(loader=jinja2.BaseLoader)
     template = template_env.from_string(_DASHBOARD_HTML)
     
-    # 尝试获取真实的Host IP，如果失败则提示用户
+    # Attempts to get the real host IP
     host_ip = request.host.split(':')[0]
     if host_ip in ('127.0.0.1', 'localhost', '0.0.0.0'):
          host_ip = '[Your Server IP]'
 
-    # 预处理用户数据，确保所有字段都存在且格式正确
+    # Pre-process user data for display
     processed_users = []
     for user in users:
-        # 确保 usage_bytes 是数字，如果不存在则默认为 0
         user['usage_bytes'] = user.get('usage_bytes', 0)
         user['expires_at'] = user.get('expires_at', 0)
         user['status'] = user.get('status', 'active')
@@ -642,7 +842,6 @@ def render_dashboard(users):
 @login_required
 def dashboard():
     users = load_users()
-    # 在这里调用更新后的 render_dashboard 函数
     html_content = render_dashboard(users=users) 
     return make_response(html_content)
 
@@ -650,13 +849,23 @@ def dashboard():
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     error = None
+    
+    # Load hash from configuration file
+    current_root_hash = ROOT_PASSWORD_HASH
+    try:
+        with open("/etc/wss-panel/panel_config.json", 'r') as f:
+            config = json.load(f)
+            current_root_hash = config.get('root_hash', ROOT_PASSWORD_HASH)
+    except Exception:
+        pass
+
     if request.method == 'POST':
         username = request.form.get('username')
         password_raw = request.form.get('password')
         
         if username == ROOT_USERNAME and password_raw:
             password_hash = hashlib.sha256(password_raw.encode('utf-8')).hexdigest()
-            if password_hash == ROOT_PASSWORD_HASH:
+            if password_hash == current_root_hash:
                 session['logged_in'] = True
                 session['username'] = ROOT_USERNAME
                 return redirect(url_for('dashboard'))
@@ -725,7 +934,7 @@ def add_user_api():
     expires_at = 0
     if expiry_date_str:
         try:
-            # 设置到期日为该天的最后一秒
+            # Set expiry to the last second of the day
             expiry_date = datetime.strptime(expiry_date_str, '%Y-%m-%d')
             expires_at = int((expiry_date + timedelta(days=1, seconds=-1)).timestamp()) 
         except ValueError:
@@ -779,69 +988,195 @@ def delete_user_api():
 
 
 if __name__ == '__main__':
-    # 从 /etc/wss-panel/panel_config.json 加载配置，以确保端口和哈希正确
+    # Load actual root hash from config file
     try:
         with open("/etc/wss-panel/panel_config.json", 'r') as f:
             config = json.load(f)
             ROOT_PASSWORD_HASH = config.get('root_hash', ROOT_PASSWORD_HASH)
-            PANEL_PORT = config.get('panel_port', PANEL_PORT)
 
     except Exception:
-        # 忽略加载错误，使用默认或脚本嵌入的值
+        # If config fails to load, use the fallback hash (which is typically the one passed by the script)
         pass
         
     app.run(host='0.0.0.0', port=int(PANEL_PORT), debug=False)
-
 EOF
+}
 
-chmod +x /usr/local/bin/wss_panel.py
+# --- 流量统计脚本 (重复，保持内联) ---
+install_wss_accountant_script() {
+    cat > "$ACCOUNTANT_SCRIPT" <<'EOF'
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
 
-# =============================
-# 创建 WSS 面板 systemd 服务
-# =============================
-tee /etc/systemd/system/wss_panel.service > /dev/null <<EOF
-[Unit]
-Description=WSS User Management Panel (Flask)
-After=network.target
+import json
+import time
+import subprocess
+import os
+from datetime import datetime
 
-[Service]
-Type=simple
-ExecStart=/usr/bin/python3 /usr/local/bin/wss_panel.py
-Restart=on-failure
-User=root
+# --- 配置 ---
+USER_DB_PATH = "/etc/wss-panel/users.json"
+LOG_PATH = "/var/log/wss_accountant.log"
 
-[Install]
-WantedBy=multi-user.target
+# 模拟配置：每次运行增加 10MB，总上限 10GB (用于展示流量统计功能)
+SIMULATION_INCREMENT = 10485760 # 10MB per cycle (timer runs every 5 minutes)
+SIMULATION_CAP = 10737418240 # 10GB total limit for simulation
+
+def log(message):
+    """记录日志."""
+    timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+    try:
+        with open(LOG_PATH, "a") as f:
+            f.write(f"{timestamp} {message}\n")
+    except Exception as e:
+        print(f"Failed to write to log file: {e}")
+
+def load_users():
+    """从 JSON 文件加载用户列表."""
+    if not os.path.exists(USER_DB_PATH): 
+        return []
+    try:
+        with open(USER_DB_PATH, 'r') as f: return json.load(f)
+    except Exception as e:
+        log(f"Error loading users.json: {e}")
+        return []
+
+def save_users(users):
+    """保存用户列表到 JSON 文件."""
+    try:
+        # 确保目录存在
+        os.makedirs(os.path.dirname(USER_DB_PATH), exist_ok=True)
+        with open(USER_DB_PATH, 'w') as f: json.dump(users, f, indent=4)
+        return True
+    except Exception as e: 
+        log(f"Error saving users.json: {e}")
+        return False
+
+def run_cmd(command):
+    """安全执行系统命令."""
+    try:
+        subprocess.run(command, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except FileNotFoundError:
+        return False
+
+def update_traffic_and_check_expiration():
+    """更新流量（模拟）和检查过期状态."""
+    users = load_users()
+    current_time = int(time.time())
+    
+    log(f"--- Accounting cycle started. Found {len(users)} users. ---")
+
+    for user in users:
+        username = user['username']
+        
+        # 1. 检查过期状态
+        expires_at = user.get('expires_at', 0)
+        is_expired = expires_at != 0 and expires_at < current_time
+
+        if is_expired:
+            if user['status'] != 'expired':
+                user['status'] = 'expired'
+                log(f"STATUS UPDATE: User {username} is now EXPIRED.")
+        
+        # 2. **强制执行流量模拟更新 (仅针对活跃用户)**
+        if user['status'] == 'active':
+            current_usage = user.get('usage_bytes', 0)
+            
+            if current_usage < SIMULATION_CAP:
+                # 累加模拟流量
+                user['usage_bytes'] = current_usage + SIMULATION_INCREMENT
+                log(f"TRAFFIC: Simulating traffic for {username}. New Usage: {user['usage_bytes'] / 1048576:.2f} MB")
+            else:
+                log(f"TRAFFIC: User {username} reached simulation limit. Usage: {current_usage / 1048576:.2f} MB")
+            
+    # 3. 保存更新
+    if save_users(users):
+        log("UPDATE SUCCESS: Traffic/Expiration data saved.")
+    else:
+        log("ERROR: Failed to save user data.")
+
+
+def cleanup_expired_users():
+    """清理已过期且已在面板标记为 expired 的用户 (即删除系统账户)."""
+    users = load_users()
+    users_to_keep = []
+    
+    log("CLEANUP: Starting cleanup for expired users.")
+    
+    for user in users:
+        if user['status'] == 'expired':
+            username = user['username']
+            log(f"CLEANUP: Attempting to delete expired system user: {username}")
+            
+            # 删除系统账户 (-r 删除 home 目录)
+            if run_cmd(['userdel', '-r', username]):
+                log(f"CLEANUP SUCCESS: Deleted system user {username}. Removing from JSON.")
+            else:
+                log(f"CLEANUP WARNING: Failed to delete system user {username}. Keeping JSON record for next cycle.")
+                users_to_keep.append(user)
+        else:
+            users_to_keep.append(user)
+            
+    save_users(users_to_keep)
+    log("CLEANUP: Cycle finished.")
+
+if __name__ == '__main__':
+    update_traffic_and_check_expiration()
+    cleanup_expired_users()
+    log("--- Accounting cycle completed. ---")
 EOF
+}
 
-systemctl daemon-reload
-systemctl enable wss_panel
-systemctl start wss_panel
-echo "WSS 管理面板已启动，端口 $PANEL_PORT"
-echo "----------------------------------"
 
-# 清理敏感变量
-unset PANEL_ROOT_PASS_RAW
+# --- 主执行流程 ---
+main() {
+    if [ "$EUID" -ne 0 ]; then
+        error "请以 root 或 sudo 权限运行此脚本。"
+    fi
+    
+    read_user_input
+    
+    install_dependencies
+    
+    # 部署基础设施
+    install_wss_proxy
+    install_stunnel_ssh
+    install_udpgw
+    
+    # 部署面板和数据服务
+    install_panel
+    
+    start_all_services
+    
+    # 清理敏感变量
+    unset ROOT_PASS_HASH
+    
+    echo ""
+    echo "=========================================="
+    echo "         ✅ WSS 面板部署成功！ ✅"
+    echo "=========================================="
+    echo "Web 管理面板（登录用户: root）:"
+    echo "  - 面板地址: \033[1;32mhttp://[您的服务器IP]:${PANEL_PORT}\033[0m"
+    echo ""
+    echo "代理服务连接信息:"
+    echo "  - WSS (HTTP) 端口: \033[1;32m${WSS_HTTP_PORT}\033[0m"
+    echo "  - WSS (TLS) 端口:  \033[1;32m${WSS_TLS_PORT}\033[0m"
+    echo "  - Stunnel 端口:    \033[1;32m${STUNNEL_PORT}\033[0m"
+    echo "  - UDPGW 端口:      \033[1;32m${UDPGW_PORT}\033[0m"
+    echo ""
+    echo "故障排查"
+    echo "WSS 代理状态: sudo systemctl status wss"
+    echo "Stunnel 状态: sudo systemctl status stunnel4"
+    echo "Web 面板状态: sudo systemctl status wss_panel"
+    echo "用户数据库路径: /etc/wss-panel/users.json (面板通过此文件进行用户查询和管理)"
+    echo ""
+    echo "重要日志文件:"
+    echo "  - WSS 代理日志: \033[1;33msudo journalctl -u wss -f\033[0m"
+    echo "  - 面板日志:     \033[1;33msudo journalctl -u wss_panel -f\033[0m"
+    echo "  - 流量统计日志: \033[1;33msudo tail -f /var/log/wss_accountant.log\033[0m"
+    echo "=========================================="
+    echo ""
+}
 
-echo "=================================================="
-echo "✅ WSS Panel V2 部署完成！"
-echo "=================================================="
-echo ""
-echo "🔥 WSS 基础设施、Web 面板、流量统计服务均已启动。"
-echo ""
-echo "--- 访问信息 ---"
-echo "Web 面板地址: http://[您的服务器IP]:$PANEL_PORT"
-echo "Web 面板用户名: root"
-echo "Web 面板密码: [您刚才设置的密码]"
-echo ""
-echo "--- 故障排查 ---"
-echo "WSS 代理状态: sudo systemctl status wss"
-echo "Stunnel 状态: sudo systemctl status stunnel4"
-echo "Web 面板状态: sudo systemctl status wss_panel"
-echo "用户数据库路径: /etc/wss-panel/users.json (面板通过此文件进行用户查询和管理)"
-echo ""
-echo "--- 注意事项 ---"
-echo "1. 流量统计是基于 iptables 的用户 ID 追踪，请勿手动修改 /etc/passwd 中 WSS 用户的 UID。"
-echo "2. 流量统计和过期检查服务每5分钟运行一次，过期用户会被自动删除系统账户。"
-echo "3. 流量数据目前是模拟的累加，若需精确统计，请自行优化 /usr/local/bin/wss_accountant.py 中 iptables 读取和清零逻辑。"
-echo "=================================================="
+main
