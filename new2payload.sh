@@ -34,14 +34,16 @@ PANEL_PORT=${PANEL_PORT:-8080}
 # 交互式安全输入并确认 ROOT 密码
 echo "请为 Web 面板的 'root' 用户设置密码（输入时隐藏）。"
 while true; do
-  # 第一次密码输入
-  read -r -s -p "面板密码: " pw1
-  echo # 换行
+  # 第一次密码输入 (使用 echo -n 输出提示，read -s 隐藏输入)
+  echo -n "面板密码: "
+  read -r -s pw1
+  echo # 确保换行
 
-  # 第二次确认密码输入
-  read -r -s -p "请再次确认密码: " pw2
-  echo # 换行
-
+  # 第二次确认密码输入
+  echo -n "请再次确认密码: "
+  read -r -s pw2
+  echo # 确保换行
+  
   if [ -z "$pw1" ]; then
     echo "密码不能为空，请重新输入。"
     continue
