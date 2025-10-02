@@ -31,18 +31,15 @@ echo "==== 管理面板配置 ===="
 read -p "请输入 Web 管理面板监听端口 (默认8080): " PANEL_PORT
 PANEL_PORT=${PANEL_PORT:-8080}
 
-# 交互式安全输入并确认 ROOT 密码
-echo "请为 Web 面板的 'root' 用户设置密码（输入时隐藏）。"
+# 交互式安全输入并确认 ROOT 密码 (使用兼容性最好的纯 read 模式)
+echo "----------------------------------"
+echo "请为 Web 面板的 'root' 用户设置密码（注意：为保证兼容性，此处输入**不会**被隐藏）。"
 while true; do
-  # 第一次密码输入 (使用 echo -n 输出提示，read -s 隐藏输入)
-  echo -n "面板密码: "
-  read -r -s pw1
-  echo # 确保换行
-
+  # 第一次密码输入 (不隐藏输入，保证兼容性)
+  read -r -p "面板密码: " pw1
+  
   # 第二次确认密码输入
-  echo -n "请再次确认密码: "
-  read -r -s pw2
-  echo # 确保换行
+  read -r -p "请再次确认密码: " pw2
   
   if [ -z "$pw1" ]; then
     echo "密码不能为空，请重新输入。"
