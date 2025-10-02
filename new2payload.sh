@@ -28,21 +28,29 @@ echo "==== 管理面板配置 ===="
 read -p "请输入 Web 管理面板监听端口 (默认8080): " PANEL_PORT
 PANEL_PORT=${PANEL_PORT:-8080}
 
+# 交互式安全输入并确认 ROOT 密码
 echo "请为 Web 面板的 'root' 用户设置密码（输入时隐藏）。"
 while true; do
-  read -s -p "面板密码: " pw1 && echo
-  read -s -p "请再次确认密码: " pw2 && echo
-  if [ -z "$pw1" ]; then
-    echo "密码不能为空，请重新输入。"
-    continue
-  fi
-  if [ "$pw1" != "$pw2" ]; then
-    echo "两次输入不一致，请重试。"
-    continue
-  fi
-  PANEL_ROOT_PASS_RAW="$pw1"
-  PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | sha256sum | awk '{print $1}')
-  break
+    read -s -p "面板密码: " pw1 && echo
+    read -s -p "请再次确认密码: " pw2 && echo
+    
+    # 确保 [ 和 ] 内部的空格正确
+    if [[ -z "$pw1" ]]; then
+        echo "密码不能为空，请重新输入。"
+        continue
+    fi
+    
+    # 确保 [[ 和 ]] 内部的空格正确
+    if [[ "$pw1" != "$pw2" ]]; then
+        echo "两次输入不一致，请重试。"
+        continue
+    fi
+    
+    PANEL_ROOT_PASS_RAW="$pw1"
+    # 对密码进行简单的 HASH，防止明文存储
+    # 注意: sha256sum 可能不是所有系统内置命令，但 Debian 9 应有。
+    PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | sha256sum | awk '{print $1}')
+    break
 done
 
 echo "----------------------------------"
