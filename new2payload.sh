@@ -31,22 +31,29 @@ echo "==== 管理面板配置 ===="
 read -p "请输入 Web 管理面板监听端口 (默认8080): " PANEL_PORT
 PANEL_PORT=${PANEL_PORT:-8080}
 
+# 交互式安全输入并确认 ROOT 密码 (使用 /dev/tty 确保健壮性)
 echo "请为 Web 面板的 'root' 用户设置密码（输入时隐藏）。"
 while true; do
-  read -s -p "面板密码: " pw1 && echo
-  read -s -p "请再次确认密码: " pw2 && echo
-  if [ -z "$pw1" ]; then
-    echo "密码不能为空，请重新输入。"
-    continue
-  fi
-  if [ "$pw1" != "$pw2" ]; then
-    echo "两次输入不一致，请重试。"
-    continue
-  fi
-  PANEL_ROOT_PASS_RAW="$pw1"
-  # 对密码进行简单的 HASH，防止明文存储
-  PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | sha256sum | awk '{print $1}')
-  break
+  # 第一次密码输入
+  echo -n "面板密码: " > /dev/tty
+  read -r -s pw1 < /dev/tty && echo > /dev/tty # 使用显式 /dev/tty 读写
+
+  # 第二次确认密码输入
+  echo -n "请再次确认密码: " > /dev/tty
+  read -r -s pw2 < /dev/tty && echo > /dev/tty
+  
+  if [ -z "$pw1" ]; then
+    echo "密码不能为空，请重新输入。" > /dev/tty
+    continue
+  fi
+  if [ "$pw1" != "$pw2" ]; then
+    echo "两次输入不一致，请重试。" > /dev/tty
+    continue
+  fi
+  PANEL_ROOT_PASS_RAW="$pw1"
+  # 对密码进行简单的 HASH，防止明文存储
+  PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | sha256sum | awk '{print $1}')
+  break
 done
 
 echo "----------------------------------"
@@ -132,11 +139,11 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             data = await asyncio.wait_for(reader.read(BUFFER_SIZE), timeout=TIMEOUT)
             if not data:
                 break
-            
+            
             full_request += data
-            
+            
             header_end_index = full_request.find(b'\r\n\r\n')
-            
+            
             if header_end_index == -1:
                 writer.write(FIRST_RESPONSE)
                 await writer.drain()
@@ -149,7 +156,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             headers = headers_raw.decode(errors='ignore')
 
             is_websocket_request = 'Upgrade: websocket' in headers or 'Connection: Upgrade' in headers or 'GET-RAY' in headers
-            
+            
             # 3. 转发触发
             if is_websocket_request:
                 writer.write(SWITCH_RESPONSE)
@@ -160,7 +167,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 await writer.drain()
                 full_request = b''
                 continue
-        
+        
         # --- 退出握手循环 ---
 
         # 4. 连接目标服务器 (默认到 Stunnel/SSH 的转发端口)
@@ -171,7 +178,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         if data_to_forward:
             target_writer.write(data_to_forward)
             await target_writer.drain()
-            
+            
         # 6. 转发后续数据流
         async def pipe(src_reader, dst_writer):
             try:
@@ -213,10 +220,10 @@ async def main():
     except FileNotFoundError:
         print(f"WARNING: TLS certificate not found at {CERT_FILE}. TLS server disabled.")
         tls_task = asyncio.sleep(86400) # Keep task running but effectively disabled
-    
+    
     http_server = await asyncio.start_server(
         lambda r, w: handle_client(r, w, tls=False), LISTEN_ADDR, HTTP_PORT)
-    
+    
     print(f"Listening on {LISTEN_ADDR}:{HTTP_PORT} (HTTP payload)")
 
     async with http_server:
@@ -229,7 +236,7 @@ if __name__ == '__main__':
         asyncio.run(main())
     except KeyboardInterrupt:
         print("WSS Proxy Stopped.")
-        
+        
 EOF
 
 chmod +x /usr/local/bin/wss
@@ -525,7 +532,7 @@ def set_system_user_status(username, enable=True):
         command.extend(['-L', username]) 
     else:
         command.extend(['-U', username]) 
-    
+    
     success, output = safe_run_command(command)
     return success, output
 
@@ -616,7 +623,7 @@ _DASHBOARD_HTML = """
         .stat-box { background: linear-gradient(135deg, #ffffff, #f7f7f7); padding: 20px; border-radius: 10px; text-align: center; border: 1px solid #ddd; }
         .stat-box h3 { margin: 0 0 5px 0; color: #555; font-size: 16px; border-bottom: none; padding-bottom: 0; }
         .stat-box p { margin: 0; font-size: 28px; font-weight: 700; color: var(--primary-dark); }
-        
+        
         /* Form */
         .user-form { display: flex; flex-wrap: wrap; gap: 15px; align-items: flex-end; }
         .user-form > div { display: flex; flex-direction: column; }
@@ -632,7 +639,7 @@ _DASHBOARD_HTML = """
         .user-table tr:nth-child(even) { background-color: #f9f9f9; }
         .user-table tr:hover { background-color: #f1f1f1; }
         .user-table tr:last-child td { border-bottom: none; }
-        
+        
         /* Action Buttons */
         .action-btn { background-color: var(--danger-color); color: white; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; font-size: 13px; margin-right: 5px; transition: background-color 0.3s; }
         .action-btn:hover { opacity: 0.9; }
@@ -667,7 +674,7 @@ _DASHBOARD_HTML = """
 
     <div class="container">
         <div id="status-message" class="alert" style="display:none;"></div>
-        
+        
         <div class="grid">
             <div class="stat-box">
                 <h3>已创建用户数</h3>
@@ -742,7 +749,7 @@ _DASHBOARD_HTML = """
             </table>
         </div>
     </div>
-    
+    
     <script>
         function showStatus(message, isSuccess, isInfo = false) {
             const statusDiv = document.getElementById('status-message');
@@ -777,7 +784,7 @@ _DASHBOARD_HTML = """
                 });
 
                 const result = await response.json();
-                
+                
                 if (response.ok && result.success) {
                     showStatus(result.message, true);
                     location.reload();
@@ -793,7 +800,7 @@ _DASHBOARD_HTML = """
             if (window.prompt(\`确定要删除用户 \${username} 吗? (输入 YES 确认)\`) !== 'YES') {
                 return;
             }
-            
+            
             try {
                 const response = await fetch('/api/users/delete', {
                     method: 'POST',
@@ -813,7 +820,7 @@ _DASHBOARD_HTML = """
                 showStatus('请求失败，请检查面板运行状态。', false);
             }
         }
-        
+        
         // --- 状态和流量管理 ---
 
         async function toggleUserStatus(username, action) {
@@ -823,7 +830,7 @@ _DASHBOARD_HTML = """
             if (window.prompt(\`确定要\${actionText}用户 \${username} 吗? (输入 YES 确认)\`) !== 'YES') {
                 return;
             }
-            
+            
             try {
                 const response = await fetch('/api/users/status', {
                     method: 'POST',
@@ -879,7 +886,7 @@ _DASHBOARD_HTML = """
         function logout() {
             window.location.href = '/logout';
         }
-        
+        
         // 暴露给全局以便 HTML 内联调用
         window.deleteUser = deleteUser;
         window.toggleUserStatus = toggleUserStatus;
@@ -907,7 +914,7 @@ def render_dashboard(users):
 
     template_env = jinja2.Environment(loader=jinja2.BaseLoader)
     template = template_env.from_string(_DASHBOARD_HTML)
-    
+    
     host_ip = request.host.split(':')[0]
     if host_ip in ('127.0.0.1', 'localhost'):
          host_ip = '[Your Server IP]'
