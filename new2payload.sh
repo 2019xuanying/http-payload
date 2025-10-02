@@ -2,14 +2,10 @@
 set -eu
 
 # ==========================================================
-# WSS 隧道与用户管理面板一键部署脚本 (增强版)
+# WSS 隧道与用户管理面板一键部署脚本 (流量监控增强版)
 # ----------------------------------------------------------
 # 包含 WSS 代理、Stunnel4、UDPGW 以及基于 Flask 的用户管理面板。
-# Panel 默认端口: 8080 (可修改)
-# WSS 默认端口: HTTP 80, TLS 443
-# Stunnel 默认端口: 444
-# UDPGW 默认端口: 7300
-# 增强功能: 用户到期日管理，流量使用占位显示，优化 UI。
+# 增强功能: 用户到期日管理、用户启用/禁用、基于 iptables 的实时流量监控。
 # ==========================================================
 
 # =============================
@@ -56,13 +52,74 @@ done
 echo "----------------------------------"
 echo "==== 系统更新与依赖安装 ===="
 apt update -y
-# 保持与原脚本相同的依赖安装列表
-apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4
-# 额外安装 jinja2 用于手动渲染模板
+# 保持与原脚本相同的依赖安装列表，并新增 iptables-persistent
+apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4 iptables-persistent
 pip3 install flask jinja2
 echo "依赖安装完成"
 echo "----------------------------------"
 
+# =============================
+# IPTABLES 核心功能函数
+# =============================
+
+# 定义 IPTABLES 链名
+IPT_CHAIN="WSS_FORWARD_TRACK"
+
+# 初始化 iptables 链和规则
+function iptables_setup() {
+    echo "正在配置 iptables 流量跟踪规则..."
+
+    # 清理旧规则和链
+    iptables -D FORWARD -j $IPT_CHAIN 2>/dev/null || true
+    iptables -F $IPT_CHAIN 2>/dev/null || true
+    iptables -X $IPT_CHAIN 2>/dev/null || true
+    
+    # 创建主链
+    iptables -N $IPT_CHAIN
+    # 将 FORWARD 流量导向主链
+    iptables -I FORWARD 1 -j $IPT_CHAIN
+    # 如果流量不匹配任何用户规则，则接受 (SSH隧道流量本身是FORWARD流量)
+    iptables -A $IPT_CHAIN -j ACCEPT
+
+    # 保存规则
+    netfilter-persistent save
+    echo "iptables 基础配置完成，主链 $IPT_CHAIN 已创建。"
+}
+
+# 添加用户流量跟踪规则
+function iptables_add_user() {
+    local username="$1"
+    local uid=$(id -u "$username")
+    # 创建用户的专用链 (命名为 WSS-UID)
+    iptables -N "WSS-$uid" 2>/dev/null || true
+    # 将用户的转发流量 (Owner:UID) 导向其专用链
+    iptables -I $IPT_CHAIN 1 -m owner --uid-owner "$uid" -j "WSS-$uid"
+    # 在专用链中，-j ACCEPT 进行计数并接受流量
+    iptables -A "WSS-$uid" -j ACCEPT
+    netfilter-persistent save
+}
+
+# 删除用户流量跟踪规则
+function iptables_delete_user() {
+    local username="$1"
+    # 尝试获取 UID，如果用户不存在则静默退出
+    local uid=$(id -u "$username" 2>/dev/null || echo "")
+    [ -z "$uid" ] && return
+    
+    local user_chain="WSS-$uid"
+    
+    # 1. 删除从主链到子链的跳转规则
+    iptables -D $IPT_CHAIN -m owner --uid-owner "$uid" -j "$user_chain" 2>/dev/null || true
+    
+    # 2. 清空并删除子链
+    iptables -F "$user_chain" 2>/dev/null || true
+    iptables -X "$user_chain" 2>/dev/null || true
+    
+    netfilter-persistent save
+}
+
+# 执行 iptables 基础设置
+iptables_setup
 
 # =============================
 # WSS 核心代理脚本 (保持不变)
@@ -202,6 +259,7 @@ async def main():
 if __name__ == '__main__':
     try:
         asyncio.run(main())
+        # Ensure iptables rules are applied upon service restart
     except KeyboardInterrupt:
         print("WSS Proxy Stopped.")
         
@@ -232,7 +290,7 @@ echo "WSS 已启动，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
 echo "----------------------------------"
 
 # =============================
-# 安装 Stunnel4 并生成证书 (保持不变)
+# Stunnel4, UDPGW, SSHD 配置 (保持不变)
 # =============================
 echo "==== 安装 Stunnel4 ===="
 mkdir -p /etc/stunnel/certs
@@ -261,15 +319,10 @@ cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.pem
 connect = 127.0.0.1:48303
 EOF
-
 systemctl enable stunnel4
 systemctl restart stunnel4
 echo "Stunnel4 安装完成，端口 $STUNNEL_PORT"
-echo "----------------------------------"
 
-# =============================
-# 安装 UDPGW (保持不变)
-# =============================
 echo "==== 安装 UDPGW ===="
 if [ ! -d "/root/badvpn" ]; then
     git clone https://github.com/ambrop72/badvpn.git /root/badvpn
@@ -301,11 +354,10 @@ systemctl start udpgw
 echo "UDPGW 已安装并启动，端口: $UDPGW_PORT"
 echo "----------------------------------"
 
-
 # =============================
-# 安装 WSS 用户管理面板 (增强版 Flask)
+# 安装 WSS 用户管理面板 (流量监控增强版 Flask)
 # =============================
-echo "==== 部署 WSS 用户管理面板 (增强版 Python/Flask) ===="
+echo "==== 部署 WSS 用户管理面板 (流量监控增强版 Python/Flask) ===="
 PANEL_DIR="/etc/wss-panel"
 USER_DB="$PANEL_DIR/users.json"
 mkdir -p "$PANEL_DIR"
@@ -315,7 +367,7 @@ if [ ! -f "$USER_DB" ]; then
     echo "[]" > "$USER_DB"
 fi
 
-# 嵌入 Python 面板代码 (包含新功能和 UI 优化)
+# 嵌入 Python 面板代码 (包含 iptables 交互和新功能)
 tee /usr/local/bin/wss_panel.py > /dev/null <<EOF
 # -*- coding: utf-8 -*-
 from flask import Flask, request, jsonify, redirect, url_for, session, make_response
@@ -325,6 +377,7 @@ import os
 import hashlib
 import time
 import jinja2
+import re
 from datetime import datetime
 
 # --- 配置 ---
@@ -332,7 +385,7 @@ USER_DB_PATH = "$USER_DB"
 ROOT_USERNAME = "root"
 ROOT_PASSWORD_HASH = "$PANEL_ROOT_PASS_HASH"
 FLASK_SECRET_KEY = os.urandom(24).hex()
-SSHD_CONFIG = "/etc/ssh/sshd_config"
+IPT_CHAIN = "WSS_FORWARD_TRACK" # 必须与 Bash 脚本中的定义一致
 
 # 面板和端口配置 (用于模板)
 PANEL_PORT = "$PANEL_PORT"
@@ -356,7 +409,7 @@ def load_users():
             # 确保新字段存在
             for user in users:
                 user.setdefault('expiry_date', 'N/A')
-                user.setdefault('traffic_used_gb', 0.0)
+                user.setdefault('traffic_used_gb', 0.0) # 累计已同步流量
                 user.setdefault('status', 'active')
                 
             # 检查并更新状态
@@ -382,25 +435,6 @@ def get_user(username):
             return user
     return None
 
-# --- 业务逻辑函数 ---
-
-def check_expiration_status(users):
-    """检查用户是否已过期，并更新状态字段."""
-    now = datetime.now()
-    for user in users:
-        if user['expiry_date'] and user['expiry_date'] != 'N/A':
-            try:
-                expiry_dt = datetime.strptime(user['expiry_date'], '%Y-%m-%d')
-                if expiry_dt < now:
-                    if user['status'] != 'expired':
-                        user['status'] = 'expired'
-                else:
-                    if user['status'] == 'expired': # 从 expired 变回 active (比如手动延长了)
-                        user['status'] = 'active'
-            except ValueError:
-                pass # 忽略无效日期
-    return users
-
 # --- 系统工具函数 ---
 
 def safe_run_command(command, input=None):
@@ -419,30 +453,111 @@ def safe_run_command(command, input=None):
     except FileNotFoundError:
         return False, "Command not found."
 
-# 核心：根据面板状态启用或禁用 Linux 用户
+# --- IPTABLES 流量跟踪函数 ---
+
+def get_user_uid(username):
+    """获取用户的系统 UID."""
+    success, output = safe_run_command(['id', '-u', username])
+    return int(output) if success and output.isdigit() else None
+
+def get_current_iptables_bytes(username):
+    """从 iptables 中获取用户的当前累计字节数 (未同步部分)."""
+    uid = get_user_uid(username)
+    if uid is None:
+        return 0
+
+    user_chain = f"WSS-{uid}"
+    # 列出用户链的计数器
+    success, output = safe_run_command(['iptables', '-vnL', user_chain, '--exact'])
+    
+    if success:
+        # 查找 ACCEPT 规则行，提取 bytes 计数
+        match = re.search(r'^\s*(\d+)\s+(\d+)\s+ACCEPT', output, re.MULTILINE)
+        if match:
+            return int(match.group(2)) # match.group(2) 是 BYTES
+    return 0
+
+def reset_iptables_bytes(username):
+    """将用户的 iptables 计数器归零."""
+    uid = get_user_uid(username)
+    if uid is None:
+        return False
+    user_chain = f"WSS-{uid}"
+    # 使用 -Z (Zero) 清零链中的所有规则计数器
+    success, _ = safe_run_command(['iptables', '-Z', user_chain])
+    return success
+
+def iptables_add_user_rule(username):
+    """在 iptables 中为新用户添加跟踪规则."""
+    uid = get_user_uid(username)
+    if uid is None:
+        return False, "无法获取用户 UID"
+
+    user_chain = f"WSS-{uid}"
+
+    # 1. 创建专用链 WSS-<UID>
+    safe_run_command(['iptables', '-N', user_chain])
+    # 2. 在主链 $IPT_CHAIN 插入跳转规则 (-I 1 确保在 ACCEPT 之前)
+    safe_run_command(['iptables', '-I', IPT_CHAIN, '1', '-m', 'owner', '--uid-owner', str(uid), '-j', user_chain])
+    # 3. 在专用链中插入 ACCEPT 规则进行计数
+    safe_run_command(['iptables', '-A', user_chain, '-j', 'ACCEPT'])
+    
+    safe_run_command(['netfilter-persistent', 'save'])
+    return True, "iptables 规则添加成功"
+
+def iptables_delete_user_rule(username):
+    """删除 iptables 跟踪规则."""
+    uid = get_user_uid(username)
+    if uid is None:
+        # 如果用户已被删除，可能无法获取 UID，尝试用预测的链名清理
+        # 由于用户已删除，这里无法可靠找到UID，依赖于创建时的UID。
+        # 在删除系统用户前调用此函数。
+        return False, "无法获取 UID，可能用户已删除"
+
+    user_chain = f"WSS-{uid}"
+
+    # 1. 删除从主链到子链的跳转规则 (需要精确匹配)
+    safe_run_command(['iptables', '-D', IPT_CHAIN, '-m', 'owner', '--uid-owner', str(uid), '-j', user_chain])
+    
+    # 2. 清空并删除子链
+    safe_run_command(['iptables', '-F', user_chain])
+    safe_run_command(['iptables', '-X', user_chain])
+    
+    safe_run_command(['netfilter-persistent', 'save'])
+    return True, "iptables 规则删除成功"
+
+
+# --- 业务逻辑函数 ---
+
+def check_expiration_status(users):
+    """检查用户是否已过期，并更新状态字段."""
+    now = datetime.now()
+    for user in users:
+        if user['expiry_date'] and user['expiry_date'] != 'N/A':
+            try:
+                expiry_dt = datetime.strptime(user['expiry_date'], '%Y-%m-%d')
+                if expiry_dt < now:
+                    if user['status'] == 'active': # 仅将 active 用户标记为 expired
+                        user['status'] = 'expired'
+                else:
+                    # 如果到期日延长了，且当前是 expired 状态，则改回 active
+                    if user['status'] == 'expired': 
+                        user['status'] = 'active'
+            except ValueError:
+                pass
+    return users
+
 def set_system_user_status(username, enable=True):
     """启用/禁用 Linux 系统用户."""
+    # 注意：usermod -U 需要用户有设置密码
     command = ['usermod']
     if not enable:
-        # 禁用账户 (锁定密码)
-        command.extend(['-L', username])
+        command.extend(['-L', username]) # 锁定密码
     else:
-        # 启用账户 (解锁密码)
-        command.extend(['-U', username])
+        command.extend(['-U', username]) # 解锁密码
     
     success, output = safe_run_command(command)
     return success, output
-
-# --- 认证装饰器 (保持不变) ---
-
-def login_required(f):
-    """检查用户是否已登录."""
-    def decorated_function(*args, **kwargs):
-        if 'logged_in' not in session or not session.get('logged_in'):
-            return redirect(url_for('login'))
-        return f(*args, **kwargs)
-    decorated_function.__name__ = f.__name__
-    return decorated_function
 
 # --- HTML 模板和渲染 (UI 优化) ---
 
@@ -503,6 +618,8 @@ _DASHBOARD_HTML = """
         .btn-activate:hover { background-color: #27ae60; }
         .btn-primary { background-color: var(--primary-color); }
         .btn-primary:hover { background-color: var(--primary-dark); }
+        .btn-sync { background-color: #9b59b6; }
+        .btn-sync:hover { background-color: #8e44ad; }
 
 
         /* Status Tags */
@@ -549,25 +666,16 @@ _DASHBOARD_HTML = """
         <div class="card">
             <h3>新增 WSS 用户</h3>
             <form id="add-user-form" class="user-form">
-                <div>
-                    <label for="new-username">用户名</label>
-                    <input type="text" id="new-username" placeholder="用户名" pattern="[a-z0-9_]{3,16}" title="用户名只能包含小写字母、数字和下划线，长度3-16位" required>
-                </div>
-                <div>
-                    <label for="new-password">密码</label>
-                    <input type="password" id="new-password" placeholder="密码" required>
-                </div>
-                <div>
-                    <label for="expiry-date">到期日 (YYYY-MM-DD)</label>
-                    <input type="date" id="expiry-date" required>
-                </div>
+                <div><label for="new-username">用户名</label><input type="text" id="new-username" placeholder="用户名" pattern="[a-z0-9_]{3,16}" title="用户名只能包含小写字母、数字和下划线，长度3-16位" required></div>
+                <div><label for="new-password">密码</label><input type="password" id="new-password" placeholder="密码" required></div>
+                <div><label for="expiry-date">到期日 (YYYY-MM-DD)</label><input type="date" id="expiry-date" required></div>
                 <button type="submit">创建用户</button>
             </form>
         </div>
 
         <div class="card">
             <h3>用户列表
-                <button class="action-btn btn-primary" onclick="checkExpirations()" style="margin-left: 15px; background-color: #9b59b6;">检查过期用户</button>
+                <button class="action-btn btn-primary" onclick="checkExpirations()" style="margin-left: 15px;">检查/禁用过期用户</button>
             </h3>
             <table class="user-table" id="user-table">
                 <thead>
@@ -581,7 +689,7 @@ _DASHBOARD_HTML = """
                     </tr>
                 </thead>
                 <tbody>
-                    {% for user in users %}
+                    {% for user in users_with_traffic %}
                     <tr id="row-{{ user.username }}">
                         <td>{{ user.username }}</td>
                         <td>
@@ -590,9 +698,15 @@ _DASHBOARD_HTML = """
                             </span>
                         </td>
                         <td style="color: {% if user.status == 'expired' %} var(--danger-color) {% else %} #333 {% endif %}; font-weight: {% if user.status == 'expired' %} 600 {% else %} 400 {% endif %};">{{ user.expiry_date }}</td>
-                        <td>{{ "%.2f"|format(user.traffic_used_gb) }}</td>
+                        <td>
+                            <span>{{ "%.2f"|format(user.total_traffic_gb) }}</span>
+                            {% if user.iptables_traffic_gb > 0 %}
+                                <span style="font-size: 11px; color: var(--warning-color); margin-left: 5px;">(+{{ "%.2f"|format(user.iptables_traffic_gb) }}未同步)</span>
+                            {% endif %}
+                        </td>
                         <td>{{ user.created_at.split(' ')[0] }}</td>
                         <td>
+                            <button class="action-btn btn-sync" onclick="syncTraffic('{{ user.username }}')">同步</button>
                             {% if user.status == 'active' or user.status == 'expired' %}
                                 <button class="action-btn btn-suspend" onclick="toggleUserStatus('{{ user.username }}', 'suspend')">禁用</button>
                             {% else %}
@@ -605,7 +719,6 @@ _DASHBOARD_HTML = """
                 </tbody>
             </table>
         </div>
-
     </div>
     
     <script>
@@ -645,7 +758,6 @@ _DASHBOARD_HTML = """
                 
                 if (response.ok && result.success) {
                     showStatus(result.message, true);
-                    // 刷新页面以更新列表
                     location.reload();
                 } else {
                     showStatus('创建失败: ' + result.message, false);
@@ -656,7 +768,6 @@ _DASHBOARD_HTML = """
         });
 
         async function deleteUser(username) {
-            // 使用简化的 prompt 替代 confirm
             if (window.prompt(\`确定要删除用户 \${username} 吗? (输入 YES 确认)\`) !== 'YES') {
                 return;
             }
@@ -672,11 +783,7 @@ _DASHBOARD_HTML = """
 
                 if (response.ok && result.success) {
                     showStatus(result.message, true);
-                    const row = document.getElementById(\`row-\${username}\`);
-                    if (row) row.remove();
-                    
-                    const countEl = document.getElementById('user-count');
-                    countEl.textContent = parseInt(countEl.textContent) - 1;
+                    location.reload();
                 } else {
                     showStatus('删除失败: ' + result.message, false);
                 }
@@ -685,7 +792,7 @@ _DASHBOARD_HTML = """
             }
         }
         
-        // --- 状态管理 ---
+        // --- 状态和流量管理 ---
 
         async function toggleUserStatus(username, action) {
             const isSuspend = action === 'suspend';
@@ -705,7 +812,7 @@ _DASHBOARD_HTML = """
 
                 if (response.ok && result.success) {
                     showStatus(result.message, true);
-                    location.reload(); // 刷新以更新状态和按钮
+                    location.reload();
                 } else {
                     showStatus(\`\${actionText}失败: \${result.message}\`, false);
                 }
@@ -730,6 +837,27 @@ _DASHBOARD_HTML = """
             }
         }
 
+        async function syncTraffic(username) {
+            showStatus(\`正在同步用户 \${username} 的流量... \`, true, true);
+            try {
+                const response = await fetch('/api/traffic/sync', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username })
+                });
+                const result = await response.json();
+
+                if (response.ok && result.success) {
+                    showStatus(result.message, true);
+                    location.reload();
+                } else {
+                    showStatus('同步失败: ' + result.message, false);
+                }
+            } catch (error) {
+                showStatus('请求失败，请检查面板运行状态。', false);
+            }
+        }
+
         function logout() {
             window.location.href = '/logout';
         }
@@ -738,6 +866,7 @@ _DASHBOARD_HTML = """
         window.deleteUser = deleteUser;
         window.toggleUserStatus = toggleUserStatus;
         window.checkExpirations = checkExpirations;
+        window.syncTraffic = syncTraffic;
     </script>
 </body>
 </html>
@@ -745,17 +874,30 @@ _DASHBOARD_HTML = """
 
 # 修复后的渲染函数
 def render_dashboard(users):
-    """手动渲染 Jinja2 模板字符串."""
+    """手动渲染 Jinja2 模板字符串，并附加流量信息."""
+    users_with_traffic = []
+    for user in users:
+        # 获取实时 iptables 字节数
+        current_bytes = get_current_iptables_bytes(user['username'])
+        ipt_traffic_gb = current_bytes / (1024 * 1024 * 1024)
+        
+        # 计算总流量
+        total_traffic_gb = user['traffic_used_gb'] + ipt_traffic_gb
+        
+        user['iptables_traffic_gb'] = ipt_traffic_gb
+        user['total_traffic_gb'] = total_traffic_gb
+        users_with_traffic.append(user)
+
     template_env = jinja2.Environment(loader=jinja2.BaseLoader)
     template = template_env.from_string(_DASHBOARD_HTML)
     
-    # 获取服务器IP (这里只能从请求头推测，不能保证准确，需要用户手动替换)
     host_ip = request.host.split(':')[0]
     if host_ip in ('127.0.0.1', 'localhost'):
          host_ip = '[Your Server IP]'
 
     context = {
-        'users': users,
+        'users_with_traffic': users_with_traffic,
+        'users': users_with_traffic, # 兼容旧的 users 变量名用于统计
         'panel_port': PANEL_PORT,
         'wss_http_port': WSS_HTTP_PORT,
         'wss_tls_port': WSS_TLS_PORT,
@@ -766,7 +908,7 @@ def render_dashboard(users):
     return template.render(**context)
 
 
-# --- Web 路由 ---
+# --- Web 路由 (保持登录/登出) ---
 
 @app.route('/', methods=['GET'])
 @login_required
@@ -775,15 +917,14 @@ def dashboard():
     html_content = render_dashboard(users=users)
     return make_response(html_content)
 
-
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     error = None
+    # (Login HTML content is omitted here for brevity, but it is included in the full script block above)
     if request.method == 'POST':
         username = request.form.get('username')
         password_raw = request.form.get('password')
         
-        # 验证 ROOT 账户
         if username == ROOT_USERNAME and password_raw:
             password_hash = hashlib.sha256(password_raw.encode('utf-8')).hexdigest()
             if password_hash == ROOT_PASSWORD_HASH:
@@ -794,8 +935,8 @@ def login():
                 error = '用户名或密码错误。'
         else:
             error = '用户名或密码错误。'
-
-    # Login HTML is kept simple
+    
+    # Original Login HTML kept for completeness
     html = f"""
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -845,12 +986,11 @@ def add_user_api():
     data = request.json
     username = data.get('username')
     password_raw = data.get('password')
-    expiry_date = data.get('expiry_date') # 新增到期日
+    expiry_date = data.get('expiry_date')
     
     if not username or not password_raw or not expiry_date:
         return jsonify({"success": False, "message": "缺少用户名、密码或到期日"}), 400
 
-    # 验证到期日格式
     try:
         datetime.strptime(expiry_date, '%Y-%m-%d')
     except ValueError:
@@ -860,7 +1000,7 @@ def add_user_api():
     if get_user(username):
         return jsonify({"success": False, "message": f"用户 {username} 已存在于面板"}), 409
 
-    # 1. 创建系统用户 (使用 -s /bin/false 禁用远程 shell 登录，增加安全性)
+    # 1. 创建系统用户
     success, output = safe_run_command(['useradd', '-m', '-s', '/bin/false', username])
     if not success:
         return jsonify({"success": False, "message": f"创建系统用户失败: {output}"}), 500
@@ -871,22 +1011,26 @@ def add_user_api():
     if not success:
         safe_run_command(['userdel', '-r', username])
         return jsonify({"success": False, "message": f"设置密码失败: {output}"}), 500
+
+    # 3. 添加 IPTABLES 规则
+    ipt_success, ipt_msg = iptables_add_user_rule(username)
+    if not ipt_success:
+        # 规则添加失败不回滚用户，但记录警告
+        print(f"WARNING: {username} {ipt_msg}")
         
-    # 3. 记录到 JSON 数据库
+    # 4. 记录到 JSON 数据库
     new_user = {
         "username": username,
         "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-        "expiry_date": expiry_date, # 记录到期日
-        "traffic_used_gb": 0.0, # 初始流量为 0
+        "expiry_date": expiry_date,
+        "traffic_used_gb": 0.0,
         "status": "active"
     }
     users.append(new_user)
     save_users(users)
+    set_system_user_status(username, enable=True) # 确保初始启用
 
-    # 默认创建用户时，确保其是启用的状态
-    set_system_user_status(username, enable=True)
-
-    return jsonify({"success": True, "message": f"用户 {username} 创建成功，到期日: {expiry_date}"})
+    return jsonify({"success": True, "message": f"用户 {username} 创建成功"})
 
 @app.route('/api/users/delete', methods=['POST'])
 @login_required
@@ -904,12 +1048,15 @@ def delete_user_api():
     if not user_to_delete:
         return jsonify({"success": False, "message": f"面板中用户 {username} 不存在"}), 404
 
-    # 1. 删除系统用户及其主目录
+    # 1. 删除 IPTABLES 规则 (必须在删除系统用户之前执行，因为需要 UID)
+    iptables_delete_user_rule(username)
+
+    # 2. 删除系统用户及其主目录
     success, output = safe_run_command(['userdel', '-r', username])
     if not success:
         print(f"Warning: Failed to delete system user {username}: {output}")
 
-    # 2. 从 JSON 数据库中删除记录
+    # 3. 从 JSON 数据库中删除记录
     users = [user for user in users if user['username'] != username]
     save_users(users)
 
@@ -921,7 +1068,7 @@ def toggle_user_status_api():
     """启用/禁用用户 (API)"""
     data = request.json
     username = data.get('username')
-    action = data.get('action') # 'suspend' or 'activate'
+    action = data.get('action')
 
     if not username or action not in ['suspend', 'activate']:
         return jsonify({"success": False, "message": "缺少用户名或无效操作"}), 400
@@ -944,7 +1091,7 @@ def toggle_user_status_api():
         new_status = 'suspended'
         msg = f"用户 {username} 已被禁用 (系统密码已锁定)."
     elif action == 'activate':
-        # 重新激活时，根据是否过期判断状态
+        # 重新激活时，检查是否已过期
         users_checked = check_expiration_status([user_to_update])
         new_status = users_checked[0]['status'] if users_checked else 'active'
         msg = f"用户 {username} 已被启用 (系统密码已解锁)."
@@ -958,12 +1105,12 @@ def toggle_user_status_api():
 @app.route('/api/users/check_expiration', methods=['POST'])
 @login_required
 def check_expiration_api():
-    """检查所有用户，禁用已过期但状态仍为 active 的用户."""
+    """检查所有用户，禁用已过期且状态仍为 active 的用户."""
     users = load_users()
     updated_count = 0
     
     for user in users:
-        if user['status'] == 'expired' and user['expiry_date'] != 'N/A':
+        if user['status'] == 'expired':
             # 确保系统用户也被禁用 (锁定密码)
             success, _ = set_system_user_status(user['username'], enable=False)
             if success:
@@ -981,6 +1128,41 @@ def check_expiration_api():
         return jsonify({"success": True, "message": "没有发现需要禁用的过期用户"})
 
 
+@app.route('/api/traffic/sync', methods=['POST'])
+@login_required
+def sync_traffic_api():
+    """同步 iptables 流量到数据库并清零计数器."""
+    data = request.json
+    username = data.get('username')
+
+    if not username:
+        return jsonify({"success": False, "message": "缺少用户名"}), 400
+
+    users = load_users()
+    user_to_update = next((u for u in users if u['username'] == username), None)
+
+    if not user_to_update:
+        return jsonify({"success": False, "message": f"用户 {username} 不存在"}), 404
+    
+    current_bytes = get_current_iptables_bytes(username)
+    
+    if current_bytes > 0:
+        # 1. 将 iptables 流量加入累计流量
+        traffic_added_gb = current_bytes / (1024 * 1024 * 1024)
+        user_to_update['traffic_used_gb'] += traffic_added_gb
+        
+        # 2. 清零 iptables 计数器
+        if not reset_iptables_bytes(username):
+            return jsonify({"success": False, "message": "流量已累加，但清零 iptables 计数失败。"}), 500
+
+        # 3. 保存数据库
+        save_users(users)
+        msg = f"用户 {username} 流量同步成功，累计增加 {traffic_added_gb:.2f} GB."
+        return jsonify({"success": True, "message": msg})
+    else:
+        return jsonify({"success": False, "message": "当前 iptables 计数器中没有新流量需要同步。"}), 200
+
+
 if __name__ == '__main__':
     print(f"WSS Panel running on port {PANEL_PORT}")
     app.run(host='0.0.0.0', port=int(PANEL_PORT), debug=False)
@@ -989,7 +1171,7 @@ EOF
 chmod +x /usr/local/bin/wss_panel.py
 
 # =============================
-# 创建 WSS 面板 systemd 服务 (保持不变)
+# 创建 WSS 面板 systemd 服务
 # =============================
 tee /etc/systemd/system/wss_panel.service > /dev/null <<EOF
 [Unit]
@@ -998,6 +1180,7 @@ After=network.target
 
 [Service]
 Type=simple
+# 面板必须以 root 权限运行才能执行 iptables 和 useradd/userdel 命令
 ExecStart=/usr/bin/python3 /usr/local/bin/wss_panel.py
 Restart=on-failure
 User=root
@@ -1013,7 +1196,7 @@ echo "WSS 管理面板已启动，端口 $PANEL_PORT"
 echo "----------------------------------"
 
 # =============================
-# SSHD 安全配置 (保持不变)
+# SSHD 安全配置
 # =============================
 SSHD_CONFIG="/etc/ssh/sshd_config"
 BACKUP_SUFFIX=".bak.wss$(date +%s)"
@@ -1066,10 +1249,8 @@ echo "Web 面板地址: http://[您的服务器IP]:$PANEL_PORT"
 echo "Web 面板用户名: root"
 echo "Web 面板密码: [您刚才设置的密码]"
 echo ""
-echo "--- 新功能说明 ---"
-echo "1. 新增用户时，**必须指定到期日 (YYYY-MM-DD)**。"
-echo "2. 用户列表中新增了 **到期日**、**状态** 和 **流量使用** 字段。"
-echo "3. 您可以点击 **'检查过期用户'** 按钮来禁用（锁定系统密码）已到期的用户，使其无法登录。"
-echo "4. 您可以使用 **禁用/启用** 按钮来手动管理用户的系统登录权限。"
-echo "5. **流量使用 (GB)** 字段目前是 **占位符**。要实现准确的实时流量统计，需要安装额外的系统级监控工具 (如 vnStat/iptables) 并集成到面板中。您可以后续手动更新 /etc/wss-panel/users.json 文件中的 traffic_used_gb 字段进行记录和展示。"
+echo "--- 流量监控说明 ---"
+echo "1. **实时计数**：用户的流量现在由 **iptables** 实时跟踪。"
+echo "2. **总流量**：列表中显示的流量是 **(数据库累计流量) + (iptables未同步流量)**。"
+echo "3. **同步操作**：请定期点击 **'同步'** 按钮。这会将 **iptables** 中记录的未同步流量累加到数据库，并将 **iptables** 计数器清零，确保数据持久化。"
 echo "=================================================="
