@@ -5,7 +5,7 @@ set -eu
 # WSS 隧道与用户管理面板一键部署脚本 (V2 - 增强版)
 # ----------------------------------------------------------
 # 新增功能: 流量统计, 到期日, 账户状态 (在线/离线/暂停), 优化 UI。
-# Panel 默认端口: 8080 (可修改)
+# Panel 默认端口: 54321 (已根据您的上次输入预设)
 # WSS 默认端口: HTTP 80, TLS 443
 # Stunnel 默认端口: 444
 # UDPGW 默认端口: 7300
@@ -16,6 +16,7 @@ set -eu
 # =============================
 echo "----------------------------------"
 echo "==== WSS 基础设施端口配置 ===="
+# 使用上次输入或默认值
 read -p "请输入 WSS HTTP 监听端口 (默认80): " WSS_HTTP_PORT
 WSS_HTTP_PORT=${WSS_HTTP_PORT:-80}
 
@@ -30,32 +31,37 @@ UDPGW_PORT=${UDPGW_PORT:-7300}
 
 echo "----------------------------------"
 echo "==== 管理面板配置 ===="
-read -p "请输入 Web 管理面板监听端口 (默认8080): " PANEL_PORT
-PANEL_PORT=${PANEL_PORT:-8080}
+read -p "请输入 Web 管理面板监听端口 (默认54321): " PANEL_PORT
+PANEL_PORT=${PANEL_PORT:-54321} # 默认值修改为上次输入 54321
 
-# 交互式安全输入并确认 ROOT 密码
+# 交互式安全输入并确认 ROOT 密码 (修复了可能的语法错误)
 echo "请为 Web 面板的 'root' 用户设置密码（输入时隐藏）。"
 while true; do
-  read -s -p "面板密码: " pw1 && echo
-  read -s -p "请再次确认密码: " pw2 && echo
-  if [ -z "$pw1" ]; then
-    echo "密码不能为空，请重新输入。"
-    continue
-  fi
-  if [ "$pw1" != "$pw2" ]; then
-    echo "两次输入不一致，请重试。"
-    continue
-  fi
-  PANEL_ROOT_PASS_RAW="$pw1"
-  # 对密码进行简单的 HASH，防止明文存储
-  PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | sha256sum | awk '{print $1}')
-  break
+    read -s -p "面板密码: " pw1
+    echo
+    read -s -p "请再次确认密码: " pw2
+    echo
+
+    if [ -z "$pw1" ]; then
+        echo "密码不能为空，请重新输入。"
+        continue
+    fi
+
+    if [ "$pw1" != "$pw2" ]; then
+        echo "两次输入不一致，请重试。"
+        continue
+    fi
+    # 密码校验通过
+    PANEL_ROOT_PASS_RAW="$pw1"
+    # 对密码进行简单的 HASH
+    PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | sha256sum | awk '{print $1}')
+    break
 done
 
 echo "----------------------------------"
 echo "==== 系统更新与依赖安装 ===="
 apt update -y
-# 确保安装 `dateutils` 用于日期计算（虽然 Python 内部会处理，但这里可以作为备选）
+# 确保安装 procps 用于 pgrep 进程状态检查
 apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4 procps
 pip3 install flask jinja2
 echo "依赖安装完成"
@@ -69,7 +75,7 @@ tee /usr/local/bin/wss > /dev/null <<'EOF'
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-# WSS 核心代理脚本 V1 (保持原样，负责 WSS/HTTP Payload 转发至 127.0.0.1:41816)
+# WSS 核心代理脚本 V1 (负责 WSS/HTTP Payload 转发至 127.0.0.1:41816)
 
 import asyncio, ssl, sys
 
@@ -93,7 +99,6 @@ KEY_FILE = '/etc/stunnel/certs/stunnel.key'
 # HTTP/WebSocket 握手响应
 FIRST_RESPONSE = b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK\r\n\r\n'
 SWITCH_RESPONSE = b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'
-FORBIDDEN_RESPONSE = b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
     peer = writer.get_extra_info('peername')
@@ -317,8 +322,8 @@ if [ ! -f "$USER_DB" ]; then
     echo "[]" > "$USER_DB"
 fi
 
-# 嵌入 Python 面板代码 (修复了模板渲染问题，并加入新逻辑)
-tee /usr/local/bin/wss_panel.py > /dev/null <<'EOF'
+# 嵌入 Python 面板代码
+tee /usr/local/bin/wss_panel.py > /dev/null <<EOF
 # -*- coding: utf-8 -*-
 from flask import Flask, request, jsonify, redirect, url_for, session, make_response
 import json
@@ -403,7 +408,6 @@ def safe_run_command(command, input=None):
 
 def check_user_status(user):
     """检查用户状态: 在线/离线/暂停.  
-        Note: 无法获取客户端真实 IP, 因为 SSH 连接来自 127.0.0.1。
     """
     now = datetime.now(TZ).date()
     expiry_date = datetime.strptime(user.get('expiry_date', '2099-12-31'), '%Y-%m-%d').date()
@@ -421,8 +425,7 @@ def check_user_status(user):
         pids = output.split('\n')
         # 找到第一个 PID
         pid = pids[0]
-        # 检查 SSH 连接的 IP (由于隧道，IP 总是 127.0.0.1)
-        # 实际客户端 IP 无法获取，这里返回 PID 作为追溯信息
+        # 由于隧道原因，IP 始终是 127.0.0.1。这里返回 PID 作为追溯信息。
         return {"status": "Online", "details": f"PID: {pid}", "pid": pid}
         
     return {"status": "Offline", "details": "离线", "pid": None}
@@ -437,7 +440,7 @@ def login_required(f):
             return redirect(url_for('login'))
         return f(*args, **kwargs)
     decorated_function.__name__ = f.__name__
-    return login_required.__name__
+    return decorated_function
 
 # --- HTML 模板和渲染 (Material Design 风格) ---
 
@@ -616,7 +619,7 @@ Stunnel 端口: {{ stunnel_port }}
         }
 
         async function deleteUser(username) {
-            if (!window.confirm(\`确定要删除用户 \${username} 吗？这将从系统中永久删除该用户。\`)) {
+            if (!window.confirm(\`确定要删除用户 \${username} 吗？这将从系统中永久删除该用户。 (输入 Y 确认)\`)) {
                 return;
             }
             
@@ -645,7 +648,7 @@ Stunnel 端口: {{ stunnel_port }}
         }
 
         async function resetTraffic(username) {
-            if (!window.confirm(\`确定要重置用户 \${username} 的已用流量吗？\`)) {
+            if (!window.confirm(\`确定要重置用户 \${username} 的已用流量吗？ (输入 Y 确认)\`)) {
                 return;
             }
             
@@ -659,7 +662,9 @@ Stunnel 端口: {{ stunnel_port }}
                 
                 if (response.ok && result.success) {
                     showStatus(result.message, true);
-                    document.getElementById(\`traffic-\${username}\`).textContent = '0.00';
+                    // 仅更新显示的值，不需要刷新
+                    const trafficElement = document.getElementById(\`traffic-\${username}\`);
+                    if (trafficElement) trafficElement.textContent = '0.00';
                 } else {
                     showStatus('重置失败: ' + result.message, false);
                 }
@@ -672,8 +677,9 @@ Stunnel 端口: {{ stunnel_port }}
             window.location.href = '/logout';
         }
         
-        // 使用 window.confirm 替代 alert/prompt，简化 iframe 兼容性问题
+        // 使用 window.confirm 替代 alert/prompt，提高 iframe 兼容性
         window.confirm = function(message) {
+          // 这是一个简化的确认方式，因为 alert/confirm 在 iframe 中表现不佳
           return window.prompt(message + ' (输入 Y 确认)') === 'Y';
         }
     </script>
@@ -722,7 +728,6 @@ def dashboard():
 @app.route('/login', methods=['GET', 'POST'])
 def login():
     error = None
-    # ... (Login HTML/Logic remains the same) ...
     if request.method == 'POST':
         username = request.form.get('username')
         password_raw = request.form.get('password')
@@ -885,7 +890,6 @@ if __name__ == '__main__':
     print(f"WSS Panel running on port {PANEL_PORT}")
     # 由于我们使用 systemd 托管，debug 保持为 False
     app.run(host='0.0.0.0', port=int(PANEL_PORT), debug=False)
-
 EOF
 
 chmod +x /usr/local/bin/wss_panel.py
@@ -937,8 +941,8 @@ cat >> "$SSHD_CONFIG" <<EOF
 Match Address 127.0.0.1,::1
     # 允许密码认证，用于 WSS/Stunnel 隧道连接
     PasswordAuthentication yes
-    # 允许 TTY 和转发
-    PermitTTY no # 明确禁止 TTY 以提高安全性，仅允许转发
+    # 明确禁止 TTY 以提高安全性，仅允许转发
+    PermitTTY no 
     AllowTcpForwarding yes
 # WSS_TUNNEL_BLOCK_END -- managed by deploy_wss_panel.sh
 
@@ -971,5 +975,5 @@ echo ""
 echo "--- 重要说明 ---"
 echo "1. **在线状态**：通过检查 **sshd 进程**确定用户是否连接。"
 echo "2. **连接信息**：由于隧道设计，SSH 连接源 IP 始终是 127.0.0.1。面板显示的是 **sshd 进程 ID (PID)**，您可以利用 PID 在系统层面 (如用 'netstat -antp | grep PID') 追溯连接详情。"
-echo "3. **流量统计**：面板目前提供 **手动重置** 功能。要实现精确的实时流量统计，需要更复杂的系统级集成，超出当前简易 Flask 架构范围。请在面板中 **手动更新或重置** 用户的流量数据。"
+echo "3. **流量统计**：面板目前提供 **手动重置** 功能。要实现精确的实时流量统计，需要更复杂的系统级集成，请在面板中 **手动更新或重置** 用户的流量数据。"
 echo "=================================================="
