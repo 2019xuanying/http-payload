@@ -34,12 +34,13 @@ echo "==== 管理面板配置 ===="
 read -p "请输入 Web 管理面板监听端口 (默认54321): " PANEL_PORT
 PANEL_PORT=${PANEL_PORT:-54321} # 默认值修改为上次输入 54321
 
-# 交互式安全输入并确认 ROOT 密码 (修复了可能的语法错误)
+# 交互式安全输入并确认 ROOT 密码 (关键修复：强制从 /dev/tty 读取)
 echo "请为 Web 面板的 'root' 用户设置密码（输入时隐藏）。"
 while true; do
-    read -s -p "面板密码: " pw1
+    # 强制从 /dev/tty 读取输入，解决 Shell 文件描述符冲突问题
+    read -s -p "面板密码: " pw1 < /dev/tty
     echo
-    read -s -p "请再次确认密码: " pw2
+    read -s -p "请再次确认密码: " pw2 < /dev/tty
     echo
 
     if [ -z "$pw1" ]; then
@@ -68,7 +69,7 @@ echo "依赖安装完成"
 echo "----------------------------------"
 
 # =============================
-# WSS 核心代理脚本 (保持不变)
+# WSS 核心代理脚本 (保持 V1 逻辑不变)
 # =============================
 echo "==== 安装 WSS 核心代理脚本 (/usr/local/bin/wss) ===="
 tee /usr/local/bin/wss > /dev/null <<'EOF'
@@ -99,7 +100,6 @@ KEY_FILE = '/etc/stunnel/certs/stunnel.key'
 # HTTP/WebSocket 握手响应
 FIRST_RESPONSE = b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK\r\n\r\n'
 SWITCH_RESPONSE = b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'
-FORBIDDEN_RESPONSE = b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
     peer = writer.get_extra_info('peername')
@@ -408,7 +408,7 @@ def safe_run_command(command, input=None):
         return False, f"Command error: {e}"
 
 def check_user_status(user):
-    """检查用户状态: 在线/离线/暂停.  
+    """检查用户状态: 在线/离线/暂停.  
     """
     now = datetime.now(TZ).date()
     expiry_date = datetime.strptime(user.get('expiry_date', '2099-12-31'), '%Y-%m-%d').date()
@@ -824,7 +824,7 @@ def add_user_api():
         "username": username,
         "created_at": datetime.now(TZ).strftime("%Y-%m-%d %H:%M:%S"),
         "expiry_date": expiry_date, # 新增到期日
-        "traffic_used_gb": 0.0,     # 新增已用流量 (手动维护)
+        "traffic_used_gb": 0.0,     # 新增已用流量 (手动维护)
         "status": "active"
     }
     users.append(new_user)
@@ -943,7 +943,7 @@ Match Address 127.0.0.1,::1
     # 允许密码认证，用于 WSS/Stunnel 隧道连接
     PasswordAuthentication yes
     # 明确禁止 TTY 以提高安全性，仅允许转发
-    PermitTTY no 
+    PermitTTY no 
     AllowTcpForwarding yes
 # WSS_TUNNEL_BLOCK_END -- managed by deploy_wss_panel.sh
 
