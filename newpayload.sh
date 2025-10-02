@@ -83,7 +83,7 @@ try:
 except (IndexError, ValueError):
     TLS_PORT = 443
 
-DEFAULT_TARGET = ('127.0.0.1', 41816)
+DEFAULT_TARGET = ('127.0.0.1', 48303)
 BUFFER_SIZE = 65536
 TIMEOUT = 3600
 CERT_FILE = '/etc/stunnel/certs/stunnel.pem'
@@ -256,7 +256,7 @@ socket = r:TCP_NODELAY=1
 accept = 0.0.0.0:$STUNNEL_PORT
 cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.pem
-connect = 127.0.0.1:41816
+connect = 127.0.0.1:48303
 EOF
 
 systemctl enable stunnel4
@@ -853,7 +853,7 @@ echo "--- 端口信息 ---"
 echo "WSS (HTTP/WebSocket): $WSS_HTTP_PORT"
 echo "WSS (TLS/WebSocket): $WSS_TLS_PORT"
 echo "Stunnel (TLS 隧道): $STUNNEL_PORT"
-echo "内部转发端口 (SSH): 41816 (由 WSS/Stunnel 转发)"
+echo "内部转发端口 (SSH): 48303 (由 WSS/Stunnel 转发)"
 echo ""
 echo "--- 故障排查 ---"
 echo "WSS 代理状态: sudo systemctl status wss"
