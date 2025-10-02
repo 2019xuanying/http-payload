@@ -76,7 +76,7 @@ tee /usr/local/bin/wss > /dev/null <<'EOF'
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-# WSS 核心代理脚本 V1 (负责 WSS/HTTP Payload 转发至 127.0.0.1:41816)
+# WSS 核心代理脚本 V1 (负责 WSS/HTTP Payload 转发至 127.0.0.1:48303)
 
 import asyncio, ssl, sys
 
@@ -91,7 +91,7 @@ try:
 except (IndexError, ValueError):
     TLS_PORT = 443
 
-DEFAULT_TARGET = ('127.0.0.1', 41816) # 转发目标：SSHD 端口
+DEFAULT_TARGET = ('127.0.0.1', 48303) # 转发目标：SSHD 端口
 BUFFER_SIZE = 65536
 TIMEOUT = 3600
 CERT_FILE = '/etc/stunnel/certs/stunnel.pem'
@@ -266,7 +266,7 @@ socket = r:TCP_NODELAY=1
 accept = 0.0.0.0:$STUNNEL_PORT
 cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.pem
-connect = 127.0.0.1:41816
+connect = 127.0.0.1:48303
 EOF
 
 systemctl enable stunnel4
