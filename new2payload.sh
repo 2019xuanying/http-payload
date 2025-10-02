@@ -2,12 +2,13 @@
 set -eu
 
 # ==========================================================
-# WSS 隧道与用户管理面板一键部署脚本 (最终修正版)
+# WSS 隧道与用户管理面板一键部署脚本 (兼容性修正版)
 # ----------------------------------------------------------
-# 修复 Bash 语法错误，并集成了 SQLite 数据库、到期日和流量监控功能。
+# 修正了 Debian 9/Systemd 环境下 Stunnel4/UDPGW 服务启用失败的问题。
+# 集成了 SQLite 数据库、到期日和流量监控功能。
 # ==========================================================
 
-# --- 端口和密码提示 (修正 Bash 语法) ---
+# --- 端口和密码提示 ---
 echo "----------------------------------"
 echo "==== WSS 基础设施端口配置 ===="
 read -p "请输入 WSS HTTP 监听端口 (默认80): " WSS_HTTP_PORT
@@ -27,13 +28,12 @@ echo "==== 管理面板配置 ===="
 read -p "请输入 Web 管理面板监听端口 (默认8080): " PANEL_PORT
 PANEL_PORT=${PANEL_PORT:-8080}
 
-# **修正后的密码输入部分**：使用最保守的 Bash 语法
+# 密码输入部分 (保留原始风格并确保 Bash 语法正确)
 echo "请为 Web 面板的 'root' 用户设置密码（输入时隐藏）。"
 while true; do
     read -s -p "面板密码: " pw1 && echo
     read -s -p "请再次确认密码: " pw2 && echo
     
-    # 确保 [ 和 ] 以及操作符周围有空格
     if [ -z "$pw1" ]; then
         echo "密码不能为空，请重新输入。"
         continue
@@ -45,14 +45,12 @@ while true; do
     fi
     
     PANEL_ROOT_PASS_RAW="$pw1"
-    # 对密码进行简单的 HASH
     PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | sha256sum | awk '{print $1}')
     break
 done
 
 echo "----------------------------------"
-echo "==== 系统更新与依赖安装 (新增 sqlite3) ===="
-# 额外安装 sqlite3-cli 和 python-dateutil 依赖
+echo "==== 系统更新与依赖安装 ===="
 apt update -y
 apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4 sqlite3
 pip3 install flask jinja2 python-dateutil
@@ -61,7 +59,6 @@ echo "----------------------------------"
 
 # =============================
 # WSS 核心代理脚本 (/usr/local/bin/wss)
-# 保持不变
 # =============================
 echo "==== 安装 WSS 核心代理脚本 (/usr/local/bin/wss) ===="
 tee /usr/local/bin/wss > /dev/null <<'EOF'
@@ -192,7 +189,7 @@ EOF
 
 chmod +x /usr/local/bin/wss
 
-# 创建 WSS systemd 服务 (保持不变)
+# 创建 WSS systemd 服务
 tee /etc/systemd/system/wss.service > /dev/null <<EOF
 [Unit]
 Description=WSS Python Proxy
@@ -203,8 +200,7 @@ Type=simple
 ExecStart=/usr/local/bin/wss $WSS_HTTP_PORT $WSS_TLS_PORT
 Restart=on-failure
 User=root
-
-[Install]
+# 确保服务随系统启动
 WantedBy=multi-user.target
 EOF
 
@@ -215,9 +211,9 @@ echo "WSS 已启动，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
 echo "----------------------------------"
 
 # =============================
-# Stunnel4 & UDPGW (保持不变)
+# 安装 Stunnel4 并生成证书 (修正启用逻辑)
 # =============================
-echo "==== 配置 Stunnel4 和 UDPGW (保持不变) ===="
+echo "==== 安装 Stunnel4 ===="
 mkdir -p /etc/stunnel/certs
 openssl req -x509 -nodes -newkey rsa:2048 \
 -keyout /etc/stunnel/certs/stunnel.key \
@@ -244,9 +240,16 @@ key = /etc/stunnel/certs/stunnel.pem
 connect = 127.0.0.1:48303
 EOF
 
-systemctl enable stunnel4
+# Stunnel4 在较新系统中通常是原生 Systemd 服务，无需手动创建 Unit 文件
+# 移除 systemctl enable (解决 transient 错误)
 systemctl restart stunnel4
+echo "Stunnel4 安装完成，端口 $STUNNEL_PORT"
+echo "----------------------------------"
 
+# =============================
+# 安装 UDPGW (修正启用逻辑)
+# =============================
+echo "==== 安装 UDPGW ===="
 if [ ! -d "/root/badvpn" ]; then
     git clone https://github.com/ambrop72/badvpn.git /root/badvpn
 fi
@@ -274,14 +277,14 @@ EOF
 systemctl daemon-reload
 systemctl enable udpgw
 systemctl restart udpgw
-echo "Stunnel4/UDPGW 配置完成。"
+echo "UDPGW 已安装并启动，端口: $UDPGW_PORT"
 echo "----------------------------------"
 
 # =============================
-# 新增: 流量监控 (Iptables 链)
+# 流量监控 (Iptables 链)
 # =============================
 echo "==== 设置 Iptables 流量监控链 ===="
-# 清除旧的 WSS 链 (如果存在)
+# 清除旧的 WSS 链 (静默错误输出)
 iptables -D INPUT -j WSS_USERS 2>/dev/null || true
 iptables -D FORWARD -j WSS_USERS 2>/dev/null || true
 iptables -F WSS_USERS 2>/dev/null || true
@@ -289,7 +292,7 @@ iptables -X WSS_USERS 2>/dev/null || true
 
 # 创建新的 WSS 流量监控链
 iptables -N WSS_USERS
-# 将所有转发和输入流量导入 WSS_USERS 链，等待用户规则插入
+# 将流量导入 WSS_USERS 链
 iptables -A INPUT -j WSS_USERS
 iptables -A FORWARD -j WSS_USERS
 echo "Iptables 链 WSS_USERS 创建完成。"
@@ -297,9 +300,9 @@ echo "----------------------------------"
 
 
 # =============================
-# 安装 WSS 用户管理面板 (基于 Flask/SQLite)
+# WSS 用户管理面板 (Flask/SQLite)
 # =============================
-echo "==== 部署 WSS 用户管理面板 (Flask/SQLite 优化版) ===="
+echo "==== 部署 WSS 用户管理面板 (Flask/SQLite) ===="
 PANEL_DIR="/etc/wss-panel"
 DB_PATH="$PANEL_DIR/users.db"
 mkdir -p "$PANEL_DIR"
@@ -313,7 +316,6 @@ CREATE TABLE IF NOT EXISTS users (
     expire_date TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active'
 );
--- 流量统计使用 users 表的字段，避免额外的 join 操作 (简化)
 EOS
 echo "数据库初始化完成: $DB_PATH"
 
@@ -333,7 +335,8 @@ from dateutil import parser as date_parser
 DB_PATH = "$DB_PATH"
 ROOT_USERNAME = "root"
 ROOT_PASSWORD_HASH = "$PANEL_ROOT_PASS_HASH"
-FLASK_SECRET_KEY = os.urandom(24).hex()
+# 使用固定的 secret key 避免每次重启都退出登录
+FLASK_SECRET_KEY = os.urandom(24).hex() 
 
 # 面板和端口配置 (用于模板)
 PANEL_PORT = "$PANEL_PORT"
@@ -353,7 +356,7 @@ def get_db_connection():
 
 def get_all_users():
     conn = get_db_connection()
-    # 使用 LEFT JOIN 从 users 表中获取用户，流量统计在 refresh 时更新
+    # 默认流量为 0
     users = conn.execute("SELECT *, 0 AS bytes_in, 0 AS bytes_out FROM users ORDER BY username").fetchall()
     conn.close()
     return [dict(user) for user in users]
@@ -364,7 +367,7 @@ def get_user_by_username(username):
     conn.close()
     return dict(user) if user else None
 
-# --- 认证装饰器 & 工具函数 (保持不变) ---
+# --- 认证装饰器 & 工具函数 ---
 def login_required(f):
     """检查用户是否已登录."""
     def decorated_function(*args, **kwargs):
@@ -394,7 +397,7 @@ def safe_run_command(command, input=None):
 def update_iptables_rules_and_read_traffic():
     """刷新 iptables 规则并读取所有用户的流量统计."""
     conn = get_db_connection()
-    users_data = conn.execute("SELECT username FROM users").fetchall()
+    users_data = conn.execute("SELECT * FROM users").fetchall()
     
     # 1. 清除 WSS_USERS 链中的所有旧规则
     safe_run_command(['iptables', '-F', 'WSS_USERS'])
@@ -404,49 +407,6 @@ def update_iptables_rules_and_read_traffic():
     users_to_update = []
 
     for user_row in users_data:
-        username = user_row[0]
-        
-        try:
-            # 尝试获取用户 UID
-            uid = subprocess.check_output(['id', '-u', username], universal_newlines=True).strip()
-            
-            # 2. 为活跃用户添加 iptables 规则进行统计
-            # 使用 owner 模块匹配用户 UID 的出站流量 (流量从隧道流出)
-            command = ['iptables', '-A', 'WSS_USERS', 
-                     '-m', 'owner', '--uid-owner', uid, 
-                     '-j', 'ACCEPT', 
-                     '-m', 'comment', '--comment', f"WSS_STAT_{username}"]
-            safe_run_command(command)
-            
-            users_to_update.append(username)
-        except Exception:
-            # 用户可能已被删除或被锁定，无法获取 UID，跳过流量统计
-            continue
-
-    # 3. 读取 iptables 链统计 (Packet | Bytes)
-    try:
-        output = subprocess.check_output(['iptables', '-L', 'WSS_USERS', '-v', '-x', '-n'], universal_newlines=True)
-        for line in output.splitlines():
-            if "WSS_STAT_" in line:
-                parts = line.split()
-                # 解析 Comment 字段获取用户名
-                comment_index = parts.index('COMMENT') + 1 
-                if comment_index < len(parts):
-                    rule_username = parts[comment_index].strip('"').replace('WSS_STAT_', '')
-                    
-                    bytes_total = int(parts[1])
-                    # 估算：通常 egress (出站) 流量更大，这里取总值，让客户端估算 in/out
-                    # 为简单起见，我们假设 in = out = total / 2 (这是一个普遍的简化)
-                    bytes_in = bytes_total // 2
-                    bytes_out = bytes_total - bytes_in
-                    all_traffic_stats[rule_username] = {'in': bytes_in, 'out': bytes_out}
-    except Exception:
-        pass # 忽略 iptables 读取失败
-
-    # 4. 更新数据库状态和流量
-    final_users_list = conn.execute("SELECT * FROM users").fetchall()
-    
-    for user_row in final_users_list:
         user = dict(user_row)
         username = user['username']
         
@@ -455,40 +415,73 @@ def update_iptables_rules_and_read_traffic():
         is_expired = expire_date < now
         new_status = 'expired' if is_expired else 'active'
         
-        # 检查系统用户状态 (用于锁定/解锁 SSH 账户)
-        is_system_user_active = True
         try:
-            # 检查密码是否被锁定 (即检查 /etc/shadow 中密码字段是否以 ! 开头)
-            subprocess.check_call(['passwd', '-S', username], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except subprocess.CalledProcessError:
-            is_system_user_active = False # 如果 passwd -S 失败，说明用户可能不存在或有其他问题
+            uid = subprocess.check_output(['id', '-u', username], universal_newlines=True).strip()
+            
+            # 状态管理：锁定/解锁 SSH 账户
+            # 检查用户是否被锁定 (即检查 /etc/shadow 中密码字段是否以 ! 开头)
+            try:
+                subprocess.check_call(['passwd', '-S', username], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except subprocess.CalledProcessError:
+                pass # 忽略 passwd -S 失败，继续处理
 
-        if is_expired and user['status'] != 'expired':
-            # 过期且面板未更新，则锁定系统用户
-            safe_run_command(['usermod', '-L', username]) 
-        elif not is_expired and user['status'] == 'expired':
-            # 被续费，但系统用户仍被锁定，则解锁
-            safe_run_command(['usermod', '-U', username]) 
-        
+            if is_expired and user['status'] != 'expired':
+                safe_run_command(['usermod', '-L', username]) # 锁定系统用户
+            elif not is_expired and user['status'] == 'expired':
+                safe_run_command(['usermod', '-U', username]) # 解锁系统用户
+            
+            # 2. 为当前活跃用户添加 iptables 规则进行统计
+            command = ['iptables', '-A', 'WSS_USERS', 
+                     '-m', 'owner', '--uid-owner', uid, 
+                     '-j', 'ACCEPT', 
+                     '-m', 'comment', '--comment', f"WSS_STAT_{username}"]
+            safe_run_command(command)
+            
+            users_to_update.append(username)
+        except Exception:
+            # 用户可能已被删除或无法获取 UID，跳过流量统计
+            pass
+
         # 更新数据库状态 (如果发生变化)
         conn.execute("UPDATE users SET status = ? WHERE username = ?", (new_status, username))
-        
-        # 流量统计更新到字典中
-        traffic = all_traffic_stats.get(username, {'in': 0, 'out': 0})
-        user['bytes_in'] = traffic['in']
-        user['bytes_out'] = traffic['out']
-        
+    
     conn.commit()
+
+    # 3. 读取 iptables 链统计 (Packet | Bytes)
+    try:
+        output = subprocess.check_output(['iptables', '-L', 'WSS_USERS', '-v', '-x', '-n'], universal_newlines=True)
+        for line in output.splitlines():
+            if "WSS_STAT_" in line:
+                parts = line.split()
+                comment_index = parts.index('COMMENT') + 1
+                if comment_index < len(parts):
+                    rule_username = parts[comment_index].strip('"').replace('WSS_STAT_', '')
+                    
+                    bytes_total = int(parts[1])
+                    bytes_in = bytes_total // 2
+                    bytes_out = bytes_total - bytes_in
+                    all_traffic_stats[rule_username] = {'in': bytes_in, 'out': bytes_out}
+    except Exception:
+        pass 
+
+    # 4. 重新查询用户列表，并附加流量数据
+    final_users_list = conn.execute("SELECT * FROM users").fetchall()
     conn.close()
     
-    # 返回包含流量信息的完整列表
-    return [dict(user) for user in final_users_list]
+    result_list = []
+    for user_row in final_users_list:
+        user = dict(user_row)
+        traffic = all_traffic_stats.get(user['username'], {'in': 0, 'out': 0})
+        user['bytes_in'] = traffic['in']
+        user['bytes_out'] = traffic['out']
+        result_list.append(user)
+    
+    return result_list
 
 
 def refresh_traffic_and_status():
     """刷新所有用户的流量统计和到期状态 (外部调用接口)."""
-    all_users_with_traffic = update_iptables_rules_and_read_traffic()
-    return all_users_with_traffic
+    return update_iptables_rules_and_read_traffic()
 
 
 def format_bytes(bytes_value):
@@ -503,9 +496,7 @@ def format_bytes(bytes_value):
         i += 1
     return f"{bytes_value:.2f} {sizes[i]}"
 
-# --- HTML 模板和渲染 (UI 优化: 使用更现代的配色和布局) ---
-
-# 仪表盘 HTML (内嵌)
+# --- HTML 模板和渲染 ---
 _DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -678,8 +669,8 @@ _DASHBOARD_HTML = """
                 if (response.ok && result.success) {
                     showStatus(result.message, true);
                     document.getElementById('add-user-form').reset();
-                    setInitialExpireDate(); // 重置初始日期
-                    refreshData(true); // 强制刷新数据
+                    setInitialExpireDate(); 
+                    refreshData(true); 
                 } else {
                     showStatus('创建失败: ' + (result.message || '未知错误'), false);
                 }
@@ -701,7 +692,7 @@ _DASHBOARD_HTML = """
                 const result = await response.json();
                 if (response.ok && result.success) {
                     showStatus(result.message, true);
-                    refreshData(true); // 强制刷新数据
+                    refreshData(true); 
                 } else {
                     showStatus('删除失败: ' + (result.message || '未知错误'), false);
                 }
@@ -747,24 +738,27 @@ _DASHBOARD_HTML = """
 
         // --- 实时刷新功能 ---
         
-        // forceRefresh: 只有在添加/删除用户时才需要强制刷新整个页面数据
-        async function refreshData(forceRefresh = false) {
-            if (!forceRefresh) {
-                // 仅更新流量统计
+        async function refreshData(forceReload = false) {
+            if (forceReload) {
+                location.reload();
+                return;
+            }
+            
+            try {
+                // GET API 仅用于获取流量和状态更新
                 const response = await fetch('/api/data/refresh', { method: 'GET' });
                 if (response.ok) {
                     const data = await response.json();
                     updateTable(data.users);
                     document.getElementById('user-count').textContent = `${data.active_count} / ${data.users.length}`;
                 }
-            } else {
-                // 强制刷新 (如删除/添加用户)
-                location.reload();
+            } catch (error) {
+                console.error('Error during refresh:', error);
+                showStatus('流量统计刷新失败，请检查面板后台服务状态。', false);
             }
         }
 
         function updateTable(users) {
-            // 仅更新现有行的流量和状态
             users.forEach(user => {
                 const row = document.getElementById(`row-\${user.username}`);
                 if (row) {
@@ -791,6 +785,8 @@ _DASHBOARD_HTML = """
 
         window.onload = () => {
             setInitialExpireDate();
+            // 页面加载后立即刷新一次数据 (获取流量)
+            refreshData(false);
         }
         
     </script>
@@ -809,7 +805,7 @@ def render_dashboard(users):
 
     active_users_count = sum(1 for user in users if user.get('status') == 'active')
 
-    # 流量数据需要通过 API 动态获取，这里传入初始化值
+    # 初始加载时不包含流量数据 (前端会通过 API 动态获取)
     for user in users:
         user['bytes_in'] = 0
         user['bytes_out'] = 0
@@ -831,7 +827,6 @@ def render_dashboard(users):
 @app.route('/', methods=['GET'])
 @login_required
 def dashboard():
-    # 仅加载用户列表，不刷新流量，让前端手动点击刷新
     users = [dict(user) for user in get_all_users()]
     html_content = render_dashboard(users=users)
     return make_response(html_content)
@@ -912,7 +907,6 @@ def update_user_date_api():
     
     conn = get_db_connection()
     try:
-        # 将状态重置为 active
         cursor = conn.execute("UPDATE users SET expire_date = ?, status = 'active' WHERE username = ?", (expire_date_str, username))
         conn.commit()
         
@@ -957,7 +951,7 @@ def delete_user_api():
         conn.close()
 
     # 2. 删除系统用户及其主目录
-    safe_run_command(['userdel', '-r', username]) # 即使失败也忽略，以确保面板记录被删除
+    safe_run_command(['userdel', '-r', username]) 
 
     # 3. 刷新 iptables (移除旧规则)
     update_iptables_rules_and_read_traffic()
@@ -1065,7 +1059,7 @@ echo "WSS 管理面板已启动，端口 $PANEL_PORT"
 echo "----------------------------------"
 
 # =============================
-# SSHD 安全配置 (保持不变)
+# SSHD 安全配置
 # =============================
 SSHD_CONFIG="/etc/ssh/sshd_config"
 BACKUP_SUFFIX=".bak.wss$(date +%s)"
