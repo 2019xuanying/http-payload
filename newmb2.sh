@@ -256,7 +256,7 @@ systemctl enable stunnel4
 systemctl restart stunnel4
 
 # UDPGW
-badvpn_dir="/root/badvpn" # FIXED: Removed 'local'
+badvpn_dir="/root/badvpn" # FIXED: Global assignment
 if [ ! -d "$badvpn_dir" ]; then
     git clone https://github.com/ambrop72/badvpn.git "$badvpn_dir" &> /dev/null
 fi
@@ -368,7 +368,7 @@ def format_bytes(bytes_value):
     if bytes_value is None or not isinstance(bytes_value, (int, float)): return "N/A"
     bytes_value = int(bytes_value)
     if bytes_value < 1048576: return f"{bytes_value / 1024:.2f} KB"
-    elif bytes_value < 1073741822: return f"{bytes_value / 1048576:.2f} MB"
+    elif bytes_value < 1073741824: return f"{bytes_value / 1048576:.2f} MB"
     else: return f"{bytes_value / 1073741824:.2f} GB"
 
 def get_days_remaining(timestamp):
@@ -386,10 +386,8 @@ def get_status_badge(status):
     if status == 'expired': return '<span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-red-100 text-red-800">Expired</span>'
     return '<span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full bg-gray-100 text-gray-800">Unknown</span>'
 
-# V8 修复: 彻底移除 subprocess 依赖，简化 IP 查找，避免崩溃
 def get_last_ip(username):
     return "N/A (System Command Removed)" 
-
 
 def run_cmd(command):
     try:
@@ -765,7 +763,6 @@ import sys
 # --- 配置 ---
 USER_DB_PATH = "/etc/wss-panel/users.json"
 LOG_PATH = "/var/log/wss_accountant.log"
-# SIMULATED_TRAFFIC_PER_CYCLE = 1048576 * 10 # 10MB per cycle
 SIMULATED_TRAFFIC_PER_CYCLE = 1048576 * 1 # 1MB per cycle 
 
 def log(message):
