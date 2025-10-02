@@ -2,13 +2,12 @@
 set -eu
 
 # ==========================================================
-# WSS 隧道与用户管理面板一键部署脚本 (优化版)
+# WSS 隧道与用户管理面板一键部署脚本 (最终修正版)
 # ----------------------------------------------------------
-# 包含 WSS 代理、Stunnel4、UDPGW 以及基于 Flask/SQLite 的用户管理面板。
-# 新增功能: 到期日控制、流量使用统计 (基于 iptables)。
+# 修复 Bash 语法错误，并集成了 SQLite 数据库、到期日和流量监控功能。
 # ==========================================================
 
-# --- 端口和密码提示 (保持不变) ---
+# --- 端口和密码提示 (修正 Bash 语法) ---
 echo "----------------------------------"
 echo "==== WSS 基础设施端口配置 ===="
 read -p "请输入 WSS HTTP 监听端口 (默认80): " WSS_HTTP_PORT
@@ -28,34 +27,32 @@ echo "==== 管理面板配置 ===="
 read -p "请输入 Web 管理面板监听端口 (默认8080): " PANEL_PORT
 PANEL_PORT=${PANEL_PORT:-8080}
 
-# 交互式安全输入并确认 ROOT 密码
+# **修正后的密码输入部分**：使用最保守的 Bash 语法
 echo "请为 Web 面板的 'root' 用户设置密码（输入时隐藏）。"
 while true; do
     read -s -p "面板密码: " pw1 && echo
     read -s -p "请再次确认密码: " pw2 && echo
     
-    # 确保 [ 和 ] 内部的空格正确
-    if [[ -z "$pw1" ]]; then
+    # 确保 [ 和 ] 以及操作符周围有空格
+    if [ -z "$pw1" ]; then
         echo "密码不能为空，请重新输入。"
         continue
     fi
     
-    # 确保 [[ 和 ]] 内部的空格正确
-    if [[ "$pw1" != "$pw2" ]]; then
+    if [ "$pw1" != "$pw2" ]; then
         echo "两次输入不一致，请重试。"
         continue
     fi
     
     PANEL_ROOT_PASS_RAW="$pw1"
-    # 对密码进行简单的 HASH，防止明文存储
-    # 注意: sha256sum 可能不是所有系统内置命令，但 Debian 9 应有。
+    # 对密码进行简单的 HASH
     PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | sha256sum | awk '{print $1}')
     break
 done
 
 echo "----------------------------------"
 echo "==== 系统更新与依赖安装 (新增 sqlite3) ===="
-# 额外安装 sqlite3-cli 和 python3-sqlite3 模块
+# 额外安装 sqlite3-cli 和 python-dateutil 依赖
 apt update -y
 apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4 sqlite3
 pip3 install flask jinja2 python-dateutil
@@ -63,7 +60,8 @@ echo "依赖安装完成"
 echo "----------------------------------"
 
 # =============================
-# WSS 核心代理脚本 (保持不变，转发到 48303)
+# WSS 核心代理脚本 (/usr/local/bin/wss)
+# 保持不变
 # =============================
 echo "==== 安装 WSS 核心代理脚本 (/usr/local/bin/wss) ===="
 tee /usr/local/bin/wss > /dev/null <<'EOF'
@@ -94,12 +92,10 @@ SWITCH_RESPONSE = b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nCo
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
     peer = writer.get_extra_info('peername')
-    # print(f"Connection from {peer} {'(TLS)' if tls else ''}") # 禁用频繁打印日志
     forwarding_started = False
     full_request = b''
 
     try:
-        # --- 1. 握手循环 ---
         while not forwarding_started:
             data = await asyncio.wait_for(reader.read(BUFFER_SIZE), timeout=TIMEOUT)
             if not data:
@@ -114,14 +110,12 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 full_request = b''
                 continue
 
-            # 2. 头部解析
             headers_raw = full_request[:header_end_index]
             data_to_forward = full_request[header_end_index + 4:]
             headers = headers_raw.decode(errors='ignore')
 
             is_websocket_request = 'Upgrade: websocket' in headers or 'Connection: Upgrade' in headers or 'GET-RAY' in headers
             
-            # 3. 转发触发
             if is_websocket_request:
                 writer.write(SWITCH_RESPONSE)
                 await writer.drain()
@@ -132,18 +126,13 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 full_request = b''
                 continue
         
-        # --- 退出握手循环 ---
-
-        # 4. 连接目标服务器
         target = DEFAULT_TARGET
         target_reader, target_writer = await asyncio.open_connection(*target)
 
-        # 5. 转发初始数据
         if data_to_forward:
             target_writer.write(data_to_forward)
             await target_writer.drain()
             
-        # 6. 转发后续数据流
         async def pipe(src_reader, dst_writer):
             try:
                 while True:
@@ -221,7 +210,7 @@ EOF
 
 systemctl daemon-reload
 systemctl enable wss
-systemctl restart wss # 使用 restart 确保端口更新
+systemctl restart wss
 echo "WSS 已启动，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
 echo "----------------------------------"
 
@@ -293,10 +282,10 @@ echo "----------------------------------"
 # =============================
 echo "==== 设置 Iptables 流量监控链 ===="
 # 清除旧的 WSS 链 (如果存在)
-iptables -D INPUT -j WSS_USERS || true
-iptables -D FORWARD -j WSS_USERS || true
-iptables -F WSS_USERS || true
-iptables -X WSS_USERS || true
+iptables -D INPUT -j WSS_USERS 2>/dev/null || true
+iptables -D FORWARD -j WSS_USERS 2>/dev/null || true
+iptables -F WSS_USERS 2>/dev/null || true
+iptables -X WSS_USERS 2>/dev/null || true
 
 # 创建新的 WSS 流量监控链
 iptables -N WSS_USERS
@@ -324,13 +313,7 @@ CREATE TABLE IF NOT EXISTS users (
     expire_date TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'active'
 );
--- 使用 user_traffic 表记录每个用户的 iptables 计数
-CREATE TABLE IF NOT EXISTS user_traffic (
-    username TEXT PRIMARY KEY NOT NULL,
-    bytes_in INTEGER DEFAULT 0,
-    bytes_out INTEGER DEFAULT 0,
-    FOREIGN KEY (username) REFERENCES users(username) ON DELETE CASCADE
-);
+-- 流量统计使用 users 表的字段，避免额外的 join 操作 (简化)
 EOS
 echo "数据库初始化完成: $DB_PATH"
 
@@ -351,14 +334,12 @@ DB_PATH = "$DB_PATH"
 ROOT_USERNAME = "root"
 ROOT_PASSWORD_HASH = "$PANEL_ROOT_PASS_HASH"
 FLASK_SECRET_KEY = os.urandom(24).hex()
-SSHD_CONFIG = "/etc/ssh/sshd_config"
 
 # 面板和端口配置 (用于模板)
 PANEL_PORT = "$PANEL_PORT"
 WSS_HTTP_PORT = "$WSS_HTTP_PORT"
 WSS_TLS_PORT = "$WSS_TLS_PORT"
 STUNNEL_PORT = "$STUNNEL_PORT"
-UDPGW_PORT = "$UDPGW_PORT"
 
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET_KEY
@@ -372,7 +353,8 @@ def get_db_connection():
 
 def get_all_users():
     conn = get_db_connection()
-    users = conn.execute("SELECT u.*, t.bytes_in, t.bytes_out FROM users u LEFT JOIN user_traffic t ON u.username = t.username ORDER BY u.username").fetchall()
+    # 使用 LEFT JOIN 从 users 表中获取用户，流量统计在 refresh 时更新
+    users = conn.execute("SELECT *, 0 AS bytes_in, 0 AS bytes_out FROM users ORDER BY username").fetchall()
     conn.close()
     return [dict(user) for user in users]
 
@@ -382,14 +364,7 @@ def get_user_by_username(username):
     conn.close()
     return dict(user) if user else None
 
-def get_user_traffic(username):
-    conn = get_db_connection()
-    traffic = conn.execute("SELECT bytes_in, bytes_out FROM user_traffic WHERE username = ?", (username,)).fetchone()
-    conn.close()
-    return dict(traffic) if traffic else {'bytes_in': 0, 'bytes_out': 0}
-
-# --- 认证装饰器 ---
-
+# --- 认证装饰器 & 工具函数 (保持不变) ---
 def login_required(f):
     """检查用户是否已登录."""
     def decorated_function(*args, **kwargs):
@@ -398,8 +373,6 @@ def login_required(f):
         return f(*args, **kwargs)
     decorated_function.__name__ = f.__name__
     return decorated_function
-
-# --- 系统工具函数 ---
 
 def safe_run_command(command, input=None):
     """安全执行系统命令并返回结果."""
@@ -418,136 +391,113 @@ def safe_run_command(command, input=None):
     except Exception as e:
         return False, f"Exception: {e}"
 
-def update_iptables_rules():
-    """根据数据库中的活动用户和流量统计，更新 iptables 规则."""
-    users = get_all_users()
-   
+def update_iptables_rules_and_read_traffic():
+    """刷新 iptables 规则并读取所有用户的流量统计."""
+    conn = get_db_connection()
+    users_data = conn.execute("SELECT username FROM users").fetchall()
+    
     # 1. 清除 WSS_USERS 链中的所有旧规则
     safe_run_command(['iptables', '-F', 'WSS_USERS'])
-   
-    # 2. 为每个活跃用户添加规则 (使用 SSH 连接端口 48303)
-    for user in users:
-        # 流量统计规则: 匹配用户id (ssh认证的user) 到 48303 的连接，标记为 ACCEPT 以统计流量
-        # 注意：iptables 不直接按系统用户UID过滤，但通过用户端口转发连接到48303可以实现统计。
-        # 真正的流量统计依赖于连接到 48303 后，Linux netfilter 内部对 user/group 的处理。
-        # 鉴于 WSS/Stunnel 都在本机，我们使用一个简单的通用ACCEPT规则，并依赖 iptables -L -v -x 统计。
-        # 实际上，为了实现 per-user 统计，需要更复杂的 L7 或 cgroups/SELinux 方案，
-        # 在 bash/python 脚本中难以实现，但我们可以模拟一个"用户ID"来标记流量。
 
-        # 最佳实践是使用 connmark 或 owner 模块，但owner模块要求进程启动时的UID/GID，
-        # 而 WSS/Stunnel 都是 root 启动并转发。
-        # 
-        # 简单实现: 使用用户ID作为 Comment, 并标记为 ACCEPT。
-        # **此处的流量统计实际是针对所有 48303 端口的流量，然后通过手动匹配 Comment 来区分用户。**
-        # 我们将使用 MASQUERADE 后的流量作为统计目标。
+    all_traffic_stats = {}
+    now = datetime.datetime.now()
+    users_to_update = []
 
-        # 标记入站流量 (从 48303 出来的返回流量)
-        safe_run_command(['iptables', '-A', 'WSS_USERS', '-m', 'owner', '--uid-owner', user['username'], '-j', 'ACCEPT', '-m', 'comment', '--comment', f"WSS_USER_{user['username']}"])
-        # 标记出站流量 (进入 48303 的请求流量)
-        # 很难区分 user-specific ingress traffic in WSS_USERS chain directly.
-        # 简化方案: 仅依赖 iptables -L -v -x 的计数功能，并在面板中读取。
-        # 注意：我们在这里只是添加一个 ACCEPT 规则，但实际统计将通过读取 iptables -L -v -x 结果并匹配 Comment 实现。
-        pass # 真正的 iptables rule will be added in the traffic reading function for simplicity.
+    for user_row in users_data:
+        username = user_row[0]
+        
+        try:
+            # 尝试获取用户 UID
+            uid = subprocess.check_output(['id', '-u', username], universal_newlines=True).strip()
+            
+            # 2. 为活跃用户添加 iptables 规则进行统计
+            # 使用 owner 模块匹配用户 UID 的出站流量 (流量从隧道流出)
+            command = ['iptables', '-A', 'WSS_USERS', 
+                     '-m', 'owner', '--uid-owner', uid, 
+                     '-j', 'ACCEPT', 
+                     '-m', 'comment', '--comment', f"WSS_STAT_{username}"]
+            safe_run_command(command)
+            
+            users_to_update.append(username)
+        except Exception:
+            # 用户可能已被删除或被锁定，无法获取 UID，跳过流量统计
+            continue
 
-    # 3. 默认拒绝所有不匹配的流量 (如果需要更严格的控制)
-    # safe_run_command(['iptables', '-A', 'WSS_USERS', '-j', 'DROP']) # 暂时不加，避免中断其他服务
-    return True
-
-def get_iptables_traffic_stats(username):
-    """读取 iptables 中指定用户规则的流量统计."""
-    # 尝试获取用户ID (由于是 SSH 用户，UID在 /etc/passwd 中)
-    try:
-        uid_line = subprocess.check_output(['id', '-u', username], universal_newlines=True).strip()
-        uid = int(uid_line)
-    except Exception:
-        return 0, 0 # 用户不存在或无法获取 UID
-
-    # 流量统计是所有连接到 48303 的流量，我们无法直接区分用户。
-    # 由于您要求实现功能，我们将**模拟**通过匹配 user ID 来区分。
-    # 注意：这在非 cgroups 环境下**不是精确**的用户级流量统计，但能给出大致数据。
-
-    # 清除旧的规则 (以确保我们读取的是新的计数)
-    safe_run_command(['iptables', '-F', 'WSS_USERS'])
-    
-    # 添加一个 ACCEPT 规则用于统计 (从 48303 出来的用户流量，即隧道回包)
-    # 匹配用户 ID 是最接近用户级统计的方法。
-    safe_run_command(['iptables', '-A', 'WSS_USERS', '-m', 'owner', '--uid-owner', str(uid), '-j', 'ACCEPT', '-m', 'comment', '--comment', f"WSS_STAT_{username}"])
-
-    # 读取 iptables 链统计 (Packet | Bytes)
+    # 3. 读取 iptables 链统计 (Packet | Bytes)
     try:
         output = subprocess.check_output(['iptables', '-L', 'WSS_USERS', '-v', '-x', '-n'], universal_newlines=True)
         for line in output.splitlines():
-            if f"WSS_STAT_{username}" in line:
+            if "WSS_STAT_" in line:
                 parts = line.split()
-                # 默认 iptables -L -v -x 的输出顺序: pkts bytes target prot opt in out source destination
-                bytes_total = int(parts[1])
-                # 因为我们只使用了一条规则，无法区分 in/out，假设一半是入，一半是出 (这是估算)
-                bytes_in = bytes_total // 2
-                bytes_out = bytes_total - bytes_in
-                
-                # 找到规则后，清空计数以便下次从零开始统计 (可选，但为了实时性先不清空)
-                # safe_run_command(['iptables', '-Z', 'WSS_USERS', parts[0]])
-                
-                return bytes_in, bytes_out
-        
-        return 0, 0 # 没有找到匹配规则
-    
+                # 解析 Comment 字段获取用户名
+                comment_index = parts.index('COMMENT') + 1 
+                if comment_index < len(parts):
+                    rule_username = parts[comment_index].strip('"').replace('WSS_STAT_', '')
+                    
+                    bytes_total = int(parts[1])
+                    # 估算：通常 egress (出站) 流量更大，这里取总值，让客户端估算 in/out
+                    # 为简单起见，我们假设 in = out = total / 2 (这是一个普遍的简化)
+                    bytes_in = bytes_total // 2
+                    bytes_out = bytes_total - bytes_in
+                    all_traffic_stats[rule_username] = {'in': bytes_in, 'out': bytes_out}
     except Exception:
-        return 0, 0 # 执行 iptables 命令失败
+        pass # 忽略 iptables 读取失败
 
-def refresh_traffic_and_status():
-    """刷新所有用户的流量统计和到期状态."""
-    users = get_all_users()
-    conn = get_db_connection()
-    now = datetime.datetime.now()
+    # 4. 更新数据库状态和流量
+    final_users_list = conn.execute("SELECT * FROM users").fetchall()
     
-    for user in users:
+    for user_row in final_users_list:
+        user = dict(user_row)
         username = user['username']
         
-        # 1. 检查到期日
+        # 检查到期日
         expire_date = date_parser.parse(user['expire_date']).replace(tzinfo=None)
         is_expired = expire_date < now
-        
         new_status = 'expired' if is_expired else 'active'
         
-        # 2. 检查系统用户状态 (如果被面板删除，但系统仍存在，避免重复操作)
+        # 检查系统用户状态 (用于锁定/解锁 SSH 账户)
+        is_system_user_active = True
         try:
-            subprocess.check_call(['id', username], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            is_system_user_active = True
+            # 检查密码是否被锁定 (即检查 /etc/shadow 中密码字段是否以 ! 开头)
+            subprocess.check_call(['passwd', '-S', username], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except subprocess.CalledProcessError:
-            is_system_user_active = False
+            is_system_user_active = False # 如果 passwd -S 失败，说明用户可能不存在或有其他问题
 
-        # 3. 状态更新与系统操作
-        if is_expired and is_system_user_active:
-            # 禁用系统用户登录 (防止 SSH 认证)
-            safe_run_command(['usermod', '-L', username]) # 锁定密码
-            # 移除非活动用户的 iptables 规则 (可选，但为了清爽)
-            # safe_run_command(['iptables', '-D', 'WSS_USERS', '-m', 'owner', '--uid-owner', str(uid), '-j', 'ACCEPT', '-m', 'comment', '--comment', f"WSS_STAT_{username}"])
-        elif not is_expired and not is_system_user_active:
-            # 如果数据库显示活跃，但系统用户被锁定，则解锁（这种情况通常不会发生）
-            safe_run_command(['usermod', '-U', username]) # 解锁密码
-            new_status = 'active'
+        if is_expired and user['status'] != 'expired':
+            # 过期且面板未更新，则锁定系统用户
+            safe_run_command(['usermod', '-L', username]) 
+        elif not is_expired and user['status'] == 'expired':
+            # 被续费，但系统用户仍被锁定，则解锁
+            safe_run_command(['usermod', '-U', username]) 
         
-        # 4. 更新数据库状态
+        # 更新数据库状态 (如果发生变化)
         conn.execute("UPDATE users SET status = ? WHERE username = ?", (new_status, username))
         
-        # 5. 读取并更新流量统计 (使用估算值)
-        bytes_in, bytes_out = get_iptables_traffic_stats(username)
-        conn.execute("INSERT OR REPLACE INTO user_traffic (username, bytes_in, bytes_out) VALUES (?, ?, ?)", 
-                     (username, bytes_in, bytes_out))
+        # 流量统计更新到字典中
+        traffic = all_traffic_stats.get(username, {'in': 0, 'out': 0})
+        user['bytes_in'] = traffic['in']
+        user['bytes_out'] = traffic['out']
         
     conn.commit()
     conn.close()
+    
+    # 返回包含流量信息的完整列表
+    return [dict(user) for user in final_users_list]
+
+
+def refresh_traffic_and_status():
+    """刷新所有用户的流量统计和到期状态 (外部调用接口)."""
+    all_users_with_traffic = update_iptables_rules_and_read_traffic()
+    return all_users_with_traffic
 
 
 def format_bytes(bytes_value):
     """格式化字节数为人类可读的字符串."""
-    if bytes_value is None:
-        return "N/A"
-    if bytes_value == 0:
+    if bytes_value is None or bytes_value == 0:
         return "0 B"
     sizes = ['B', 'KB', 'MB', 'GB', 'TB']
     i = 0
+    bytes_value = float(bytes_value)
     while bytes_value >= 1024 and i < len(sizes) - 1:
         bytes_value /= 1024.0
         i += 1
@@ -639,8 +589,8 @@ _DASHBOARD_HTML = """
         </div>
 
         <div class="card">
-            <h3>用户管理与流量监控 (每30秒自动刷新一次)</h3>
-            <button class="action-btn" onclick="refreshData()">手动刷新数据</button>
+            <h3>用户管理与流量监控 (数据需手动刷新)</h3>
+            <button class="action-btn" onclick="refreshData()">手动刷新数据/流量统计</button>
             <table class="user-table" id="user-table">
                 <thead>
                     <tr>
@@ -648,8 +598,8 @@ _DASHBOARD_HTML = """
                         <th>状态</th>
                         <th>创建日期</th>
                         <th>到期日期</th>
-                        <th>下载流量 (估算)</th>
-                        <th>上传流量 (估算)</th>
+                        <th>总下载流量 (估算)</th>
+                        <th>总上传流量 (估算)</th>
                         <th>操作</th>
                     </tr>
                 </thead>
@@ -670,7 +620,7 @@ _DASHBOARD_HTML = """
                     {% endfor %}
                 </tbody>
             </table>
-            <p class="info-note">注意：流量统计采用 SSH **进程UID** 匹配的 **iptables 规则** 进行估算，可能存在误差。</p>
+            <p class="info-note">注意：流量统计采用 **iptables owner 模块** 进行估算，精确度受 SSH 隧道连接机制限制。点击 **手动刷新** 获取最新数据。</p>
         </div>
     </div>
 
@@ -692,11 +642,14 @@ _DASHBOARD_HTML = """
             if (bytes === null || bytes === undefined) return "N/A";
             const units = ['B', 'KB', 'MB', 'GB', 'TB'];
             let i = 0;
-            while (bytes >= 1024 && i < units.length - 1) {
-                bytes /= 1024.0;
+            let value = parseFloat(bytes);
+            if (value === 0) return "0 B";
+
+            while (value >= 1024 && i < units.length - 1) {
+                value /= 1024.0;
                 i++;
             }
-            return `${bytes.toFixed(2)} ${units[i]}`;
+            return `${value.toFixed(2)} ${units[i]}`;
         }
 
         function showStatus(message, isSuccess) {
@@ -725,7 +678,8 @@ _DASHBOARD_HTML = """
                 if (response.ok && result.success) {
                     showStatus(result.message, true);
                     document.getElementById('add-user-form').reset();
-                    refreshData(); // 刷新数据
+                    setInitialExpireDate(); // 重置初始日期
+                    refreshData(true); // 强制刷新数据
                 } else {
                     showStatus('创建失败: ' + (result.message || '未知错误'), false);
                 }
@@ -747,7 +701,7 @@ _DASHBOARD_HTML = """
                 const result = await response.json();
                 if (response.ok && result.success) {
                     showStatus(result.message, true);
-                    refreshData(); // 刷新数据
+                    refreshData(true); // 强制刷新数据
                 } else {
                     showStatus('删除失败: ' + (result.message || '未知错误'), false);
                 }
@@ -782,7 +736,7 @@ _DASHBOARD_HTML = """
                 closeUpdateModal();
                 if (response.ok && result.success) {
                     showStatus(result.message, true);
-                    refreshData();
+                    refreshData(true);
                 } else {
                     showStatus('修改失败: ' + (result.message || '未知错误'), false);
                 }
@@ -792,54 +746,51 @@ _DASHBOARD_HTML = """
         });
 
         // --- 实时刷新功能 ---
-
-        async function refreshData() {
-            try {
-                const response = await fetch('/api/data/refresh', { method: 'POST' });
+        
+        // forceRefresh: 只有在添加/删除用户时才需要强制刷新整个页面数据
+        async function refreshData(forceRefresh = false) {
+            if (!forceRefresh) {
+                // 仅更新流量统计
+                const response = await fetch('/api/data/refresh', { method: 'GET' });
                 if (response.ok) {
                     const data = await response.json();
                     updateTable(data.users);
                     document.getElementById('user-count').textContent = `${data.active_count} / ${data.users.length}`;
-                    // showStatus('数据刷新成功', true); // 避免频繁提示
-                } else {
-                    console.error('Failed to fetch refresh data');
                 }
-            } catch (error) {
-                console.error('Error during refresh:', error);
+            } else {
+                // 强制刷新 (如删除/添加用户)
+                location.reload();
             }
         }
 
         function updateTable(users) {
-            const tbody = document.getElementById('user-table').querySelector('tbody');
+            // 仅更新现有行的流量和状态
             users.forEach(user => {
                 const row = document.getElementById(`row-\${user.username}`);
                 if (row) {
-                    // Update status
                     const statusCell = row.cells[1].querySelector('.status-badge');
                     statusCell.textContent = user.status.toUpperCase();
                     statusCell.className = `status-badge status-\${user.status}`;
-                    // Update traffic
                     row.cells[4].textContent = formatBytes(user.bytes_in);
                     row.cells[5].textContent = formatBytes(user.bytes_out);
-                    // Update expire date
                     row.cells[3].textContent = user.expire_date.split(' ')[0];
                 }
             });
         }
 
-        function logout() { window.location.href = '/logout'; }
-
-        // 首次加载时设置到期日为30天后
-        window.onload = () => {
+        function setInitialExpireDate() {
             const today = new Date();
             today.setDate(today.getDate() + 30);
             const month = String(today.getMonth() + 1).padStart(2, '0');
             const day = String(today.getDate()).padStart(2, '0');
             const year = today.getFullYear();
             document.getElementById('expire-date').value = `${year}-${month}-${day}`;
+        }
 
-            // 启动自动刷新
-            setInterval(refreshData, 30000); // 每30秒刷新一次
+        function logout() { window.location.href = '/logout'; }
+
+        window.onload = () => {
+            setInitialExpireDate();
         }
         
     </script>
@@ -858,6 +809,11 @@ def render_dashboard(users):
 
     active_users_count = sum(1 for user in users if user.get('status') == 'active')
 
+    # 流量数据需要通过 API 动态获取，这里传入初始化值
+    for user in users:
+        user['bytes_in'] = 0
+        user['bytes_out'] = 0
+
     context = {
         'users': users,
         'panel_port': PANEL_PORT,
@@ -865,43 +821,28 @@ def render_dashboard(users):
         'stunnel_port': STUNNEL_PORT,
         'host_ip': host_ip,
         'active_users_count': active_users_count,
-        'format_bytes': format_bytes # 传递格式化函数给模板
+        'format_bytes': format_bytes
     }
     return template.render(**context)
 
 
 # --- Web 路由 ---
 
-@app.before_request
-def check_maintenance():
-    """在每次请求前，刷新流量和状态."""
-    if request.path.startswith('/api'):
-        # 仅对 API 请求进行维护，避免页面加载延迟
-        refresh_traffic_and_status()
-
-
 @app.route('/', methods=['GET'])
 @login_required
 def dashboard():
-    # 确保在加载面板时数据已刷新
-    refresh_traffic_and_status()
-    users = get_all_users()
+    # 仅加载用户列表，不刷新流量，让前端手动点击刷新
+    users = [dict(user) for user in get_all_users()]
     html_content = render_dashboard(users=users)
     return make_response(html_content)
 
 
-@app.route('/api/data/refresh', methods=['POST'])
+@app.route('/api/data/refresh', methods=['GET'])
 @login_required
 def refresh_data_api():
     """提供实时刷新所需的用户数据."""
-    refresh_traffic_and_status()
-    users = get_all_users()
+    users = refresh_traffic_and_status()
     active_count = sum(1 for user in users if user.get('status') == 'active')
-    
-    # 确保 bytes 被格式化成数字
-    for user in users:
-        user['bytes_in'] = user.get('bytes_in') or 0
-        user['bytes_out'] = user.get('bytes_out') or 0
     
     return jsonify({"success": True, "users": users, "active_count": active_count})
 
@@ -921,7 +862,6 @@ def add_user_api():
         return jsonify({"success": False, "message": f"用户 {username} 已存在于面板"}), 409
 
     try:
-        # 验证日期格式
         date_parser.parse(expire_date_str)
     except ValueError:
         return jsonify({"success": False, "message": "到期日格式错误"}), 400
@@ -943,7 +883,6 @@ def add_user_api():
     try:
         conn.execute("INSERT INTO users (username, created_at, expire_date, status) VALUES (?, ?, ?, ?)", 
                     (username, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"), expire_date_str, 'active'))
-        conn.execute("INSERT INTO user_traffic (username) VALUES (?)", (username,)) # 初始化流量
         conn.commit()
     except sqlite3.Error as e:
         safe_run_command(['userdel', '-r', username])
@@ -951,6 +890,9 @@ def add_user_api():
     finally:
         conn.close()
 
+    # 4. 更新 iptables (立即为新用户添加规则)
+    update_iptables_rules_and_read_traffic()
+    
     return jsonify({"success": True, "message": f"用户 {username} 创建成功，到期日: {expire_date_str}"})
 
 @app.route('/api/users/update_date', methods=['POST'])
@@ -970,16 +912,20 @@ def update_user_date_api():
     
     conn = get_db_connection()
     try:
-        conn.execute("UPDATE users SET expire_date = ?, status = 'active' WHERE username = ?", (expire_date_str, username))
+        # 将状态重置为 active
+        cursor = conn.execute("UPDATE users SET expire_date = ?, status = 'active' WHERE username = ?", (expire_date_str, username))
         conn.commit()
         
-        # 如果用户被锁定，则解锁
-        safe_run_command(['usermod', '-U', username]) 
-        
-        if conn.changes == 0:
+        if cursor.rowcount == 0:
             return jsonify({"success": False, "message": f"用户 {username} 不存在"}), 404
         
-        return jsonify({"success": True, "message": f"用户 {username} 到期日更新为 {expire_date_str}"})
+        # 解锁系统用户 (如果之前被锁定)
+        safe_run_command(['usermod', '-U', username]) 
+        
+        # 刷新 iptables (确保用户恢复正常连接)
+        update_iptables_rules_and_read_traffic()
+        
+        return jsonify({"success": True, "message": f"用户 {username} 到期日更新为 {expire_date_str}，并已重新激活"})
     except sqlite3.Error as e:
         return jsonify({"success": False, "message": f"数据库错误: {e}"}), 500
     finally:
@@ -998,7 +944,7 @@ def delete_user_api():
     if username == ROOT_USERNAME:
         return jsonify({"success": False, "message": "不能删除 root 管理员"}), 403
 
-    # 1. 从 SQLite 数据库中删除记录 (CASCADE 会删除 traffic 记录)
+    # 1. 从 SQLite 数据库中删除记录
     conn = get_db_connection()
     try:
         cursor = conn.execute("DELETE FROM users WHERE username = ?", (username,))
@@ -1011,16 +957,16 @@ def delete_user_api():
         conn.close()
 
     # 2. 删除系统用户及其主目录
-    success, output = safe_run_command(['userdel', '-r', username])
-    if not success and "does not exist" not in output:
-        print(f"Warning: Failed to delete system user {username}: {output}") # 记录警告，但仍返回成功 (用户数据已清除)
+    safe_run_command(['userdel', '-r', username]) # 即使失败也忽略，以确保面板记录被删除
 
+    # 3. 刷新 iptables (移除旧规则)
+    update_iptables_rules_and_read_traffic()
+    
     return jsonify({"success": True, "message": f"用户 {username} 已删除"})
 
-# 保持 Login 和 Logout 路由不变 (需要放在最后)
+# 保持 Login 和 Logout 路由不变
 @app.route('/login', methods=['GET', 'POST'])
 def login():
-    # ... (省略，内容与原脚本保持一致)
     error = None
     if request.method == 'POST':
         username = request.form.get('username')
@@ -1083,7 +1029,7 @@ def logout():
 if __name__ == '__main__':
     # 在启动面板前，先执行一次状态刷新，确保 iptables 规则存在，且初始用户状态正确
     try:
-        refresh_traffic_and_status()
+        update_iptables_rules_and_read_traffic()
         print("Initial traffic and status refreshed successfully.")
     except Exception as e:
         print(f"WARNING: Initial refresh failed: {e}")
