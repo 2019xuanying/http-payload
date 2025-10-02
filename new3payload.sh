@@ -2,9 +2,10 @@
 set -eu
 
 # ==========================================================
-# WSS 隧道与用户管理面板一键部署脚本 (V3 - 最终功能修复)
+# WSS 隧道与用户管理面板一键部署脚本 (V4 - 强制断开连接)
 # ----------------------------------------------------------
-# FIX: 修复 safe_run_command 中的 TypeError，确保参数正确传递。
+# FIX: 修复用户删除后客户端仍然连接的问题，在删除系统账户前强制终止活跃会话。
+# FIX: 修复用户创建时系统用户已存在的问题，提供清晰的错误提示。
 # ==========================================================
 
 # =============================
@@ -66,9 +67,9 @@ echo "IPTables 规则检查完成。"
 echo "----------------------------------"
 
 # =============================
-# 安装 WSS 用户管理面板 (基于 Flask) - V3 核心修复
+# 安装 WSS 用户管理面板 (基于 Flask) - V4 核心修复
 # =============================
-echo "==== 部署 WSS 用户管理面板 (Python/Flask) V3 最终功能修复版 ===="
+echo "==== 部署 WSS 用户管理面板 (Python/Flask) V4 最终功能修复版 ===="
 PANEL_DIR="/etc/wss-panel"
 USER_DB="$PANEL_DIR/users.json"
 mkdir -p "$PANEL_DIR"
@@ -160,7 +161,7 @@ def get_user(username):
             return user, i
     return None, -1
 
-# --- 系统工具函数 (FIXED: 接受可选的 check 参数，并默认为 True) ---
+# --- 系统工具函数 ---
 
 def safe_run_command(command, input=None, check=True):
     """安全执行系统命令并返回结果."""
@@ -184,8 +185,42 @@ def safe_run_command(command, input=None, check=True):
 
 def get_user_uid(username):
     """获取系统用户的 UID."""
-    success, uid = safe_run_command(['/usr/bin/id', '-u', username], check=False) # 明确不检查，因为用户可能不存在
+    # 明确不检查，因为如果用户不存在，此命令也会失败
+    success, uid = safe_run_command(['/usr/bin/id', '-u', username], check=False) 
     return int(uid) if success and uid.isdigit() else None
+
+# --- V4 新增: 终止用户会话函数 ---
+
+def kill_user_sessions(username, uid):
+    """
+    查找并终止给定 UID 的所有进程（主要针对活跃的sshd会话）。
+    在删除系统用户前执行此操作。
+    """
+    if uid is None:
+        logging.warning(f"Cannot kill sessions for {username}: UID not found.")
+        return False, "UID not found"
+        
+    # pgrep -u <UID> 查找所有属于该 UID 的进程
+    pgrep_cmd = ['/usr/bin/pgrep', '-u', str(uid)]
+    success, output = safe_run_command(pgrep_cmd, check=False)
+    
+    if success and output:
+        pids = output.split()
+        logging.warning(f"Found active sessions for UID {uid} ({username}): {pids}. Killing them.")
+        
+        # 使用 kill -9 强制终止进程
+        kill_cmd = ['/bin/kill', '-9'] + pids
+        kill_success, kill_output = safe_run_command(kill_cmd, check=False)
+        
+        if kill_success or "No such process" in kill_output:
+            return True, f"Killed sessions: {', '.join(pids)}"
+        else:
+            logging.error(f"Failed to kill sessions for {username}. Kill output: {kill_output}")
+            return False, f"Failed to kill sessions: {kill_output}"
+            
+    logging.info(f"No active sessions found for {username}.")
+    return True, "No active sessions found."
+
 
 # --- IPTables 流量管理函数 ---
 
@@ -193,7 +228,6 @@ def apply_iptables_rules(users):
     """根据活动用户动态生成并应用 IPTables 规则."""
     IPTABLES_CMD = ['/sbin/iptables'] 
     
-    # 使用 check=False 允许链不存在时跳过
     safe_run_command(IPTABLES_CMD + ['-N', IPTABLES_CHAIN], check=False) 
     safe_run_command(IPTABLES_CMD + ['-F', IPTABLES_CHAIN]) 
     
@@ -204,8 +238,8 @@ def apply_iptables_rules(users):
                 rule_spec = ['-m', 'owner', '--uid-owner', str(uid), '-j', 'RETURN']
                 safe_run_command(IPTABLES_CMD + ['-A', IPTABLES_CHAIN] + rule_spec)
 
-    safe_run_command(IPTABLES_CMD + ['-A', IPTABLES_CHAIN, '-j', 'ACCEPT']) # 接受剩余流量
-    safe_run_command(['/usr/sbin/netfilter-persistent', 'save'], check=False) # 尝试保存规则
+    safe_run_command(IPTABLES_CMD + ['-A', IPTABLES_CHAIN, '-j', 'ACCEPT']) 
+    safe_run_command(['/usr/sbin/netfilter-persistent', 'save'], check=False) 
 
 
 def get_traffic_usage(username):
@@ -215,7 +249,6 @@ def get_traffic_usage(username):
 
     IPTABLES_CMD = ['/sbin/iptables'] 
     cmd = IPTABLES_CMD + ['-L', IPTABLES_CHAIN, '-v', '-x', '-n']
-    # 允许此命令失败 (例如链不存在)
     success, output = safe_run_command(cmd, check=False) 
 
     if success:
@@ -240,13 +273,12 @@ def reset_iptables_counter(username):
     IPTABLES_CMD = ['/sbin/iptables'] 
     rule_spec = ['-m', 'owner', '--uid-owner', str(uid), '-j', 'RETURN']
     
-    # 使用 check=False，因为删除不存在的规则会失败，但这不是致命错误
     safe_run_command(IPTABLES_CMD + ['-D', IPTABLES_CHAIN] + rule_spec, check=False)
-    success_add, _ = safe_run_command(IPTABLES_CMD + ['-A', IPTABLES_CHAIN] + rule_spec) # 重新添加必须成功
+    success_add, _ = safe_run_command(IPTABLES_CMD + ['-A', IPTABLES_CHAIN] + rule_spec) 
 
     return success_add
 
-# --- 核心用户状态管理函数 ---
+# --- 核心用户状态管理函数 (不变) ---
 
 def sync_user_status(user):
     """检查并同步用户的到期日、流量配额状态到系统 (chage, usermod)."""
@@ -331,9 +363,8 @@ def refresh_all_user_status(users):
     return users
 
 
-# --- HTML 模板和渲染 ---
-
-# 仪表盘 HTML (内嵌 - 使用 Tailwind)
+# --- HTML 模板和渲染 (省略，与 V3 Debug版一致) ---
+# ... [Omitted HTML template for brevity, it remains the same as previous debug version] ...
 _DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -570,7 +601,8 @@ _DASHBOARD_HTML = """
         }
 
         async function deleteUser(username) {
-            if (window.prompt(\`确定要删除用户 \${username} 吗? (输入 DELETE 确认)\`) !== 'DELETE') {
+            // V4: 增加强制断开提示
+            if (window.prompt(\`确定要删除用户 \${username} 吗? (删除操作将强制终止其所有活跃连接，输入 DELETE 确认)\`) !== 'DELETE') {
                 return;
             }
             
@@ -584,6 +616,7 @@ _DASHBOARD_HTML = """
                 const result = await response.json();
 
                 if (response.ok && result.success) {
+                    // 显示终止会话的结果
                     showStatus(result.message, true);
                     location.reload(); 
                 } else {
@@ -701,9 +734,7 @@ def dashboard():
         html_content = render_dashboard(users=users)
         return make_response(html_content)
     except Exception as e:
-        # 记录完整的堆栈信息
         logging.exception("Dashboard (/) route failed during execution.")
-        # 返回一个包含日志路径的友好提示
         return f"Internal Server Error. The application encountered an error. Please check the debug log at: {LOG_FILE}", 500
 
 
@@ -792,6 +823,10 @@ def add_user_api():
 
     success, output = safe_run_command(USERADD_CMD + ['-m', '-s', '/bin/false', username])
     if not success:
+        # FIX V4.1: 检查是否是用户已存在错误
+        if "already exists" in output:
+             return jsonify({"success": False, "message": f"系统用户 '{username}' 已经存在。请通过命令行运行 'sudo userdel -r {username}' 删除该用户后重试。"}), 409
+        
         return jsonify({"success": False, "message": f"创建系统用户失败: {output}"}), 500
 
     chpasswd_input = f"{username}:{password_raw}"
@@ -827,22 +862,33 @@ def delete_user_api():
     if not username:
         return jsonify({"success": False, "message": "缺少用户名"}), 400
 
-    users = load_users()
     user_to_delete, index = get_user(username)
 
     if not user_to_delete:
         return jsonify({"success": False, "message": f"面板中用户 {username} 不存在"}), 404
-    
-    USERDEL_CMD = ['/usr/sbin/userdel']
 
+    # 1. 在删除前获取用户的 UID，用于后续的进程终止和规则清理
+    user_uid = get_user_uid(username)
+
+    # 2. 强制终止该用户的所有活跃会话 (V4 核心功能)
+    kill_success, kill_message = kill_user_sessions(username, user_uid)
+
+    # 3. 删除系统用户
+    USERDEL_CMD = ['/usr/sbin/userdel']
     safe_run_command(USERDEL_CMD + ['-r', username], check=False)
 
-    users.pop(index)
-    save_users(users)
+    # 4. 从 JSON 数据库中删除记录
+    users = load_users()
+    if index != -1:
+        users.pop(index)
+        save_users(users)
     
+    # 5. 刷新 IPTables 规则
     apply_iptables_rules(users)
 
-    return jsonify({"success": True, "message": f"用户 {username} 已删除"})
+    # 6. 组合返回消息
+    final_message = f"用户 {username} 已删除。会话终止结果: {kill_message}"
+    return jsonify({"success": True, "message": final_message})
 
 @app.route('/api/users/status', methods=['POST'])
 @login_required
@@ -946,15 +992,19 @@ chmod +x /usr/local/bin/wss_panel.py
 systemctl daemon-reload
 systemctl enable wss_panel || true
 systemctl restart wss_panel
-echo "WSS 管理面板 V3 最终功能修复版已启动/重启，端口 $PANEL_PORT"
+echo "WSS 管理面板 V4 已启动/重启，端口 $PANEL_PORT"
 echo "----------------------------------"
 
 echo "=================================================="
 echo "✅ 部署完成！"
 echo "=================================================="
 echo ""
-echo "请再次访问 Web 面板进行登录。"
+echo "现在，如果你尝试创建的系统用户已存在，面板会给出明确提示。"
 echo ""
-echo "如果这次成功，你将看到仪表盘。如果仍有错误，请提供 **新的** 日志内容："
-echo "命令: sudo cat /var/log/wss_panel_debug.log"
+echo "--- 下一步操作 ---"
+echo "请在 SSH 终端中运行以下命令，**手动删除** 冲突的用户 (例如 'ziqing')："
+echo ""
+echo "sudo userdel -r ziqing"
+echo ""
+echo "删除后，即可通过面板重新创建该用户，或创建其他新用户。"
 echo "=================================================="
