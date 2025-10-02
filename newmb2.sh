@@ -24,8 +24,8 @@ STUNNEL_PORT=${STUNNEL_PORT:-444}
 read -p "请输入 UDPGW 端口（默认7300）: " UDPGW_PORT
 UDPGW_PORT=${UDPGW_PORT:-7300}
 
-read -p "请输入 Web 管理面板端口（默认8080）: " PANEL_PORT
-PANEL_PORT=${PANEL_PORT:-8080}
+read -p "请输入 Web 管理面板端口（默认54321）: " PANEL_PORT
+PANEL_PORT=${PANEL_PORT:-54321}
 
 # 设置面板登录密码
 echo "--------------------------------------------------------"
@@ -256,7 +256,7 @@ systemctl enable stunnel4
 systemctl restart stunnel4
 
 # UDPGW
-local badvpn_dir="/root/badvpn"
+badvpn_dir="/root/badvpn" # FIXED: Removed 'local'
 if [ ! -d "$badvpn_dir" ]; then
     git clone https://github.com/ambrop72/badvpn.git "$badvpn_dir" &> /dev/null
 fi
@@ -297,7 +297,7 @@ sed -i '/# WSS_CONFIG_BLOCK_START/,/# WSS_CONFIG_BLOCK_END/d' "$SSHD_CONFIG"
 
 cat >> "$SSHD_CONFIG" <<EOF
 
-# WSS_CONFIG_BLOCK_START -- managed by deploy_wss_final_v5.sh
+# WSS_CONFIG_BLOCK_START -- managed by deploy_wss_final_v6.sh
 # 允许所有用户仅通过本机 (127.0.0.1/::1) 使用密码登录，用于 WSS 转发
 Match Address 127.0.0.1,::1
     PermitTTY yes
@@ -307,7 +307,7 @@ Match Address 127.0.0.1,::1
     # 强制所有非本机连接禁用密码，以增强安全性
 Match Address *,!127.0.0.1,!::1
     PasswordAuthentication no
-# WSS_CONFIG_BLOCK_END -- managed by deploy_wss_final_v5.sh
+# WSS_CONFIG_BLOCK_END -- managed by deploy_wss_final_v6.sh
 
 EOF
 
@@ -324,7 +324,7 @@ mkdir -p "$PANEL_CONFIG_DIR"
 
 # 1. 部署 WSS 面板 Python 脚本 (/usr/local/bin/wss_panel.py) - V8 最终稳定版
 echo "==== 部署 WSS Web 面板脚本 (V8 最终稳定版) ===="
-tee "$PANEL_SCRIPT" > /dev/null <<'EOF'
+tee "$PANEL_SCRIPT" > /dev/null <<EOF
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
@@ -336,6 +336,7 @@ import time
 from datetime import datetime, timedelta
 import hashlib
 import socket
+import sys
 
 # --- 配置 ---
 USER_DB_PATH = "/etc/wss-panel/users.json"
@@ -367,7 +368,7 @@ def format_bytes(bytes_value):
     if bytes_value is None or not isinstance(bytes_value, (int, float)): return "N/A"
     bytes_value = int(bytes_value)
     if bytes_value < 1048576: return f"{bytes_value / 1024:.2f} KB"
-    elif bytes_value < 1073741824: return f"{bytes_value / 1048576:.2f} MB"
+    elif bytes_value < 1073741822: return f"{bytes_value / 1048576:.2f} MB"
     else: return f"{bytes_value / 1073741824:.2f} GB"
 
 def get_days_remaining(timestamp):
@@ -464,6 +465,7 @@ DASHBOARD_HTML = """
                 </div>
             </div>
 
+            <!-- 用户列表 -->
             <div class="card p-6">
                 <h2 class="text-xl font-semibold text-gray-700 mb-4">WSS 用户列表</h2>
                 <div class="overflow-x-auto">
@@ -484,7 +486,7 @@ DASHBOARD_HTML = """
                             <tr>
                                 <td class="px-4 py-3 whitespace-nowrap text-sm font-medium text-gray-900">{{ user.username }}</td>
                                 <td class="px-4 py-3 whitespace-nowrap text-sm">{{ user.status | status_badge }}</td>
-                                <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">{{ "N/A (System Command Removed)" }}</td>
+                                <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">{{ user.username | last_ip }}</td>
                                 <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">{{ user.usage_bytes | format_bytes }}</td>
                                 <td class="px-4 py-3 whitespace-nowrap text-sm text-gray-500">
                                     {% if user.expires_at %}
@@ -566,7 +568,6 @@ LOGIN_HTML = """
 # --- 路由和视图 ---
 
 def login_required(f):
-    """验证会话中是否已登录."""
     def wrapper(*args, **kwargs):
         if 'logged_in' not in session:
             return redirect(url_for('login'))
@@ -581,7 +582,6 @@ def login():
         username = request.form['username']
         password = request.form['password']
         
-        # 计算输入密码的 SHA256 散列
         input_hash = hashlib.sha256(password.encode('utf-8')).hexdigest()
         
         if username == PANEL_USER and input_hash == PANEL_PASS_HASH:
@@ -591,7 +591,6 @@ def login():
         else:
             error = '用户名或密码错误'
     
-    # 使用 render_template_string 渲染登录页
     return render_template_string(LOGIN_HTML, error=error, url_for=url_for)
 
 @app.route('/logout')
@@ -605,23 +604,19 @@ def logout():
 def dashboard():
     users = load_users()
     
-    # 尝试获取服务器 IP 地址
     try:
-        import socket
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.connect(("8.8.8.8", 80))
         host_ip = s.getsockname()[0]
     except:
         host_ip = "127.0.0.1 (请替换)"
 
-    # 从环境变量中获取端口变量
     current_panel_port = os.environ.get('WSS_PANEL_PORT', '54321')
     current_wss_http_port = os.environ.get('WSS_HTTP_PORT', '80')
     current_wss_tls_port = os.environ.get('WSS_TLS_PORT', '443')
     current_stunnel_port = os.environ.get('STUNNEL_PORT', '444')
     current_udpgw_port = os.environ.get('UDPGW_PORT', '7300')
 
-    # 渲染参数
     context = {
         'users': users,
         'panel_port': current_panel_port,
@@ -633,7 +628,6 @@ def dashboard():
         'message': request.args.get('message')
     }
     
-    # 最终的渲染调用，传入所有需要的函数和变量
     return render_template_string(DASHBOARD_HTML, **context, 
                                 url_for=url_for, 
                                 format_bytes=format_bytes, 
@@ -661,7 +655,6 @@ def add_user():
         subprocess.run(['useradd', '--shell', '/bin/bash', '--create-home', username], check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(f'echo "{username}:{password}" | chpasswd', shell=True, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         
-        # 移除 sudo 权限
         run_cmd(['gpasswd', '-d', username, 'sudo'])
         
     except subprocess.CalledProcessError as e:
@@ -745,10 +738,204 @@ def delete_user():
         return redirect(url_for('dashboard', message=f"用户 {username} 系统账户已删除，面板记录已清除 (如果存在)!"))
 
 if __name__ == '__main__':
-    # 启动 Flask Web 服务器
     try:
         panel_port = int(os.environ.get('WSS_PANEL_PORT', 54321))
     except ValueError:
         panel_port = 54321
         
     app.run(host='0.0.0.0', port=panel_port, debug=False)
+EOF
+
+chmod +x "$PANEL_SCRIPT"
+echo "Web 面板脚本部署完成。"
+
+# 2. 部署 Accountant 脚本 (/usr/local/bin/wss_accountant.py)
+echo "==== 部署流量统计脚本 ===="
+tee "$ACCOUNTANT_SCRIPT" > /dev/null <<EOF
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+import os
+import json
+import subprocess
+import time
+from datetime import datetime
+import sys
+
+# --- 配置 ---
+USER_DB_PATH = "/etc/wss-panel/users.json"
+LOG_PATH = "/var/log/wss_accountant.log"
+# SIMULATED_TRAFFIC_PER_CYCLE = 1048576 * 10 # 10MB per cycle
+SIMULATED_TRAFFIC_PER_CYCLE = 1048576 * 1 # 1MB per cycle 
+
+def log(message):
+    timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+    with open(LOG_PATH, 'a') as f:
+        f.write(f"{timestamp} {message}\n")
+
+def load_users():
+    if not os.path.exists(USER_DB_PATH):
+        return []
+    try:
+        with open(USER_DB_PATH, 'r') as f: return json.load(f)
+    except:
+        return []
+
+def save_users(users):
+    try:
+        os.makedirs(os.path.dirname(USER_DB_PATH), exist_ok=True)
+        with open(USER_DB_PATH, 'w') as f: json.dump(users, f, indent=4)
+        return True
+    except:
+        return False
+
+def run_cmd(command):
+    try:
+        subprocess.run(command, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except:
+        return False
+
+def check_and_cleanup():
+    log("--- Accounting cycle started. ---")
+    users = load_users()
+    users_modified = False
+    
+    current_time = int(time.time())
+    
+    # 1. 流量统计 (模拟)
+    for user in users:
+        # 仅对 active 用户进行流量模拟和过期检查
+        if user.get('status') == 'active':
+            # 流量模拟: 增加 SIMULATED_TRAFFIC_PER_CYCLE
+            current_usage = user.get('usage_bytes', 0)
+            user['usage_bytes'] = current_usage + SIMULATED_TRAFFIC_PER_CYCLE
+            users_modified = True
+            log(f"TRAFFIC: Simulating traffic for {user['username']}. New Usage: {user['usage_bytes'] / 1048576:.2f} MB")
+            
+            # 2. 过期检查
+            expires_at = user.get('expires_at', 0)
+            if expires_at and expires_at < current_time:
+                user['status'] = 'expired'
+                users_modified = True
+                log(f"EXPIRY: User {user['username']} has expired. Status set to 'expired'.")
+                
+                # 锁定系统账户
+                if run_cmd(['usermod', '-L', user['username']]):
+                    log(f"EXPIRY: Successfully locked system account for {user['username']}.")
+                else:
+                    log(f"EXPIRY: Failed to lock system account for {user['username']}!")
+
+    if users_modified:
+        if save_users(users):
+            log("UPDATE SUCCESS: Traffic/Expiration data saved.")
+        else:
+            log("UPDATE FAILURE: Could not save data.")
+
+    log("--- Accounting cycle completed. ---")
+
+
+if __name__ == '__main__':
+    # 确保日志文件存在
+    if not os.path.exists(LOG_PATH):
+        try:
+            with open(LOG_PATH, 'w') as f: f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Accountant Log Initialized.\n")
+        except:
+            # 如果权限有问题，直接退出
+            sys.exit(1)
+
+    check_and_cleanup()
+    sys.exit(0)
+EOF
+
+chmod +x "$ACCOUNTANT_SCRIPT"
+echo "流量统计脚本部署完成。"
+
+# 3. 部署 systemd 服务单元
+tee /etc/systemd/system/wss_panel.service > /dev/null <<EOF
+[Unit]
+Description=WSS Web Panel (Flask)
+After=network.target
+
+[Service]
+Type=simple
+# 强制环境变量，解决 Jinja2 崩溃问题
+Environment=WSS_PANEL_PORT=$PANEL_PORT
+Environment=WSS_HTTP_PORT=$WSS_HTTP_PORT
+Environment=WSS_TLS_PORT=$WSS_TLS_PORT
+Environment=STUNNEL_PORT=$STUNNEL_PORT
+Environment=UDPGW_PORT=$UDPGW_PORT
+ExecStart=/usr/bin/python3 $PANEL_SCRIPT
+Restart=on-failure
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+tee /etc/systemd/system/wss_accountant.service > /dev/null <<EOF
+[Unit]
+Description=WSS Traffic and Expiration Accountant
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 $ACCOUNTANT_SCRIPT
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+tee /etc/systemd/system/wss_accountant.timer > /dev/null <<EOF
+[Unit]
+Description=Run WSS Usage Accountant every 5 minutes
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+EOF
+
+# 4. 启动服务
+echo "==== 启动 Web 面板和流量统计服务 ===="
+systemctl daemon-reload
+
+# 停止旧的进程
+systemctl stop wss_panel.service wss_accountant.timer wss_accountant.service
+
+# 启动新的服务
+systemctl enable wss_panel.service
+systemctl restart wss_panel.service
+
+systemctl enable wss_accountant.timer
+systemctl start wss_accountant.timer
+
+# 立即运行一次 Accountant，初始化数据
+systemctl start wss_accountant.service
+
+echo "所有组件已启动。"
+echo "--------------------------------------------------------"
+
+# ===============================================
+# G. 最终连接信息
+# ===============================================
+
+SERVER_IP=$(curl -s ifconfig.me)
+if [ -z "$SERVER_IP" ]; then SERVER_IP="[请手动查找您的公网 IP]"; fi
+
+echo "================================================"
+echo " ✅ 部署成功! WSS 隧道管理面板信息"
+echo "================================================"
+echo "面板访问地址: http://$SERVER_IP:$PANEL_PORT"
+echo "面板登录用户: root"
+echo "面板登录密码: 您设置的密码"
+echo ""
+echo "WSS HTTP 端口 (隧道入口): $WSS_HTTP_PORT"
+echo "WSS TLS 端口 (隧道入口): $WSS_TLS_PORT"
+echo "Stunnel TLS 端口 (隧道入口): $STUNNEL_PORT"
+echo "UDP 转发端口 (需客户端配置): $UDPGW_PORT"
+echo "================================================"
+echo "请确保您的云服务商防火墙已放行 $PANEL_PORT, $WSS_HTTP_PORT, $WSS_TLS_PORT, $STUNNEL_PORT 端口!"
