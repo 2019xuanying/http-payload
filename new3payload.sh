@@ -1,15 +1,6 @@
 #!/usr/bin/env bash
 set -eu
 
-# ==========================================================
-# WSS 隧道与用户管理面板一键部署脚本 (V4 - 增强版)
-# ----------------------------------------------------------
-# 优化点: 
-# 1. 安全增强: SSHD 明确监听 127.0.0.1:48303，隔离隧道入口。
-# 2. 运维增强: 面板新增 "重置流量" API 和按钮。
-# 3. 稳定运行: 解决所有 JSON/API 认证问题，流量统计稳定。
-# ==========================================================
-
 # =============================
 # 提示端口和面板密码
 # =============================
@@ -612,7 +603,6 @@ _DASHBOARD_HTML = """
                 <p><span class="font-bold">服务器地址:</span> {{ host_ip }} (请手动替换为你的公网 IP)</p>
                 <p><span class="font-bold">WSS (TLS/WebSocket):</span> 端口 {{ wss_tls_port }}</p>
                 <p><span class="font-bold">Stunnel (TLS 隧道):</span> 端口 {{ stunnel_port }}</p>
-                <p><span class="font-bold text-green-600">隔离状态:</span> SSH 48303 端口现已锁定在 **127.0.0.1**，无法从外部访问。</p>
                 <p><span class="font-bold text-red-600">注意:</span> 认证方式为 **SSH 账户/密码**。WSS/Stunnel 均转发至本地 SSH 端口 48303。</p>
             </div>
         </div>
@@ -850,7 +840,7 @@ _DASHBOARD_HTML = """
         
         // NEW: 重置流量功能
         async function resetTraffic(username) {
-            if (window.prompt(`确定要将用户 ${username} 的已用流量清零吗? (输入 RESET 确认)`) !== 'RESET') {
+            if (window.prompt('确定要将用户 ' + username + ' 的已用流量清零吗? (输入 RESET 确认)') !== 'RESET') {
                 return;
             }
 
@@ -1452,25 +1442,21 @@ setup_iptables_chains
 
 
 # =============================
-# SSHD 安全配置 (V4 - 隔离 48303 端口)
+# SSHD 安全配置 
 # =============================
 SSHD_CONFIG="/etc/ssh/sshd_config"
 BACKUP_SUFFIX=".bak.wss$(date +%s)"
 SSHD_SERVICE=$(systemctl list-units --full -all | grep -q "sshd.service" && echo "sshd" || echo "ssh")
 
-echo "==== 配置 SSHD 安全策略 (隔离 48303 端口) ===="
+echo "==== 配置 SSHD 安全策略 ===="
 # 备份 sshd_config
 cp -a "$SSHD_CONFIG" "${SSHD_CONFIG}${BACKUP_SUFFIX}"
 echo "SSHD 配置已备份到 ${SSHD_CONFIG}${BACKUP_SUFFIX}"
 
-# 1. 确保 SSHD 监听 127.0.0.1:48303
-# 移除可能存在的旧的 ListenAddress 48303 配置
-sed -i '/^ListenAddress.*:48303/d' "$SSHD_CONFIG"
-
-# 2. 删除旧的 WSS 匹配配置段
+# 1. 删除旧的 WSS 匹配配置段
 sed -i '/# WSS_TUNNEL_BLOCK_START/,/# WSS_TUNNEL_BLOCK_END/d' "$SSHD_CONFIG"
 
-# 3. 写入新的 WSS 隧道策略
+# 2. 写入新的 WSS 隧道策略
 cat >> "$SSHD_CONFIG" <<EOF
 
 # WSS_TUNNEL_BLOCK_START -- managed by deploy_wss_panel.sh
@@ -1507,9 +1493,8 @@ echo "🔥 WSS & Stunnel 基础设施已启动。"
 echo "🌐 升级后的管理面板已在后台运行。"
 echo ""
 echo "--- 核心功能更新 ---"
-echo "1. **安全性**: SSHD 端口 48303 现已锁定到 **127.0.0.1**，无法被外部扫描。"
-echo "2. **维护性**: 面板新增 **'重置流量'** 按钮，可一键清零用户已用流量。"
-echo "3. **稳定性**: 所有已知流量同步问题已修复。"
+echo "1. **维护性**: 面板新增 **'重置流量'** 按钮，可一键清零用户已用流量。"
+echo "2. **稳定性**: 所有已知流量同步问题已修复。"
 echo ""
 echo "--- 访问信息 ---"
 echo "Web 面板地址: http://[您的服务器IP]:$PANEL_PORT"
