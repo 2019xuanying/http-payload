@@ -1217,7 +1217,6 @@ import json
 import os
 import subprocess
 import time
-import requests
 from datetime import datetime
 
 # --- Configuration ---
@@ -1230,7 +1229,7 @@ IPTABLES_CHAIN_OUT = "WSS_USER_TRAFFIC_OUT"
 
 # --- Utility Functions ---
 
-def safe_run_command(command):
+def safe_run_command(command, input_data=None):
     """安全执行系统命令并返回结果."""
     try:
         result = subprocess.run(
@@ -1238,11 +1237,11 @@ def safe_run_command(command):
             check=False,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
+            input=input_data,
             timeout=5
         )
         return True, result.stdout.decode('utf-8').strip()
     except Exception:
-        # print(f"Command failed: {command}") # 禁用日志输出
         return False, ""
 
 def load_users():
@@ -1259,7 +1258,7 @@ def bytes_to_gb(bytes_val):
     """将字节转换为 GB."""
     return bytes_val / (1024 * 1024 * 1024)
 
-# --- Core Logic ---
+# --- Core Logic (IPTables Setup and Reading) ---
 
 def setup_iptables_rules(users):
     """根据用户列表设置/更新 iptables 规则 (清空链并重建规则)."""
@@ -1269,14 +1268,11 @@ def setup_iptables_rules(users):
     safe_run_command(['iptables', '-F', IPTABLES_CHAIN_OUT])
 
     # 2. 为每个用户添加统计规则 (使用 owner 模块)
-    # 匹配用户连接到本地 SSH 端口 (默认 48303) 的流量
     for user in users:
         username = user['username']
         
-        # 查找用户 UID (关键)
         success, uid = safe_run_command(['id', '-u', username])
         if not success or not uid.isdigit():
-            # print(f"Warning: Could not get UID for user {username}. Skipping rule setup.") # 禁用日志输出
             continue
 
         # INPUT: 目标端口 48303 (SSH) - 客户端发来的数据
@@ -1301,7 +1297,7 @@ def setup_iptables_rules(users):
 
 
 def read_and_report_traffic():
-    """读取 iptables 计数器并调用 Flask API 更新流量."""
+    """读取 iptables 计数器并调用 Flask API 更新流量 (使用 Curl)."""
     users = load_users()
     if not users:
         return
@@ -1318,27 +1314,20 @@ def read_and_report_traffic():
     traffic_data = {}
     
     for line in output.split('\n'):
-        # 仅处理包含用户 owner 匹配的 ACCEPT 规则
         if ('owner' in line) and ('ACCEPT' in line):
             try:
-                # 从 [pkts:bytes] 格式中提取字节数
-                # 示例: [1500:2500000]
                 parts = line.split('[')[1].split(']')
                 bytes_str = parts[0].split(':')[1]
                 total_bytes = int(bytes_str)
-
-                # 提取用户 UID
                 uid = line.split('--uid-owner')[1].split()[0]
                 
-                # 确定链和方向
                 if IPTABLES_CHAIN_IN in line and 'dport 48303' in line:
                     direction = 'in'
                 elif IPTABLES_CHAIN_OUT in line and 'sport 48303' in line:
                     direction = 'out'
                 else:
-                    continue # 忽略不匹配的规则
+                    continue
 
-                # 需要查找 UID 对应的用户名
                 success_user, username = safe_run_command(['id', '-un', uid])
                 if not success_user:
                     continue
@@ -1346,69 +1335,63 @@ def read_and_report_traffic():
                 if username not in traffic_data:
                     traffic_data[username] = {'in': 0, 'out': 0, 'uid': uid}
                 
-                # IPTables -Z 清零的是整条规则，所以只需要累加 total_bytes
                 traffic_data[username]['in' if direction == 'in' else 'out'] += total_bytes
                 
             except Exception:
                 continue
 
-    # 4. 更新面板 (API 调用)
+    # 4. 更新面板 (使用 CURL 代替 requests)
     for user in users:
         username = user['username']
         current_used_gb = user.get('used_traffic_gb', 0.0)
         
-        # 计算总流量
         in_bytes = traffic_data.get(username, {}).get('in', 0)
         out_bytes = traffic_data.get(username, {}).get('out', 0)
         total_transfer_bytes = in_bytes + out_bytes
         
-        # 换算成 GB (四舍五入到两位小数)，累加到面板历史流量
+        # 换算成 GB，累加到面板历史流量
         new_used_gb = current_used_gb + bytes_to_gb(total_transfer_bytes)
-
-        # 提交到面板 API
-        payload = {
+        rounded_gb = round(new_used_gb, 2)
+        
+        # 构建 API JSON Payload
+        payload_json = json.dumps({
             "username": username,
-            "used_traffic_gb": round(new_used_gb, 2)
-        }
+            "used_traffic_gb": rounded_gb
+        })
 
-        try:
-            # 依赖于 wss_panel.py 中移除了 @login_required 的修复
-            response = requests.post(
-                API_URL, 
-                json=payload, 
-                headers={'Content-Type': 'application/json'},
-                timeout=5
-            )
-            
-            if response.status_code == 200 and response.json().get('success'):
-                
-                # 5. 成功报告后，清零该用户的 iptables 计数器
-                uid = traffic_data.get(username, {}).get('uid')
-                if uid:
-                    # 清除 IN 链中该用户的规则计数
-                    safe_run_command([
-                        'iptables', '-Z', IPTABLES_CHAIN_IN, 
-                        '-p', 'tcp', '--dport', '48303', 
-                        '-m', 'owner', '--uid-owner', uid
-                    ])
-                    # 清除 OUT 链中该用户的规则计数
-                    safe_run_command([
-                        'iptables', '-Z', IPTABLES_CHAIN_OUT, 
-                        '-p', 'tcp', '--sport', '48303', 
-                        '-m', 'owner', '--uid-owner', uid
-                    ])
-                
-            else:
-                # print(f"API update failed for {username}: {response.text}") # 禁用日志输出
+        # >>>>>> 核心修改: 使用 CURL 发送 API 请求 <<<<<<
+        success_curl, api_response = safe_run_command([
+            'curl', '-s', '-X', 'POST', API_URL, 
+            '-H', 'Content-Type: application/json', 
+            '-d', payload_json
+        ])
+        
+        # 5. 检查 CURL 响应并清零计数器
+        if success_curl and api_response:
+            try:
+                response_json = json.loads(api_response)
+                if response_json.get('success'):
+                    # 成功上报后，清零该用户的 iptables 计数器
+                    uid = traffic_data.get(username, {}).get('uid')
+                    if uid:
+                        safe_run_command([
+                            'iptables', '-Z', IPTABLES_CHAIN_IN, 
+                            '-p', 'tcp', '--dport', '48303', 
+                            '-m', 'owner', '--uid-owner', uid
+                        ])
+                        safe_run_command([
+                            'iptables', '-Z', IPTABLES_CHAIN_OUT, 
+                            '-p', 'tcp', '--sport', '48303', 
+                            '-m', 'owner', '--uid-owner', uid
+                        ])
+            except json.JSONDecodeError:
+                # 忽略非 JSON 响应（例如 WSS 代理的 'OK' 或其他错误）
                 pass
-                
-        except requests.exceptions.RequestException:
-            # print(f"API connection error for {username}: {e}") # 禁用日志输出
-            pass
 
 
 if __name__ == '__main__':
     read_and_report_traffic()
+
 EOF
 
 chmod +x /usr/local/bin/wss_traffic_sync.py
