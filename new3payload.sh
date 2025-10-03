@@ -2,12 +2,12 @@
 set -eu
 
 # ==========================================================
-# WSS 隧道与用户管理面板一键部署脚本 (V3 - 最终修复版)
+# WSS 隧道与用户管理面板一键部署脚本 (V4 - 增强版)
 # ----------------------------------------------------------
 # 优化点: 
-# 1. 修复流量同步脚本的 JSONDecodeError (已解除 API 的内部认证限制)。
-# 2. 增强删除/暂停用户时的会话强制终止逻辑 (pkill)。
-# 3. 优化 IPTables 规则清理和用户 UID 匹配逻辑，提高流量统计稳定性。
+# 1. 安全增强: SSHD 明确监听 127.0.0.1:48303，隔离隧道入口。
+# 2. 运维增强: 面板新增 "重置流量" API 和按钮。
+# 3. 稳定运行: 解决所有 JSON/API 认证问题，流量统计稳定。
 # ==========================================================
 
 # =============================
@@ -260,9 +260,10 @@ socket = r:TCP_NODELAY=1
 
 [ssh-tls-gateway]
 accept = 0.0.0.0:$STUNNEL_PORT
+# 注意: Stunnel 转发目标是 127.0.0.1:48303
+connect = 127.0.0.1:48303
 cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.pem
-connect = 127.0.0.1:48303
 EOF
 
 systemctl enable stunnel4 || true
@@ -310,18 +311,17 @@ echo "----------------------------------"
 
 
 # =============================
-# 安装 WSS 用户管理面板 (基于 Flask) - V3 最终修复
+# 安装 WSS 用户管理面板 (基于 Flask) - V4 新增重置流量
 # =============================
-echo "==== 部署 WSS 用户管理面板 (Python/Flask) V3 最终修复 ===="
+echo "==== 部署 WSS 用户管理面板 (Python/Flask) V4 增强版 ===="
 PANEL_DIR="/etc/wss-panel"
 USER_DB="$PANEL_DIR/users.json"
 mkdir -p "$PANEL_DIR"
 
-# 检查/初始化用户数据库，并添加新字段的默认值
+# 检查/初始化用户数据库 (保留升级逻辑)
 if [ ! -f "$USER_DB" ]; then
     echo "[]" > "$USER_DB"
 else
-    # 尝试升级旧的 JSON 结构，确保新字段存在
     python3 -c "
 import json
 import time
@@ -358,7 +358,7 @@ upgrade_users()
 "
 fi
 
-# 嵌入 Python 面板代码 (修复了 update_traffic_api 的认证问题)
+# 嵌入 Python 面板代码 (新增重置流量功能)
 tee /usr/local/bin/wss_panel.py > /dev/null <<EOF
 # -*- coding: utf-8 -*-
 from flask import Flask, request, jsonify, redirect, url_for, session, make_response
@@ -422,7 +422,6 @@ def login_required(f):
     """检查用户是否已登录."""
     def decorated_function(*args, **kwargs):
         if 'logged_in' not in session or not session.get('logged_in'):
-            # 返回登录 HTML 页面，这是导致 JSONDecodeError 的原因
             return redirect(url_for('login')) 
         return f(*args, **kwargs)
     decorated_function.__name__ = f.__name__
@@ -507,7 +506,6 @@ def sync_user_status(user):
         safe_run_command(['usermod', '-U', username]) # 解锁密码
         safe_run_command(['chage', '-E', '', username]) # 清除到期日
         user['status'] = 'active'
-        # print(f"Synced {username}: Activated in system.")
         
     # 如果面板要求暂停, 且系统是未暂停的
     elif should_be_paused and not system_locked:
@@ -515,9 +513,8 @@ def sync_user_status(user):
         safe_run_command(['usermod', '-L', username])
         # 额外设置到期日为 '1970-01-01' (立即过期) 确保客户端连接断开
         safe_run_command(['chage', '-E', '1970-01-01', username]) 
-        kill_user_sessions(username) # 立即终止活动会话 (NEW)
+        kill_user_sessions(username) # 立即终止活动会话
         user['status'] = 'paused' # 标记面板状态
-        # print(f"Synced {username}: Paused in system and sessions killed.")
         
     # 无论如何，如果到期日字段存在，确保它被设置到系统
     if user['expiry_date'] and current_status == 'active':
@@ -562,7 +559,7 @@ _DASHBOARD_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WSS Panel - 仪表盘 V3</title>
+    <title>WSS Panel - 仪表盘 V4</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
     <style>
@@ -577,7 +574,7 @@ _DASHBOARD_HTML = """
 <body class="bg-gray-50 min-h-screen">
     <div class="bg-indigo-600 text-white shadow-lg">
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
-            <h1 class="text-3xl font-bold">WSS 隧道管理面板 V3</h1>
+            <h1 class="text-3xl font-bold">WSS 隧道管理面板 V4</h1>
             <button onclick="logout()" class="bg-indigo-800 hover:bg-red-700 px-4 py-2 rounded-lg font-semibold shadow-md btn-action">
                 退出登录 (root)
             </button>
@@ -615,6 +612,7 @@ _DASHBOARD_HTML = """
                 <p><span class="font-bold">服务器地址:</span> {{ host_ip }} (请手动替换为你的公网 IP)</p>
                 <p><span class="font-bold">WSS (TLS/WebSocket):</span> 端口 {{ wss_tls_port }}</p>
                 <p><span class="font-bold">Stunnel (TLS 隧道):</span> 端口 {{ stunnel_port }}</p>
+                <p><span class="font-bold text-green-600">隔离状态:</span> SSH 48303 端口现已锁定在 **127.0.0.1**，无法从外部访问。</p>
                 <p><span class="font-bold text-red-600">注意:</span> 认证方式为 **SSH 账户/密码**。WSS/Stunnel 均转发至本地 SSH 端口 48303。</p>
             </div>
         </div>
@@ -671,6 +669,11 @@ _DASHBOARD_HTML = """
                                 <button onclick="openQuotaModal('{{ user.username }}', '{{ user.quota_gb }}', '{{ user.expiry_date }}')" 
                                         class="text-xs px-3 py-1 rounded-full font-bold bg-blue-100 text-blue-800 hover:bg-blue-200 btn-action">
                                     配额/到期
+                                </button>
+                                <!-- NEW: 重置流量按钮 -->
+                                <button onclick="resetTraffic('{{ user.username }}')"
+                                        class="text-xs px-3 py-1 rounded-full font-bold bg-purple-100 text-purple-800 hover:bg-purple-200 btn-action">
+                                    重置流量
                                 </button>
                                 <button onclick="deleteUser('{{ user.username }}')" 
                                         class="text-xs px-3 py-1 rounded-full font-bold bg-red-100 text-red-800 hover:bg-red-200 btn-action">
@@ -758,7 +761,6 @@ _DASHBOARD_HTML = """
         async function toggleUserStatus(username, action) {
             const actionText = action === 'active' ? '启用' : '暂停';
             const confirmText = action === 'active' ? 'YES' : 'STOP';
-            // NEW: 提示用户会话将立即中断
             if (window.prompt(\`确定要\${actionText}用户 \${username} 吗? (\${actionText}操作将同时终止所有活动会话。输入 \${confirmText} 确认)\`) !== confirmText) {
                 return;
             }
@@ -784,7 +786,6 @@ _DASHBOARD_HTML = """
         }
 
         async function deleteUser(username) {
-            // NEW: 提示用户会话将立即中断
             if (window.prompt(\`确定要永久删除用户 \${username} 吗? (此操作将终止所有活动会话并删除系统账户。输入 DELETE 确认)\`) !== 'DELETE') {
                 return;
             }
@@ -847,6 +848,32 @@ _DASHBOARD_HTML = """
             }
         }
         
+        // NEW: 重置流量功能
+        async function resetTraffic(username) {
+            if (window.prompt(`确定要将用户 ${username} 的已用流量清零吗? (输入 RESET 确认)`) !== 'RESET') {
+                return;
+            }
+
+            try {
+                const response = await fetch('/api/users/reset_traffic', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username })
+                });
+
+                const result = await response.json();
+
+                if (response.ok && result.success) {
+                    showStatus(result.message, true);
+                    location.reload();
+                } else {
+                    showStatus('重置失败: ' + result.message, false);
+                }
+            } catch (error) {
+                showStatus('请求失败，请检查面板运行状态。', false);
+            }
+        }
+        
         function logout() {
             window.location.href = '/logout';
         }
@@ -879,7 +906,7 @@ def render_dashboard(users):
     return template.render(**context)
 
 
-# --- Web 路由 (保持不变) ---
+# --- Web 路由 ---
 
 @app.route('/', methods=['GET'])
 @login_required
@@ -932,7 +959,7 @@ def login():
 </head>
 <body>
     <div class="container">
-        <h1 class="text-2xl">WSS 管理面板 V3</h1>
+        <h1 class="text-2xl">WSS 管理面板 V4</h1>
         {f'<div class="error">{error}</div>' if error else ''}
         <form method="POST">
             <label for="username" class="block text-sm font-medium text-gray-700">用户名</label>
@@ -1014,7 +1041,7 @@ def delete_user_api():
     if not user_to_delete:
         return jsonify({"success": False, "message": f"面板中用户 {username} 不存在"}), 404
 
-    # 1. 终止用户会话 (NEW STEP)
+    # 1. 终止用户会话
     kill_user_sessions(username)
 
     # 2. 删除系统用户及其主目录
@@ -1046,7 +1073,7 @@ def toggle_user_status_api():
         # 暂停逻辑：锁定密码
         success, output = safe_run_command(['usermod', '-L', username])
         safe_run_command(['chage', '-E', '1970-01-01', username]) # 强制过期
-        kill_user_sessions(username) # 立即终止活动会话 (NEW)
+        kill_user_sessions(username) # 立即终止活动会话
         users[index]['status'] = 'paused'
         message = f"用户 {username} 已暂停，活动会话已终止"
     elif action == 'active':
@@ -1068,6 +1095,28 @@ def toggle_user_status_api():
         return jsonify({"success": True, "message": message})
     else:
         return jsonify({"success": False, "message": f"系统操作失败: {output}"}), 500
+
+@app.route('/api/users/reset_traffic', methods=['POST'])
+@login_required
+def reset_user_traffic_api():
+    """将用户的已用流量清零 (API) - NEW"""
+    data = request.json
+    username = data.get('username')
+
+    user, index = get_user(username)
+    if not user:
+        return jsonify({"success": False, "message": f"用户 {username} 不存在"}), 404
+        
+    users = load_users()
+    
+    # 清零流量
+    users[index]['used_traffic_gb'] = 0.0
+    
+    # 如果用户超额状态被清除，重新同步状态（如果超额清零后状态变为 active，则解除系统锁定）
+    users[index] = sync_user_status(users[index])
+    
+    save_users(users)
+    return jsonify({"success": True, "message": f"用户 {username} 的已用流量已重置为 0.00 GB"})
 
 
 @app.route('/api/users/settings', methods=['POST'])
@@ -1113,8 +1162,7 @@ def update_user_settings_api():
     
     
 @app.route('/api/users/update_traffic', methods=['POST'])
-# >>>>>>>>>> 关键修复: 移除 @login_required 以允许内部脚本调用 <<<<<<<<<<
-# @login_required 
+# 此 API 无需登录，供内部脚本调用
 def update_user_traffic_api():
     """外部工具用于更新用户流量的 API (无需系统操作)"""
     data = request.json
@@ -1172,7 +1220,7 @@ fi
 systemctl daemon-reload
 systemctl enable wss_panel || true
 systemctl restart wss_panel
-echo "WSS 管理面板 V3 已启动/重启，端口 $PANEL_PORT"
+echo "WSS 管理面板 V4 已启动/重启，端口 $PANEL_PORT"
 echo "----------------------------------"
 
 # =============================
@@ -1184,11 +1232,9 @@ setup_iptables_chains() {
     echo "==== 配置 IPTABLES 流量统计链 ===="
     
     # 1. 清理旧链和规则 (确保幂等性)
-    # 尝试删除 INPUT/OUTPUT 中的跳转规则
     iptables -D INPUT -j WSS_USER_TRAFFIC_IN 2>/dev/null || true
     iptables -D OUTPUT -j WSS_USER_TRAFFIC_OUT 2>/dev/null || true
     
-    # 刷新和删除自定义链 (修复 Chain already exists)
     iptables -F WSS_USER_TRAFFIC_IN 2>/dev/null || true
     iptables -X WSS_USER_TRAFFIC_IN 2>/dev/null || true
     iptables -F WSS_USER_TRAFFIC_OUT 2>/dev/null || true
@@ -1210,7 +1256,7 @@ setup_iptables_chains() {
     echo "IPTABLES 流量统计链创建/清理完成，已连接到 INPUT/OUTPUT。"
 }
 
-# 2. 流量同步 Python 脚本 (增强了 UID 查找和 IPTables 解析)
+# 2. 流量同步 Python 脚本 (使用 Curl)
 tee /usr/local/bin/wss_traffic_sync.py > /dev/null <<EOF
 # -*- coding: utf-8 -*-
 import json
@@ -1222,7 +1268,6 @@ from datetime import datetime
 # --- Configuration ---
 USER_DB_PATH = "/etc/wss-panel/users.json"
 PANEL_PORT = "$PANEL_PORT"
-# 注意: 流量同步脚本和面板在同一台机器，直接使用 127.0.0.1
 API_URL = f"http://127.0.0.1:{PANEL_PORT}/api/users/update_traffic" 
 IPTABLES_CHAIN_IN = "WSS_USER_TRAFFIC_IN"
 IPTABLES_CHAIN_OUT = "WSS_USER_TRAFFIC_OUT"
@@ -1263,11 +1308,9 @@ def bytes_to_gb(bytes_val):
 def setup_iptables_rules(users):
     """根据用户列表设置/更新 iptables 规则 (清空链并重建规则)."""
     
-    # 1. 刷新用户链 (保留链本身，清理内部规则)
     safe_run_command(['iptables', '-F', IPTABLES_CHAIN_IN])
     safe_run_command(['iptables', '-F', IPTABLES_CHAIN_OUT])
 
-    # 2. 为每个用户添加统计规则 (使用 owner 模块)
     for user in users:
         username = user['username']
         
@@ -1291,7 +1334,6 @@ def setup_iptables_rules(users):
             '-j', 'ACCEPT'
         ])
         
-    # 3. 添加默认返回规则 (必须是最后一条)
     safe_run_command(['iptables', '-A', IPTABLES_CHAIN_IN, '-j', 'RETURN'])
     safe_run_command(['iptables', '-A', IPTABLES_CHAIN_OUT, '-j', 'RETURN'])
 
@@ -1302,15 +1344,12 @@ def read_and_report_traffic():
     if not users:
         return
 
-    # 1. 重新设置 iptables 规则 (确保规则与当前用户列表同步)
     setup_iptables_rules(users)
 
-    # 2. 读取流量数据
     success, output = safe_run_command(['iptables-save', '-c'])
     if not success:
         return
 
-    # 3. 解析流量数据
     traffic_data = {}
     
     for line in output.split('\n'):
@@ -1340,7 +1379,6 @@ def read_and_report_traffic():
             except Exception:
                 continue
 
-    # 4. 更新面板 (使用 CURL 代替 requests)
     for user in users:
         username = user['username']
         current_used_gb = user.get('used_traffic_gb', 0.0)
@@ -1349,29 +1387,24 @@ def read_and_report_traffic():
         out_bytes = traffic_data.get(username, {}).get('out', 0)
         total_transfer_bytes = in_bytes + out_bytes
         
-        # 换算成 GB，累加到面板历史流量
         new_used_gb = current_used_gb + bytes_to_gb(total_transfer_bytes)
         rounded_gb = round(new_used_gb, 2)
         
-        # 构建 API JSON Payload
         payload_json = json.dumps({
             "username": username,
             "used_traffic_gb": rounded_gb
         })
 
-        # >>>>>> 核心修改: 使用 CURL 发送 API 请求 <<<<<<
         success_curl, api_response = safe_run_command([
             'curl', '-s', '-X', 'POST', API_URL, 
             '-H', 'Content-Type: application/json', 
             '-d', payload_json
         ])
         
-        # 5. 检查 CURL 响应并清零计数器
         if success_curl and api_response:
             try:
                 response_json = json.loads(api_response)
                 if response_json.get('success'):
-                    # 成功上报后，清零该用户的 iptables 计数器
                     uid = traffic_data.get(username, {}).get('uid')
                     if uid:
                         safe_run_command([
@@ -1385,13 +1418,11 @@ def read_and_report_traffic():
                             '-m', 'owner', '--uid-owner', uid
                         ])
             except json.JSONDecodeError:
-                # 忽略非 JSON 响应（例如 WSS 代理的 'OK' 或其他错误）
                 pass
 
 
 if __name__ == '__main__':
     read_and_report_traffic()
-
 EOF
 
 chmod +x /usr/local/bin/wss_traffic_sync.py
@@ -1399,10 +1430,8 @@ chmod +x /usr/local/bin/wss_traffic_sync.py
 # 3. 创建定时任务 (Cron Job) 运行流量同步脚本
 echo "==== 设置 Cron 定时任务 (每 5 分钟同步一次流量) ===="
 
-# 确保 cron.d 目录存在
 mkdir -p /etc/cron.d
 
-# 使用 /etc/cron.d/ 部署每 5 分钟执行一次的定时任务
 tee /etc/cron.d/wss-traffic > /dev/null <<EOF
 SHELL=/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
@@ -1410,10 +1439,8 @@ PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
 */5 * * * * root /usr/bin/python3 /usr/local/bin/wss_traffic_sync.py
 EOF
 
-# 授予执行权限
 chmod 0644 /etc/cron.d/wss-traffic
 
-# 确保 cron 服务已启动
 systemctl enable cron || true
 systemctl start cron || true
 
@@ -1425,21 +1452,27 @@ setup_iptables_chains
 
 
 # =============================
-# SSHD 安全配置 (保持不变)
+# SSHD 安全配置 (V4 - 隔离 48303 端口)
 # =============================
 SSHD_CONFIG="/etc/ssh/sshd_config"
 BACKUP_SUFFIX=".bak.wss$(date +%s)"
 SSHD_SERVICE=$(systemctl list-units --full -all | grep -q "sshd.service" && echo "sshd" || echo "ssh")
 
-echo "==== 配置 SSHD 安全策略 (允许本机密码认证) ===="
+echo "==== 配置 SSHD 安全策略 (隔离 48303 端口) ===="
 # 备份 sshd_config
 cp -a "$SSHD_CONFIG" "${SSHD_CONFIG}${BACKUP_SUFFIX}"
 echo "SSHD 配置已备份到 ${SSHD_CONFIG}${BACKUP_SUFFIX}"
 
-# 删除旧的 WSS 配置段
+# 1. 确保 SSHD 监听 127.0.0.1:48303
+# 移除可能存在的旧的 ListenAddress 48303 配置
+sed -i '/^ListenAddress.*:48303/d' "$SSHD_CONFIG"
+# 在配置文件末尾添加 ListenAddress 127.0.0.1:48303，只对本机开放
+echo "ListenAddress 127.0.0.1:48303" >> "$SSHD_CONFIG"
+
+# 2. 删除旧的 WSS 匹配配置段
 sed -i '/# WSS_TUNNEL_BLOCK_START/,/# WSS_TUNNEL_BLOCK_END/d' "$SSHD_CONFIG"
 
-# 写入新的 WSS 隧道策略
+# 3. 写入新的 WSS 隧道策略
 cat >> "$SSHD_CONFIG" <<EOF
 
 # WSS_TUNNEL_BLOCK_START -- managed by deploy_wss_panel.sh
@@ -1469,22 +1502,19 @@ echo "----------------------------------"
 unset PANEL_ROOT_PASS_RAW
 
 echo "=================================================="
-echo "✅ WSS 管理面板 V3 最终修复版部署完成！"
+echo "✅ WSS 管理面板 V4 增强版部署完成！"
 echo "=================================================="
 echo ""
 echo "🔥 WSS & Stunnel 基础设施已启动。"
 echo "🌐 升级后的管理面板已在后台运行。"
 echo ""
 echo "--- 核心功能更新 ---"
-echo "1. **会话强制终止**: **删除** 或 **暂停** 用户时，其活动连接会立即被中断。"
-echo "2. **IPTables 流量监控**: 已配置流量统计规则，每 **5 分钟** 自动同步数据到面板。**JSON 解析错误已修复**。"
+echo "1. **安全性**: SSHD 端口 48303 现已锁定到 **127.0.0.1**，无法被外部扫描。"
+echo "2. **维护性**: 面板新增 **'重置流量'** 按钮，可一键清零用户已用流量。"
+echo "3. **稳定性**: 所有已知流量同步问题已修复。"
 echo ""
-echo "--- 访问信息 (UI 已美化为 MD 风格) ---"
+echo "--- 访问信息 ---"
 echo "Web 面板地址: http://[您的服务器IP]:$PANEL_PORT"
 echo "Web 面板用户名: root"
 echo "Web 面板密码: [您刚才设置的密码]"
-echo ""
-echo "--- 故障排查 ---"
-echo "Web 面板状态: sudo systemctl status wss_panel"
-echo "流量同步状态: sudo tail -f /var/log/syslog | grep wss_traffic_sync"
 echo "=================================================="
