@@ -1466,8 +1466,6 @@ echo "SSHD 配置已备份到 ${SSHD_CONFIG}${BACKUP_SUFFIX}"
 # 1. 确保 SSHD 监听 127.0.0.1:48303
 # 移除可能存在的旧的 ListenAddress 48303 配置
 sed -i '/^ListenAddress.*:48303/d' "$SSHD_CONFIG"
-# 在配置文件末尾添加 ListenAddress 127.0.0.1:48303，只对本机开放
-echo "ListenAddress 127.0.0.1:48303" >> "$SSHD_CONFIG"
 
 # 2. 删除旧的 WSS 匹配配置段
 sed -i '/# WSS_TUNNEL_BLOCK_START/,/# WSS_TUNNEL_BLOCK_END/d' "$SSHD_CONFIG"
