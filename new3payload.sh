@@ -20,8 +20,8 @@ UDPGW_PORT=${UDPGW_PORT:-7300}
 
 echo "----------------------------------"
 echo "==== 管理面板配置 ===="
-read -p "请输入 Web 管理面板监听端口 (默认8080): " PANEL_PORT
-PANEL_PORT=${PANEL_PORT:-8080}
+read -p "请输入 Web 管理面板监听端口 (默认54321): " PANEL_PORT
+PANEL_PORT=${PANEL_PORT:-54321}
 
 # 交互式安全输入并确认 ROOT 密码
 echo "请为 Web 面板的 'root' 用户设置密码（输入时隐藏）。"
