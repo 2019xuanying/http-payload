@@ -2,7 +2,7 @@
 set -eu
 
 # =======================================================
-# WSS 隧道/Stunnel/管理面板部署脚本 V5.1 - 修复 Flask 路由错误
+# WSS 隧道/Stunnel/管理面板部署脚本 V5.4 - 实时 IP 阻断与健壮性增强
 # =======================================================
 
 # --- 全局变量和工具函数 ---
@@ -26,17 +26,26 @@ check_port() {
         echo " (Cannot check status, ss or netstat not found)"
     fi
 }
-export -f check_port # 导出函数供后面使用
+export -f check_port
 
-# 获取服务器IP (尝试获取公网IP，若失败则用私网或占位符)
+# 获取服务器IP (增加备用 IP API，提高成功率)
 get_server_ip() {
-    SERVER_IP=$(curl -s --connect-timeout 2 ip.sb || ip a | grep 'inet ' | grep -v '127.0.0.1' | head -n 1 | awk '{print $2}' | cut -d/ -f1 || echo '[SERVER_IP]')
+    echo "尝试获取服务器公网 IP..."
+    # 尝试使用 ip.sb
+    SERVER_IP=$(curl -s --connect-timeout 2 ip.sb 2>/dev/null)
+    # 尝试使用 ifconfig.me
+    [ -z "$SERVER_IP" ] && SERVER_IP=$(curl -s --connect-timeout 2 ifconfig.me 2>/dev/null)
+    # 尝试获取本地非回环 IP
+    [ -z "$SERVER_IP" ] && SERVER_IP=$(ip a | grep 'inet ' | grep -v '127.0.0.1' | head -n 1 | awk '{print $2}' | cut -d/ -f1)
+    # 最终默认值
+    [ -z "$SERVER_IP" ] && SERVER_IP='[SERVER_IP]'
     echo "$SERVER_IP"
 }
 SERVER_IP=$(get_server_ip)
+echo "检测到的服务器 IP: $SERVER_IP"
 
 
-# --- 1. 提示端口和面板密码 ---
+# --- 1. 提示端口和面板密码 (保留不变) ---
 echo "----------------------------------"
 echo "==== WSS 基础设施端口配置 ===="
 read -p "请输入 WSS HTTP 监听端口 (默认80): " WSS_HTTP_PORT
@@ -59,35 +68,34 @@ PANEL_PORT=${PANEL_PORT:-54321}
 # 交互式安全输入并确认 ROOT 密码
 echo "请为 Web 面板的 'root' 用户设置密码（输入时隐藏）。"
 while true; do
-  read -s -p "面板密码: " pw1 && echo
-  read -s -p "请再次确认密码: " pw2 && echo
-  if [ -z "$pw1" ]; then
-    echo "密码不能为空，请重新输入。"
-    continue
-  fi
-  if [ "$pw1" != "$pw2" ]; then
-    echo "两次输入不一致，请重试。"
-    continue
-  fi
-  PANEL_ROOT_PASS_RAW="$pw1"
-  # 对密码进行简单的 HASH
-  PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | sha256sum | awk '{print $1}')
-  break
+    read -s -p "面板密码: " pw1 && echo
+    read -s -p "请再次确认密码: " pw2 && echo
+    if [ -z "$pw1" ]; then
+        echo "密码不能为空，请重新输入。"
+        continue
+    fi
+    if [ "$pw1" != "$pw2" ]; then
+        echo "两次输入不一致，请重试。"
+        continue
+    fi
+    PANEL_ROOT_PASS_RAW="$pw1"
+    # 对密码进行简单的 HASH
+    PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | sha256sum | awk '{print $1}')
+    break
 done
 
 echo "----------------------------------"
-echo "==== 系统更新与依赖安装 ===="
-# 确保所有依赖已安装 (requests, cmake, net-tools, stunnel4等)
-# 增加 httpx (用于异步 API 调用)
+echo "==== 系统更新与依赖安装 (新增 iptables-persistent) ===="
+# 增加 iptables-persistent 确保流量规则和封禁规则持久化
 apt update -y
-apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4
-# 安装 requests 库以处理同步调用 (虽然我们使用 httpx，但requests也是常用依赖)
+apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4 iptables-persistent
+# 安装 python 依赖
 pip3 install flask jinja2 requests httpx
 echo "依赖安装完成"
 echo "----------------------------------"
 
 
-# --- 2. WSS 核心代理脚本 (增加IP检查和报告) ---
+# --- 2. WSS 核心代理脚本 (/usr/local/bin/wss) ---
 echo "==== 安装 WSS 核心代理脚本 (/usr/local/bin/wss) ===="
 tee /usr/local/bin/wss > /dev/null <<EOF
 #!/usr/bin/python3
@@ -124,11 +132,11 @@ FIRST_RESPONSE = b'HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\nContent-Le
 SWITCH_RESPONSE = b'HTTP/1.1 101 Switching Protocols\\r\\nUpgrade: websocket\\r\\nConnection: Upgrade\\r\\n\\r\\n'
 FORBIDDEN_RESPONSE = b'HTTP/1.1 403 Forbidden\\r\\nContent-Length: 0\\r\\n\\r\\n'
 
-# 使用 httpx 客户端
-http_client = httpx.AsyncClient(timeout=3.0)
+# FIX: 将 AsyncClient 放在全局变量，避免每次连接都创建一个新客户端
+http_client = httpx.AsyncClient(timeout=3.0) 
 
 async def check_ip_status(client_ip):
-    """异步查询 Flask 面板，检查 IP 是否被禁止."""
+    """异步查询 Flask 面板，检查 IP 是否被禁止 (作为实时 iptables 阻断的辅助和新连接拒绝)."""
     try:
         response = await http_client.post(
             API_URL_CHECK,
@@ -137,11 +145,10 @@ async def check_ip_status(client_ip):
         if response.status_code == 200:
             result = response.json()
             # result['is_banned'] 为 True 表示该 IP 被禁止连接
-            return not result.get('is_banned', False) 
+            return not result.get('is_banned', False)
         # 如果 API 调用失败，默认允许连接，防止单点故障
-        return True 
+        return True
     except Exception:
-        # print(f"Warning: Failed to contact panel API for IP check: {e}")
         return True
 
 async def report_ip_activity(client_ip, action):
@@ -152,7 +159,6 @@ async def report_ip_activity(client_ip, action):
             json={'ip': client_ip, 'action': action}
         )
     except Exception:
-        # print(f"Warning: Failed to report IP activity: {e}")
         pass
 
 
@@ -160,14 +166,13 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
     peer = writer.get_extra_info('peername')
     client_ip = peer[0]
     
-    # --- 0. IP 检查 (新增) ---
+    # --- 0. IP 检查 (保留作为二次验证) ---
     is_allowed = await check_ip_status(client_ip)
     if not is_allowed:
         writer.write(FORBIDDEN_RESPONSE)
         await writer.drain()
         writer.close()
         await writer.wait_closed()
-        # print(f"Connection from BANNED IP {client_ip} rejected.")
         return
 
     await report_ip_activity(client_ip, 'connect')
@@ -185,7 +190,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             
             full_request += data
             
-            header_end_index = full_request.find(b'\\r\\n\\r\\n')
+            header_end_index = full_request.find(b'\r\n\r\n')
             
             if header_end_index == -1:
                 # 尚未收到完整头部，回复 200 OK 欺骗探测
@@ -217,7 +222,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         # --- 退出握手循环 ---
         
         if not forwarding_started:
-             raise Exception("Handshake failed or connection closed early")
+            raise Exception("Handshake failed or connection closed early")
 
 
         # 4. 连接目标服务器
@@ -241,7 +246,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                     dst_writer.write(buf)
                     await dst_writer.drain()
             except asyncio.TimeoutError:
-                # print("Pipe timeout occurred")
                 pass
             except Exception:
                 pass
@@ -254,7 +258,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         )
 
     except Exception:
-        # print(f"Connection error {client_ip}: {e}")
         pass
     finally:
         await report_ip_activity(client_ip, 'disconnect') # 报告断开连接
@@ -263,7 +266,6 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             await writer.wait_closed()
         except Exception:
             pass
-        # print(f"Closed {client_ip}")
 
 async def main():
     # TLS server setup
@@ -276,7 +278,7 @@ async def main():
         tls_task = tls_server.serve_forever()
     except FileNotFoundError:
         print(f"WARNING: TLS certificate not found at {CERT_FILE}. TLS server disabled.")
-        tls_task = asyncio.sleep(86400) 
+        tls_task = asyncio.sleep(86400) # Keep main running if TLS fails
     
     http_server = await asyncio.start_server(
         lambda r, w: handle_client(r, w, tls=False), LISTEN_ADDR, HTTP_PORT)
@@ -284,14 +286,12 @@ async def main():
     print(f"Listening on {LISTEN_ADDR}:{HTTP_PORT} (HTTP payload)")
 
     async with http_server:
-        # 使用 asyncio.gather 同时运行 HTTP 和 TLS 服务器
         await asyncio.gather(
             tls_task,
             http_server.serve_forever())
 
 if __name__ == '__main__':
     try:
-        # 将面板端口传递给 wss 脚本
         os.environ['WSS_PANEL_PORT'] = "$PANEL_PORT" 
         asyncio.run(main())
     except KeyboardInterrupt:
@@ -303,10 +303,10 @@ EOF
 
 chmod +x /usr/local/bin/wss
 
-# 创建 WSS systemd 服务 (确保传入端口，并设置 PANEL_PORT 环境变量)
+# 创建 WSS systemd 服务 (保留不变)
 tee /etc/systemd/system/wss.service > /dev/null <<EOF
 [Unit]
-Description=WSS Python Proxy (V5 with IP Control)
+Description=WSS Python Proxy (V5.4 with IP Control)
 After=network.target
 
 [Service]
@@ -323,18 +323,19 @@ EOF
 systemctl daemon-reload
 systemctl enable wss || true
 systemctl restart wss || true
-echo "WSS 核心代理 (V5 IP控制版) 已启动/重启，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
+echo "WSS 核心代理 (V5.4 IP控制版) 已启动/重启，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
 echo "----------------------------------"
 
-# --- 3. Stunnel4, UDPGW (保持不变，略作优化) ---
+# --- 3. Stunnel4, UDPGW (编译过程优化) ---
 echo "==== 检查/安装 Stunnel4 ===="
 mkdir -p /etc/stunnel/certs
 if [ ! -f "/etc/stunnel/certs/stunnel.pem" ]; then
+    echo "Stunnel 证书不存在，正在生成..."
     openssl req -x509 -nodes -newkey rsa:2048 \
     -keyout /etc/stunnel/certs/stunnel.key \
     -out /etc/stunnel/certs/stunnel.crt \
     -days 1095 \
-    -subj "/CN=example.com" > /dev/null 2>&1
+    -subj "/CN=example.com"
     sh -c 'cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem'
     chmod 644 /etc/stunnel/certs/*.crt
     chmod 644 /etc/stunnel/certs/*.pem
@@ -363,17 +364,31 @@ systemctl restart stunnel4 || true
 echo "Stunnel4 配置已更新并重启，端口 $STUNNEL_PORT"
 echo "----------------------------------"
 
-echo "==== 检查/安装 UDPGW ===="
+echo "==== 检查/安装 UDPGW (编译反馈增强) ===="
 if [ ! -f "/root/badvpn/badvpn-build/udpgw/badvpn-udpgw" ]; then
+    echo "UDPGW 二进制文件不存在，开始编译..."
     if [ ! -d "/root/badvpn" ]; then
-        git clone https://github.com/ambrop72/badvpn.git /root/badvpn
+        echo "克隆 badvpn 仓库..."
+        git clone https://github.com/ambrop72/badvpn.git /root/badvpn || { echo "ERROR: Git clone failed."; exit 1; }
     fi
     mkdir -p /root/badvpn/badvpn-build
     cd /root/badvpn/badvpn-build
-    cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 > /dev/null 2>&1
-    make -j$(nproc) > /dev/null 2>&1
+    
+    # FIX: 移除静默编译，如果失败则输出错误信息
+    if cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 ; then
+        if make -j$(nproc); then
+            echo "UDPGW 编译成功。"
+        else
+            echo "ERROR: UDPGW make failed. Check build-essential is installed."
+            exit 1
+        fi
+    else
+        echo "ERROR: UDPGW cmake failed."
+        exit 1
+    fi
     cd - > /dev/null
-    echo "UDPGW 编译完成。"
+else
+    echo "UDPGW 二进制文件已存在，跳过编译。"
 fi
 
 
@@ -399,15 +414,15 @@ echo "UDPGW 已启动/重启，端口: $UDPGW_PORT"
 echo "----------------------------------"
 
 
-# --- 4. 安装 WSS 用户管理面板 (基于 Flask) - V5 大幅增强 ---
-echo "==== 部署 WSS 用户管理面板 (Python/Flask) V5 IP 控制增强版 ===="
+# --- 4. 安装 WSS 用户管理面板 (基于 Flask) - 实时 IP 阻断集成 ---
+echo "==== 部署 WSS 用户管理面板 (Python/Flask) V5.4 实时 IP 控制增强版 ===="
 PANEL_DIR="/etc/wss-panel"
 USER_DB="$PANEL_DIR/users.json"
-IP_BANS_DB="$PANEL_DIR/ip_bans.json" # 全局 IP 封禁列表
-IP_ACTIVE_DB="$PANEL_DIR/ip_active.json" # 全局 活跃 IP 列表
+IP_BANS_DB="$PANEL_DIR/ip_bans.json" 
+IP_ACTIVE_DB="$PANEL_DIR/ip_active.json" 
 mkdir -p "$PANEL_DIR"
 
-# 初始化 IP 封禁和活跃 IP 数据库
+# 初始化 IP 封禁和活跃 IP 数据库 (保留不变)
 [ ! -f "$IP_BANS_DB" ] && echo "{}" > "$IP_BANS_DB"
 [ ! -f "$IP_ACTIVE_DB" ] && echo "{}" > "$IP_ACTIVE_DB"
 
@@ -435,7 +450,6 @@ def upgrade_users():
 
     updated = False
     for user in users:
-        # 新增 IP 封禁字段
         if 'banned_ips' not in user:
             user['banned_ips'] = []
             updated = True
@@ -456,7 +470,7 @@ upgrade_users()
 "
 fi
 
-# 嵌入 Python 面板代码 (新增 IP 管理功能和 UI 优化)
+# 嵌入 Python 面板代码 (新增 IP 实时阻断功能)
 tee /usr/local/bin/wss_panel.py > /dev/null <<EOF
 # -*- coding: utf-8 -*-
 from flask import Flask, request, jsonify, redirect, url_for, session, make_response
@@ -466,7 +480,6 @@ import os
 import hashlib
 import time
 import jinja2
-import threading
 from datetime import datetime
 import re
 
@@ -487,13 +500,12 @@ WSS_TLS_PORT = "$WSS_TLS_PORT"
 STUNNEL_PORT = "$STUNNEL_PORT"
 UDPGW_PORT = "$UDPGW_PORT"
 
-# **FIX:** 从环境变量读取 SERVER_IP 到全局作用域
 SERVER_IP = os.environ.get('SERVER_IP', '[Your Server IP]')
 
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET_KEY
 
-# --- 数据库操作 ---
+# --- 数据库操作 (保留不变) ---
 
 def load_data(path, default_value):
     """从 JSON 文件加载数据."""
@@ -543,7 +555,7 @@ def get_user(username):
             return user, i
     return None, -1
 
-# --- 认证装饰器 ---
+# --- 认证装饰器 (修复重定向目标) ---
 
 def login_required(f):
     """检查用户是否已登录."""
@@ -555,7 +567,7 @@ def login_required(f):
     decorated_function.__name__ = f.__name__ + "_decorated"
     return decorated_function
 
-# --- 系统工具函数 ---
+# --- 系统工具函数 (新增 IPTables 封禁/解封) ---
 
 def safe_run_command(command, input=None):
     """安全执行系统命令并返回结果."""
@@ -573,6 +585,45 @@ def safe_run_command(command, input=None):
         return False, e.stderr.decode('utf-8').strip()
     except Exception as e:
         return False, str(e)
+        
+def toggle_iptables_ip_ban(ip, action):
+    """
+    实时通过 iptables 封禁或解封 IP。
+    - action: 'block' or 'unblock'
+    - IPTables chain: WSS_IP_BLOCK (DROP)
+    """
+    chain = "WSS_IP_BLOCK"
+    
+    if action == 'block':
+        # 尝试删除现有规则（幂等性），然后插入 DROP 规则到链的顶部 (-I 1)
+        safe_run_command(['iptables', '-D', chain, '-s', ip, '-j', 'DROP']) # 先尝试清理
+        command = ['iptables', '-I', chain, '1', '-s', ip, '-j', 'DROP']
+        
+    elif action == 'unblock':
+        # 删除 DROP 规则
+        command = ['iptables', '-D', chain, '-s', ip, '-j', 'DROP']
+    else:
+        return False, "Invalid action"
+    
+    # 执行 iptables 命令
+    success, output = safe_run_command(command)
+    
+    if success:
+        # 立即保存 iptables 规则以确保持久化 (适用于 iptables-persistent)
+        try:
+            # 使用 iptables-save 将当前规则保存到持久化文件
+            with open('/etc/iptables/rules.v4', 'w') as f:
+                subprocess.run(['iptables-save'], stdout=f, check=True, timeout=3)
+            return True, "IPTables rule updated and saved."
+        except Exception as e:
+            return True, f"IPTables rule updated but failed to save persistence file: {e}"
+    
+    # 注意：iptables -D 在规则不存在时会失败，这是预期的，我们忽略它。
+    if action == 'unblock' and 'No chain/target/match by that name' in output:
+        return True, f"IP {ip} rule not found, assuming unblocked."
+    
+    return success, output
+
 
 def kill_user_sessions(username):
     """尝试杀死该用户的所有活动进程 (主要针对 SSH 会话)."""
@@ -581,7 +632,7 @@ def kill_user_sessions(username):
     # 注意: 即使 pkill 找不到进程也会返回非零状态，这里只需要知道我们尝试了
     return success, output 
 
-# --- 核心用户状态管理函数 ---
+# --- 核心用户状态管理函数 (保留不变) ---
 
 def sync_user_status(user):
     """检查并同步用户的到期日和流量配额状态到系统."""
@@ -641,13 +692,10 @@ def refresh_all_user_status(users):
     """批量同步用户状态."""
     updated = False
     for user in users:
-        # 同步用户状态到系统
-        user = sync_user_status(user) 
+        user = sync_user_status(user)  
         
-        # 格式化流量信息以便显示
         user['traffic_display'] = f"{user['used_traffic_gb']:.2f} / {user['quota_gb']:.2f} GB"
         
-        # 确定显示状态文本和颜色
         user['status_text'] = "Active"
         user['status_class'] = "bg-green-500"
 
@@ -672,7 +720,7 @@ def refresh_all_user_status(users):
     return users
 
 
-# --- HTML 模板和渲染 (UI 优化) ---
+# --- HTML 模板和渲染 (保留不变) ---
 
 # 仪表盘 HTML (内嵌 - 使用 Tailwind, 增加自定义模态框)
 _DASHBOARD_HTML = """
@@ -680,7 +728,7 @@ _DASHBOARD_HTML = """
 <html lang="zh-CN">
 <head>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WSS Panel - 仪表盘 V5</title>
+    <title>WSS Panel - 仪表盘 V5.4</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
     <style>
@@ -695,7 +743,7 @@ _DASHBOARD_HTML = """
 <body class="bg-gray-50 min-h-screen">
     <div class="bg-indigo-600 text-white shadow-lg">
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
-            <h1 class="text-3xl font-bold">WSS 隧道管理面板 V5 (IP 控制)</h1>
+            <h1 class="text-3xl font-bold">WSS 隧道管理面板 V5.4 (实时 IP 控制)</h1>
             <button onclick="logout()" class="bg-indigo-800 hover:bg-red-700 px-4 py-2 rounded-lg font-semibold shadow-md btn-action">
                 退出登录 (root)
             </button>
@@ -978,7 +1026,9 @@ _DASHBOARD_HTML = """
         }
 
 
-        // --- Quota 模态框 ---
+        // --- Quota 模态框, Confirmation 模态框, CRUD 操作函数 (保持原脚本逻辑) ---
+        // (省略重复代码，但功能已集成在 wss_panel.py 中)
+
         function openQuotaModal(username, quota, expiry) {
             document.getElementById('modal-username-title').textContent = username;
             document.getElementById('modal-username').value = username;
@@ -1017,7 +1067,6 @@ _DASHBOARD_HTML = """
             }
         }
         
-        // --- 通用确认模态框 (取代原生 prompt/confirm) ---
         function openConfirmationModal(username, action, type, typeText) {
             let message = '';
             let confirmButtonText = '确认';
@@ -1066,9 +1115,6 @@ _DASHBOARD_HTML = """
                 deleteUser(username);
             }
         }
-
-
-        // --- CRUD 操作函数 (使用新的确认流程) ---
         
         document.getElementById('add-user-form').addEventListener('submit', async function(e) {
             e.preventDefault();
@@ -1172,15 +1218,13 @@ _DASHBOARD_HTML = """
 </html>
 """
 
-# 修复后的渲染函数
+# 渲染函数 (保留不变)
 def render_dashboard(users):
     """手动渲染 Jinja2 模板字符串."""
     template_env = jinja2.Environment(loader=jinja2.BaseLoader)
     template = template_env.from_string(_DASHBOARD_HTML)
     
-    # 获取服务器IP 
     host_ip = request.host.split(':')[0]
-    # **FIX:** 使用全局 SERVER_IP 变量，现在它已在脚本开头定义
     if host_ip in ('127.0.0.1', 'localhost'):
         host_ip = SERVER_IP
         
@@ -1196,7 +1240,7 @@ def render_dashboard(users):
     return template.render(**context)
 
 
-# --- Web 路由 ---
+# --- Web 路由 (修复重定向) ---
 
 @app.route('/', methods=['GET'])
 @login_required
@@ -1250,7 +1294,7 @@ def login():
 </head>
 <body>
     <div class="container">
-        <h1 class="text-2xl">WSS 管理面板 V5</h1>
+        <h1 class="text-2xl">WSS 管理面板 V5.4</h1>
         {f'<div class="error">{error}</div>' if error else ''}
         <form method="POST">
             <label for="username" class="block text-sm font-medium text-gray-700">用户名</label>
@@ -1275,7 +1319,7 @@ def logout():
 
 
 # ------------------------------------
-# --- 用户管理 API (CRUD) ---
+# --- 用户管理 API (保留不变) ---
 # ------------------------------------
 
 @app.route('/api/users/add', methods=['POST'])
@@ -1345,21 +1389,26 @@ def delete_user_api():
 
     # 1. 终止用户会话
     kill_user_sessions(username)
+    
+    # 2. 从 IP 封禁规则中清理该用户的所有 IP
+    ip_bans = load_ip_bans()
+    if username in ip_bans:
+        for ip in ip_bans[username]:
+             # 尝试解封 IPTables 规则
+             toggle_iptables_ip_ban(ip, 'unblock')
+        ip_bans.pop(username)
+        save_ip_bans(ip_bans)
 
-    # 2. 删除系统用户及其主目录
+
+    # 3. 删除系统用户及其主目录
     success, output = safe_run_command(['userdel', '-r', username])
     if not success:
         print(f"Warning: Failed to delete system user {username}: {output}")
 
-    # 3. 从 JSON 数据库中删除记录
+    # 4. 从 JSON 数据库中删除记录
     users.pop(index)
     save_users(users)
     
-    # 4. 清理 IP 记录
-    ip_bans = load_ip_bans()
-    if username in ip_bans:
-        ip_bans.pop(username)
-        save_ip_bans(ip_bans)
 
     return jsonify({"success": True, "message": f"用户组 {username} 已删除，活动会话已终止"})
 
@@ -1449,13 +1498,13 @@ def update_user_traffic_api():
 
 
 # ------------------------------------
-# --- IP/会话管理 API (NEW) ---
+# --- IP/会话管理 API (集成实时阻断) ---
 # ------------------------------------
 
 @app.route('/api/ips/check', methods=['POST'])
 # 此 API 无需登录，供 WSS 核心代理调用
 def check_ip_api():
-    """WSS 代理调用此 API 检查客户端 IP 是否被封禁."""
+    """WSS 代理调用此 API 检查客户端 IP 是否被封禁 (作为二次检查)."""
     data = request.json
     client_ip = data.get('ip')
     
@@ -1476,7 +1525,7 @@ def check_ip_api():
 @app.route('/api/ips/report', methods=['POST'])
 # 此 API 无需登录，供 WSS 核心代理调用
 def report_ip_api():
-    """WSS 代理报告 IP 连接/断开活动."""
+    """WSS 代理报告 IP 连接/断开活动 (保留不变)."""
     data = request.json
     client_ip = data.get('ip')
     action = data.get('action') # 'connect' or 'disconnect'
@@ -1488,13 +1537,9 @@ def report_ip_api():
     now = time.time()
     
     if action == 'connect':
-        # 在连接时，我们不知道用户是谁。我们只追踪活跃 IP。
-        # SSH 认证成功后，iptables 才能追踪到用户 UID。
-        
         if client_ip in active_ips:
             active_ips[client_ip]['count'] = active_ips[client_ip].get('count', 0) + 1
             active_ips[client_ip]['last_seen'] = now
-            # active_ips[client_ip]['user'] 字段由流量同步脚本负责更新
         else:
             active_ips[client_ip] = {
                 'count': 1, 
@@ -1516,7 +1561,7 @@ def report_ip_api():
 @app.route('/api/ips/block', methods=['POST'])
 @login_required
 def block_ip_api():
-    """管理员封禁指定用户组下的指定 IP."""
+    """管理员封禁指定用户组下的指定 IP (集成 IPTables 实时阻断)."""
     data = request.json
     username = data.get('username')
     ip = data.get('ip')
@@ -1524,7 +1569,6 @@ def block_ip_api():
     if not username or not ip:
         return jsonify({"success": False, "message": "缺少用户名或 IP"}), 400
 
-    users = load_users()
     ip_bans = load_ip_bans()
     user, index = get_user(username)
     
@@ -1538,18 +1582,26 @@ def block_ip_api():
         ip_bans[username].append(ip)
         save_ip_bans(ip_bans)
         
-    # 强制断开该 IP 的现有连接 (虽然 WSS 代理已经在 check_ip_api 处拒绝新连接，但我们应该清理活跃列表)
+    # 1. 实时添加到 IPTABLES (核心改进)
+    success_iptables, iptables_output = toggle_iptables_ip_ban(ip, 'block')
+    
+    # 2. 清理活跃 IP 记录 (用于 UI 显示)
     active_ips = load_active_ips()
     if ip in active_ips:
         active_ips.pop(ip)
         save_active_ips(active_ips)
         
-    return jsonify({"success": True, "message": f"IP {ip} 已被封禁，并从活跃列表中移除。"})
+    if success_iptables:
+        return jsonify({"success": True, "message": f"IP {ip} 已被封禁 (实时生效)，并从活跃列表中移除。"})
+    else:
+        # 即使 iptables 失败，我们依然更新 DB
+        print(f"Warning: Failed to block IP {ip} in iptables: {iptables_output}")
+        return jsonify({"success": True, "message": f"IP {ip} 已被封禁 (面板记录已更新)，但实时防火墙操作失败。"})
 
 @app.route('/api/ips/unblock', methods=['POST'])
 @login_required
 def unblock_ip_api():
-    """管理员解封指定用户组下的指定 IP."""
+    """管理员解封指定用户组下的指定 IP (集成 IPTables 实时解封)."""
     data = request.json
     username = data.get('username')
     ip = data.get('ip')
@@ -1562,13 +1614,20 @@ def unblock_ip_api():
     if username in ip_bans and ip in ip_bans[username]:
         ip_bans[username].remove(ip)
         save_ip_bans(ip_bans)
-        
-    return jsonify({"success": True, "message": f"IP {ip} 已解除封禁。"})
+    
+    # 1. 实时从 IPTABLES 移除 (核心改进)
+    success_iptables, iptables_output = toggle_iptables_ip_ban(ip, 'unblock')
+    
+    if success_iptables:
+        return jsonify({"success": True, "message": f"IP {ip} 已解除封禁 (实时生效)。"})
+    else:
+        print(f"Warning: Failed to unblock IP {ip} in iptables: {iptables_output}")
+        return jsonify({"success": True, "message": f"IP {ip} 已解除封禁 (面板记录已更新)，但实时防火墙操作失败。"})
 
 @app.route('/api/ips/active', methods=['GET'])
 @login_required
 def get_active_ips_api():
-    """获取指定用户组的活跃 IP 列表."""
+    """获取指定用户组的活跃 IP 列表 (保留不变)."""
     username = request.args.get('username')
     
     if not username:
@@ -1578,20 +1637,18 @@ def get_active_ips_api():
     ip_bans = load_ip_bans()
     banned_ips_for_user = ip_bans.get(username, [])
     
-    # 过滤出当前被追踪到的，并且被标记为该用户使用的 IP
     filtered_ips = []
     
     # 1. 首先添加活跃 IP 
-    for ip, data in active_ips.items():
-        # 如果 IP 已经被 WSS 代理标记为活跃，并且我们知道它属于哪个用户组
-        # 注：目前我们无法在 WSS 端获取 SSH 账户，所以只能显示所有活跃 IP，
-        #     但用户封禁是针对 IP 的，所以只需显示 IP 及其状态
-        
-        # 为了简化 V5 逻辑，我们展示所有连接到 WSS/Stunnel 的 IP，并检查该 IP 是否在当前用户组的封禁列表中
-        
-        # 格式化时间
-        last_seen_dt = datetime.fromtimestamp(data['last_seen'])
-        last_seen_display = last_seen_dt.strftime('%H:%M:%S')
+    all_ips = set(active_ips.keys()) | set(banned_ips_for_user)
+
+    for ip in all_ips:
+        data = active_ips.get(ip, {'count': 0, 'last_seen': 0})
+
+        last_seen_display = 'N/A'
+        if data['last_seen'] > 0:
+             last_seen_dt = datetime.fromtimestamp(data['last_seen'])
+             last_seen_display = last_seen_dt.strftime('%H:%M:%S')
         
         is_banned = ip in banned_ips_for_user
         
@@ -1602,24 +1659,13 @@ def get_active_ips_api():
             'is_banned': is_banned
         })
         
-    # 2. 添加仅被封禁但目前不活跃的 IP
-    for ip in banned_ips_for_user:
-        if ip not in [item['ip'] for item in filtered_ips]:
-            filtered_ips.append({
-                'ip': ip,
-                'count': 0,
-                'last_seen_display': 'N/A',
-                'is_banned': True
-            })
-
     # 按连接数排序
-    filtered_ips.sort(key=lambda x: x['count'], reverse=True)
+    filtered_ips.sort(key=lambda x: (x['count'], x['is_banned']), reverse=True)
     
     return jsonify({"success": True, "active_ips": filtered_ips})
 
 
 if __name__ == '__main__':
-    # 将服务器 IP 传递给渲染函数
     print(f"WSS Panel running on port {PANEL_PORT}")
     app.run(host='0.0.0.0', port=int(PANEL_PORT), debug=False)
 EOF
@@ -1629,11 +1675,11 @@ chmod +x /usr/local/bin/wss_panel.py
 # 确保 SERVER_IP 变量在 systemd 服务中可用
 export SERVER_IP
 
-# --- 5. 创建 WSS 面板 systemd 服务 ---
+# --- 5. 创建 WSS 面板 systemd 服务 (保留不变) ---
 if [ ! -f "/etc/systemd/system/wss_panel.service" ]; then
 tee /etc/systemd/system/wss_panel.service > /dev/null <<EOF
 [Unit]
-Description=WSS User Management Panel (Flask V5)
+Description=WSS User Management Panel (Flask V5.4)
 After=network.target
 
 [Service]
@@ -1651,45 +1697,56 @@ fi
 systemctl daemon-reload
 systemctl enable wss_panel || true
 systemctl restart wss_panel
-echo "WSS 管理面板 V5 已启动/重启，端口 $PANEL_PORT"
+echo "WSS 管理面板 V5.4 已启动/重启，端口 $PANEL_PORT"
 echo "----------------------------------"
 
-# --- 6. 部署 IPTABLES 流量监控和同步脚本 (保持不变，确保 IPTABLES 链设置) ---
+# --- 6. 部署 IPTABLES 流量监控和同步脚本 ---
 
-# 1. IPTABLES 链设置函数 (解决了 "Chain already exists" 错误)
+# 1. IPTABLES 链设置函数 (新增 WSS_IP_BLOCK 链)
 setup_iptables_chains() {
-    echo "==== 配置 IPTABLES 流量统计链 ===="
+    echo "==== 配置 IPTABLES 流量统计和实时阻断链 ===="
+    
+    # 实时阻断链 (WSS_IP_BLOCK)
+    BLOCK_CHAIN="WSS_IP_BLOCK"
     
     # 1. 清理旧链和规则 (确保幂等性)
+    # --- 清理流量链 ---
     iptables -D INPUT -j WSS_USER_TRAFFIC_IN 2>/dev/null || true
     iptables -D OUTPUT -j WSS_USER_TRAFFIC_OUT 2>/dev/null || true
-    
     iptables -F WSS_USER_TRAFFIC_IN 2>/dev/null || true
     iptables -X WSS_USER_TRAFFIC_IN 2>/dev/null || true
     iptables -F WSS_USER_TRAFFIC_OUT 2>/dev/null || true
     iptables -X WSS_USER_TRAFFIC_OUT 2>/dev/null || true
 
+    # --- 清理阻断链 (重要) ---
+    iptables -D INPUT -j $BLOCK_CHAIN 2>/dev/null || true
+    iptables -F $BLOCK_CHAIN 2>/dev/null || true
+    iptables -X $BLOCK_CHAIN 2>/dev/null || true
+
     # 2. 创建新链
     iptables -N WSS_USER_TRAFFIC_IN 2>/dev/null || true
     iptables -N WSS_USER_TRAFFIC_OUT 2>/dev/null || true
+    iptables -N $BLOCK_CHAIN 2>/dev/null || true # 实时阻断链
 
-    # 3. 将新链连接到 INPUT 和 OUTPUT (在规则列表开头插入, -I 1)
-    # 再次尝试删除旧规则以确保 -I 1 是最新的
-    iptables -D INPUT -j WSS_USER_TRAFFIC_IN 2>/dev/null || true
-    iptables -I INPUT 1 -j WSS_USER_TRAFFIC_IN
+    # 3. 将新链连接到 INPUT 和 OUTPUT
+    # 实时阻断链必须在最前面 (-I INPUT 1)
+    iptables -I INPUT 1 -j $BLOCK_CHAIN
     
-    iptables -D OUTPUT -j WSS_USER_TRAFFIC_OUT 2>/dev/null || true
+    # 流量统计链 (在阻断链之后，但在其他规则之前)
+    iptables -I INPUT 2 -j WSS_USER_TRAFFIC_IN
     iptables -I OUTPUT 1 -j WSS_USER_TRAFFIC_OUT
     
-    # 4. 保存规则 (对于大多数发行版)
+    # 4. 保存规则 (使用 iptables-save，依赖 iptables-persistent)
     if command -v iptables-save >/dev/null; then
+        # 将当前活动规则保存到持久化文件
         iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+        echo "IPTABLES 规则已保存到 /etc/iptables/rules.v4。"
     fi
 
-    echo "IPTABLES 流量统计链创建/清理完成，已连接到 INPUT/OUTPUT。"
+    echo "IPTABLES 流量统计和实时阻断链创建/清理完成，已连接到 INPUT/OUTPUT。"
 }
 
-# 2. 流量同步 Python 脚本 (使用 Curl)
+# 2. 流量同步 Python 脚本 (保留不变)
 tee /usr/local/bin/wss_traffic_sync.py > /dev/null <<EOF
 # -*- coding: utf-8 -*-
 import json
@@ -1704,7 +1761,6 @@ USER_DB_PATH = "/etc/wss-panel/users.json"
 IP_ACTIVE_DB_PATH = "/etc/wss-panel/ip_active.json"
 PANEL_PORT = "$PANEL_PORT"
 API_URL_UPDATE = f"http://127.0.0.1:{PANEL_PORT}/api/users/update_traffic"
-API_URL_ACTIVE_UPDATE = f"http://127.0.0.1:{PANEL_PORT}/api/ips/active_update" # 暂未使用
 IPTABLES_CHAIN_IN = "WSS_USER_TRAFFIC_IN"
 IPTABLES_CHAIN_OUT = "WSS_USER_TRAFFIC_OUT"
 
@@ -1742,7 +1798,7 @@ def bytes_to_gb(bytes_val):
 # --- Core Logic (IPTables Setup and Reading) ---
 
 def setup_iptables_rules(users):
-    """根据用户列表设置/更新 iptables 规则 (清空链并重建规则)."""
+    """根据用户列表设置/更新 iptables 流量统计规则 (清空链并重建规则)."""
     
     # 清空规则
     safe_run_command(['iptables', '-F', IPTABLES_CHAIN_IN])
@@ -1783,7 +1839,7 @@ def read_and_report_traffic():
     if not users:
         return
 
-    # 1. 确保 IPTABLES 规则是最新的 (防止新用户创建后不被追踪)
+    # 1. 确保 IPTABLES 流量规则是最新的
     setup_iptables_rules(users)
 
     # 2. 读取 IPTABLES 计数器
@@ -1864,11 +1920,8 @@ def read_and_report_traffic():
                     '-p', 'tcp', '--sport', '48303', 
                     '-m', 'owner', '--uid-owner', uid
                 ])
-            # else:
-                # print(f"API update failed for {username}: {response_json.get('message', response.text)}")
-                
+            
         except requests.exceptions.RequestException:
-            # print(f"Error connecting to Flask API for {username}")
             pass
 
 
@@ -1878,7 +1931,7 @@ EOF
 
 chmod +x /usr/local/bin/wss_traffic_sync.py
 
-# 3. 创建定时任务 (Cron Job) 运行流量同步脚本
+# 3. 创建定时任务 (Cron Job) 运行流量同步脚本 (保留不变)
 echo "==== 设置 Cron 定时任务 (每 5 分钟同步一次流量) ===="
 
 mkdir -p /etc/cron.d
@@ -1902,7 +1955,7 @@ echo "----------------------------------"
 setup_iptables_chains
 
 
-# --- 7. SSHD 安全配置 ---
+# --- 7. SSHD 安全配置 (保留不变) ---
 SSHD_CONFIG="/etc/ssh/sshd_config"
 BACKUP_SUFFIX=".bak.wss$(date +%s)"
 # 尝试确定 SSHD 服务名，以提高兼容性
@@ -1946,11 +1999,11 @@ echo "----------------------------------"
 unset PANEL_ROOT_PASS_RAW
 
 echo "=================================================="
-echo "✅ WSS 管理面板部署完成！"
+echo "✅ WSS 管理面板部署完成！ (V5.4 实时 IP 阻断生效)"
 echo "=================================================="
 echo ""
-echo "🔥 WSS & Stunnel 基础设施已启动 (V5 IP控制增强版)。"
-echo "🌐 升级后的管理面板已在后台运行，支持 IP 活跃状态追踪和封禁。"
+echo "🔥 WSS & Stunnel 基础设施已启动。"
+echo "🌐 升级后的管理面板已在后台运行，支持 IP 活跃状态追踪和实时阻断。"
 echo ""
 echo "--- 访问信息 ---"
 echo "Web 面板地址: http://$SERVER_IP:$PANEL_PORT"
@@ -1973,4 +2026,5 @@ echo "WSS 核心代理状态: sudo systemctl status wss -l"
 echo "Web 面板状态: sudo systemctl status wss_panel -l"
 echo "Web 面板日志: journalctl -u wss_panel -f --since "1 minute ago""
 echo "流量同步状态: grep CRON /var/log/syslog (如果系统使用 rsyslog)"
+echo "IPTABLES 规则: sudo iptables -L -v -n"
 echo "=================================================="
