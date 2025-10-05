@@ -2,7 +2,7 @@
 set -eu
 
 # =======================================================
-# WSS 隧道/Stunnel/管理面板部署脚本 V5.4 - 实时 IP 阻断与健壮性增强
+# WSS 隧道/Stunnel/管理面板部署脚本 V5.5 - 实时 IP 阻断与 VENV 隔离
 # =======================================================
 
 # --- 全局变量和工具函数 ---
@@ -43,6 +43,10 @@ get_server_ip() {
 }
 SERVER_IP=$(get_server_ip)
 echo "检测到的服务器 IP: $SERVER_IP"
+
+# --- VENV 配置 (新增) ---
+VENV_PATH="/opt/wss_venv"
+PYTHON_VENV_PATH="$VENV_PATH/bin/python3"
 
 
 # --- 1. 提示端口和面板密码 (保留不变) ---
@@ -85,13 +89,21 @@ while true; do
 done
 
 echo "----------------------------------"
-echo "==== 系统更新与依赖安装 (新增 iptables-persistent) ===="
-# 增加 iptables-persistent 确保流量规则和封禁规则持久化
+echo "==== 系统更新与依赖安装 (新增 iptables-persistent, 启用 VENV 隔离) ===="
+# 增加 python3-venv 和 iptables-persistent
 apt update -y
-apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4 iptables-persistent
-# 安装 python 依赖
-pip3 install flask jinja2 requests httpx
-echo "依赖安装完成"
+apt install -y python3 python3-pip python3-venv wget curl git net-tools cmake build-essential openssl stunnel4 iptables-persistent
+
+# 1. 创建并安装 Python 虚拟环境
+echo "创建 Python 虚拟环境于 $VENV_PATH"
+mkdir -p "$VENV_PATH"
+python3 -m venv "$VENV_PATH"
+
+# 2. 在 VENV 中安装 python 依赖
+echo "在 VENV 中安装 Python 依赖..."
+"$PYTHON_VENV_PATH" -m pip install flask jinja2 requests httpx
+
+echo "依赖安装完成，使用隔离环境路径: $VENV_PATH"
 echo "----------------------------------"
 
 
@@ -303,16 +315,16 @@ EOF
 
 chmod +x /usr/local/bin/wss
 
-# 创建 WSS systemd 服务 (保留不变)
+# 创建 WSS systemd 服务 (ExecStart 更新为 VENV 路径)
 tee /etc/systemd/system/wss.service > /dev/null <<EOF
 [Unit]
-Description=WSS Python Proxy (V5.4 with IP Control)
+Description=WSS Python Proxy (V5.5 with VENV Isolation)
 After=network.target
 
 [Service]
 Type=simple
 Environment=WSS_PANEL_PORT=$PANEL_PORT
-ExecStart=/usr/local/bin/wss $WSS_HTTP_PORT $WSS_TLS_PORT
+ExecStart=$PYTHON_VENV_PATH /usr/local/bin/wss $WSS_HTTP_PORT $WSS_TLS_PORT
 Restart=on-failure
 User=root
 
@@ -323,7 +335,7 @@ EOF
 systemctl daemon-reload
 systemctl enable wss || true
 systemctl restart wss || true
-echo "WSS 核心代理 (V5.4 IP控制版) 已启动/重启，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
+echo "WSS 核心代理 (V5.5 VENV隔离版) 已启动/重启，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
 echo "----------------------------------"
 
 # --- 3. Stunnel4, UDPGW (编译过程优化) ---
@@ -415,7 +427,7 @@ echo "----------------------------------"
 
 
 # --- 4. 安装 WSS 用户管理面板 (基于 Flask) - 实时 IP 阻断集成 ---
-echo "==== 部署 WSS 用户管理面板 (Python/Flask) V5.4 实时 IP 控制增强版 ===="
+echo "==== 部署 WSS 用户管理面板 (Python/Flask) V5.5 实时 IP 控制增强版 ===="
 PANEL_DIR="/etc/wss-panel"
 USER_DB="$PANEL_DIR/users.json"
 IP_BANS_DB="$PANEL_DIR/ip_bans.json" 
@@ -720,7 +732,7 @@ def refresh_all_user_status(users):
     return users
 
 
-# --- HTML 模板和渲染 (保留不变) ---
+# --- HTML 模板和渲染 (更新版本号) ---
 
 # 仪表盘 HTML (内嵌 - 使用 Tailwind, 增加自定义模态框)
 _DASHBOARD_HTML = """
@@ -728,7 +740,7 @@ _DASHBOARD_HTML = """
 <html lang="zh-CN">
 <head>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WSS Panel - 仪表盘 V5.4</title>
+    <title>WSS Panel - 仪表盘 V5.5</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
     <style>
@@ -743,7 +755,7 @@ _DASHBOARD_HTML = """
 <body class="bg-gray-50 min-h-screen">
     <div class="bg-indigo-600 text-white shadow-lg">
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
-            <h1 class="text-3xl font-bold">WSS 隧道管理面板 V5.4 (实时 IP 控制)</h1>
+            <h1 class="text-3xl font-bold">WSS 隧道管理面板 V5.5 (实时 IP 控制/VENV)</h1>
             <button onclick="logout()" class="bg-indigo-800 hover:bg-red-700 px-4 py-2 rounded-lg font-semibold shadow-md btn-action">
                 退出登录 (root)
             </button>
@@ -1294,7 +1306,7 @@ def login():
 </head>
 <body>
     <div class="container">
-        <h1 class="text-2xl">WSS 管理面板 V5.4</h1>
+        <h1 class="text-2xl">WSS 管理面板 V5.5</h1>
         {f'<div class="error">{error}</div>' if error else ''}
         <form method="POST">
             <label for="username" class="block text-sm font-medium text-gray-700">用户名</label>
@@ -1675,17 +1687,17 @@ chmod +x /usr/local/bin/wss_panel.py
 # 确保 SERVER_IP 变量在 systemd 服务中可用
 export SERVER_IP
 
-# --- 5. 创建 WSS 面板 systemd 服务 (保留不变) ---
+# --- 5. 创建 WSS 面板 systemd 服务 (ExecStart 更新为 VENV 路径) ---
 if [ ! -f "/etc/systemd/system/wss_panel.service" ]; then
 tee /etc/systemd/system/wss_panel.service > /dev/null <<EOF
 [Unit]
-Description=WSS User Management Panel (Flask V5.4)
+Description=WSS User Management Panel (Flask V5.5)
 After=network.target
 
 [Service]
 Type=simple
 Environment=SERVER_IP=$SERVER_IP
-ExecStart=/usr/bin/python3 /usr/local/bin/wss_panel.py
+ExecStart=$PYTHON_VENV_PATH /usr/local/bin/wss_panel.py
 Restart=on-failure
 User=root
 
@@ -1697,7 +1709,7 @@ fi
 systemctl daemon-reload
 systemctl enable wss_panel || true
 systemctl restart wss_panel
-echo "WSS 管理面板 V5.4 已启动/重启，端口 $PANEL_PORT"
+echo "WSS 管理面板 V5.5 已启动/重启，端口 $PANEL_PORT"
 echo "----------------------------------"
 
 # --- 6. 部署 IPTABLES 流量监控和同步脚本 ---
@@ -1931,16 +1943,16 @@ EOF
 
 chmod +x /usr/local/bin/wss_traffic_sync.py
 
-# 3. 创建定时任务 (Cron Job) 运行流量同步脚本 (保留不变)
-echo "==== 设置 Cron 定时任务 (每 5 分钟同步一次流量) ===="
+# 3. 创建定时任务 (Cron Job) 运行流量同步脚本 (ExecStart 更新为 VENV 路径)
+echo "==== 设置 Cron 定时任务 (每 5 分钟同步一次流量, 使用 VENV 隔离环境) ===="
 
 mkdir -p /etc/cron.d
 
 tee /etc/cron.d/wss-traffic > /dev/null <<EOF
 SHELL=/bin/sh
 PATH=/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin
-# 每 5 分钟运行一次 Python 流量同步脚本
-*/5 * * * * root /usr/bin/python3 /usr/local/bin/wss_traffic_sync.py
+# 每 5 分钟运行一次 Python 流量同步脚本，使用 VENV 隔离环境
+*/5 * * * * root $PYTHON_VENV_PATH /usr/local/bin/wss_traffic_sync.py
 EOF
 
 chmod 0644 /etc/cron.d/wss-traffic
@@ -1999,11 +2011,11 @@ echo "----------------------------------"
 unset PANEL_ROOT_PASS_RAW
 
 echo "=================================================="
-echo "✅ WSS 管理面板部署完成！ (V5.4 实时 IP 阻断生效)"
+echo "✅ WSS 管理面板部署完成！ (V5.5 实时 IP 阻断+VENV 生效)"
 echo "=================================================="
 echo ""
 echo "🔥 WSS & Stunnel 基础设施已启动。"
-echo "🌐 升级后的管理面板已在后台运行，支持 IP 活跃状态追踪和实时阻断。"
+echo "🌐 升级后的管理面板已在后台运行，使用隔离的 Python 环境，稳定性增强。"
 echo ""
 echo "--- 访问信息 ---"
 echo "Web 面板地址: http://$SERVER_IP:$PANEL_PORT"
@@ -2027,4 +2039,5 @@ echo "Web 面板状态: sudo systemctl status wss_panel -l"
 echo "Web 面板日志: journalctl -u wss_panel -f --since "1 minute ago""
 echo "流量同步状态: grep CRON /var/log/syslog (如果系统使用 rsyslog)"
 echo "IPTABLES 规则: sudo iptables -L -v -n"
+echo "Python VENV 路径: $VENV_PATH"
 echo "=================================================="
