@@ -2,12 +2,10 @@
 set -eu
 
 # =======================================================
-# WSS 隧道/Stunnel/管理面板部署脚本 V5.7 - 实时 IP 阻断与 VENV/审计日志
+# WSS 隧道/Stunnel/管理面板部署脚本 V5.18 - 流量上报错误追踪
 # =======================================================
 
-# --- 全局变量和工具函数 (不变) ---
-
-# 检查端口是否正在监听
+# --- 全局变量和工具函数 (保留不变) ---
 check_port() {
     local port="$1"
     if command -v ss >/dev/null; then
@@ -23,28 +21,22 @@ check_port() {
             echo -e " \033[31m[FAIL]\033[0m"
         fi
     else
-        echo " (Cannot check status, ss or netstat not found)"
+        echo " (Cannot check status, ss or netstat found)"
     fi
 }
 export -f check_port
 
-# 获取服务器IP (增加备用 IP API，提高成功率)
 get_server_ip() {
     echo "尝试获取服务器公网 IP..."
-    # 尝试使用 ip.sb
     SERVER_IP=$(curl -s --connect-timeout 2 ip.sb 2>/dev/null)
-    # 尝试使用 ifconfig.me
     [ -z "$SERVER_IP" ] && SERVER_IP=$(curl -s --connect-timeout 2 ifconfig.me 2>/dev/null)
-    # 尝试获取本地非回环 IP
     [ -z "$SERVER_IP" ] && SERVER_IP=$(ip a | grep 'inet ' | grep -v '127.0.0.1' | head -n 1 | awk '{print $2}' | cut -d/ -f1)
-    # 最终默认值
     [ -z "$SERVER_IP" ] && SERVER_IP='[SERVER_IP]'
     echo "$SERVER_IP"
 }
 SERVER_IP=$(get_server_ip)
 echo "检测到的服务器 IP: $SERVER_IP"
 
-# --- VENV 配置 (API Key 配置移除) ---
 VENV_PATH="/opt/wss_venv"
 PYTHON_VENV_PATH="$VENV_PATH/bin/python3"
 
@@ -69,7 +61,6 @@ echo "==== 管理面板配置 ===="
 read -p "请输入 Web 管理面板监听端口 (默认54321): " PANEL_PORT
 PANEL_PORT=${PANEL_PORT:-54321}
 
-# 交互式安全输入并确认 ROOT 密码
 echo "请为 Web 面板的 'root' 用户设置密码（输入时隐藏）。"
 while true; do
     read -s -p "面板密码: " pw1 && echo
@@ -83,7 +74,6 @@ while true; do
         continue
     fi
     PANEL_ROOT_PASS_RAW="$pw1"
-    # 对密码进行简单的 HASH
     PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | sha256sum | awk '{print $1}')
     break
 done
@@ -91,22 +81,20 @@ done
 echo "----------------------------------"
 echo "==== 系统更新与依赖安装 (VENV 隔离) ===="
 apt update -y
-apt install -y python3 python3-pip python3-venv wget curl git net-tools cmake build-essential openssl stunnel4 iptables-persistent
+apt install -y python3 python3-pip python3-venv wget curl git net-tools cmake build-essential openssl stunnel4 iptables-persistent procps
 
-# 1. 创建并安装 Python 虚拟环境
 echo "创建 Python 虚拟环境于 $VENV_PATH"
 mkdir -p "$VENV_PATH"
 python3 -m venv "$VENV_PATH"
 
-# 2. 在 VENV 中安装 python 依赖
 echo "在 VENV 中安装 Python 依赖..."
-"$PYTHON_VENV_PATH" -m pip install flask jinja2 requests httpx
+"$PYTHON_VENV_PATH" -m pip install flask jinja2 requests httpx psutil
 
 echo "依赖安装完成，使用隔离环境路径: $VENV_PATH"
 echo "----------------------------------"
 
 
-# --- 2. WSS 核心代理脚本 (保留不变) ---
+# --- 2. WSS 核心代理脚本 (保留 V5.10 不变) ---
 echo "==== 安装 WSS 核心代理脚本 (/usr/local/bin/wss) ===="
 tee /usr/local/bin/wss > /dev/null <<EOF
 #!/usr/bin/python3
@@ -117,7 +105,7 @@ import ssl
 import sys
 import os
 import json
-import httpx # 引入 httpx 用于异步 HTTP 客户端
+import httpx 
 
 # --- 配置 ---
 LISTEN_ADDR = '0.0.0.0'
@@ -146,7 +134,6 @@ FORBIDDEN_RESPONSE = b'HTTP/1.1 403 Forbidden\\r\\nContent-Length: 0\\r\\n\\r\\n
 http_client = httpx.AsyncClient(timeout=3.0) 
 
 async def check_ip_status(client_ip):
-    """异步查询 Flask 面板，检查 IP 是否被禁止 (作为二次验证)."""
     try:
         response = await http_client.post(
             API_URL_CHECK,
@@ -160,7 +147,6 @@ async def check_ip_status(client_ip):
         return True
 
 async def report_ip_activity(client_ip, action):
-    """异步报告 IP 活动状态 (connect/disconnect)."""
     try:
         await http_client.post(
             API_URL_REPORT,
@@ -168,7 +154,6 @@ async def report_ip_activity(client_ip, action):
         )
     except Exception:
         pass
-
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
     peer = writer.get_extra_info('peername')
@@ -299,7 +284,7 @@ chmod +x /usr/local/bin/wss
 # 创建 WSS systemd 服务 (ExecStart 更新为 VENV 路径)
 tee /etc/systemd/system/wss.service > /dev/null <<EOF
 [Unit]
-Description=WSS Python Proxy (V5.7 VENV/IP Control)
+Description=WSS Python Proxy (V5.17 VENV/IP Control)
 After=network.target
 
 [Service]
@@ -316,10 +301,11 @@ EOF
 systemctl daemon-reload
 systemctl enable wss || true
 systemctl restart wss || true
-echo "WSS 核心代理 (V5.7 VENV隔离版) 已启动/重启，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
+echo "WSS 核心代理 (V5.17 VENV隔离版) 已启动/重启，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
 echo "----------------------------------"
 
-# --- 3. Stunnel4, UDPGW (保留 V5.5 优化) ---
+
+# --- 3. Stunnel4, UDPGW (保留 V5.9 不变) ---
 echo "==== 检查/安装 Stunnel4 ===="
 mkdir -p /etc/stunnel/certs
 if [ ! -f "/etc/stunnel/certs/stunnel.pem" ]; then
@@ -357,7 +343,7 @@ systemctl restart stunnel4 || true
 echo "Stunnel4 配置已更新并重启，端口 $STUNNEL_PORT"
 echo "----------------------------------"
 
-echo "==== 检查/安装 UDPGW (编译反馈增强) ===="
+echo "==== 检查/安装 UDPGW (保留 V5.9 不变) ===="
 if [ ! -f "/root/badvpn/badvpn-build/udpgw/badvpn-udpgw" ]; then
     echo "UDPGW 二进制文件不存在，开始编译..."
     if [ ! -d "/root/badvpn" ]; then
@@ -406,65 +392,50 @@ echo "UDPGW 已启动/重启，端口: $UDPGW_PORT"
 echo "----------------------------------"
 
 
-# --- 4. 安装 WSS 用户管理面板 (基于 Flask) - 实时 IP 阻断集成 ---
-echo "==== 部署 WSS 用户管理面板 (Python/Flask) V5.7 (审计日志/实时阻断) ===="
+# --- 4. 安装 WSS 用户管理面板 (新增功能：实时状态/配置生成/并发限制) ---
+echo "==== 部署 WSS 用户管理面板 (Python/Flask) V5.18 (流量追踪增强) ===="
 PANEL_DIR="/etc/wss-panel"
 USER_DB="$PANEL_DIR/users.json"
 IP_BANS_DB="$PANEL_DIR/ip_bans.json" 
 IP_ACTIVE_DB="$PANEL_DIR/ip_active.json" 
-# AUDIT_LOG_PATH 在 Python 脚本内部定义
 
 mkdir -p "$PANEL_DIR"
 
-# 初始化数据库
 [ ! -f "$IP_BANS_DB" ] && echo "{}" > "$IP_BANS_DB"
 [ ! -f "$IP_ACTIVE_DB" ] && echo "{}" > "$IP_ACTIVE_DB"
 
-# 检查/初始化用户数据库 (保留升级逻辑)
 if [ ! -f "$USER_DB" ]; then
     echo "[]" > "$USER_DB"
 else
-    # 确保旧用户数据结构兼容新字段
     python3 -c "
 import json
 import time
 import os
-
 USER_DB_PATH = \"$USER_DB\"
-
 def upgrade_users():
     try:
-        if not os.path.exists(USER_DB_PATH):
-            return
-        with open(USER_DB_PATH, 'r') as f:
-            users = json.load(f)
+        if not os.path.exists(USER_DB_PATH): return
+        with open(USER_DB_PATH, 'r') as f: users = json.load(f)
     except Exception:
         print('Error loading users, skipping upgrade.')
         return
-
     updated = False
     for user in users:
-        if 'banned_ips' not in user:
-            user['banned_ips'] = []
+        if 'banned_ips' not in user: user['banned_ips'] = []; updated = True
+        if 'status' not in user: 
+            user['status'] = 'active'; user['expiry_date'] = ''; user['quota_gb'] = 0.0
+            user['used_traffic_gb'] = 0.0; user['last_check'] = time.time(); updated = True
+        if 'max_connections' not in user:
+            user['max_connections'] = 3
             updated = True
-        if 'status' not in user:
-            user['status'] = 'active'
-            user['expiry_date'] = ''
-            user['quota_gb'] = 0.0
-            user['used_traffic_gb'] = 0.0
-            user['last_check'] = time.time()
-            updated = True
-    
     if updated:
-        with open(USER_DB_PATH, 'w') as f:
-            json.dump(users, f, indent=4)
+        with open(USER_DB_PATH, 'w') as f: json.dump(users, f, indent=4)
         print('User database structure upgraded.')
-
 upgrade_users()
 "
 fi
 
-# 嵌入 Python 面板代码 (移除 API Key 认证，添加审计日志)
+# 嵌入 Python 面板代码 (调整函数顺序修复 NameError 和 API 权限)
 tee /usr/local/bin/wss_panel.py > /dev/null <<EOF
 # -*- coding: utf-8 -*-
 from flask import Flask, request, jsonify, redirect, url_for, session, make_response
@@ -477,19 +448,20 @@ import jinja2
 from datetime import datetime
 import re
 from functools import wraps
+import psutil 
 
 # --- 配置 ---
 PANEL_DIR = "/etc/wss-panel"
 USER_DB_PATH = os.path.join(PANEL_DIR, "users.json")
 IP_BANS_DB_PATH = os.path.join(PANEL_DIR, "ip_bans.json")
 IP_ACTIVE_DB_PATH = os.path.join(PANEL_DIR, "ip_active.json")
-AUDIT_LOG_PATH = os.path.join(PANEL_DIR, "audit.log") # 审计日志路径
+AUDIT_LOG_PATH = os.path.join(PANEL_DIR, "audit.log")
 
 ROOT_USERNAME = "root"
 ROOT_PASSWORD_HASH = "$PANEL_ROOT_PASS_HASH"
 FLASK_SECRET_KEY = os.urandom(24).hex()
+MAX_CONN_DEFAULT = 3 
 
-# 面板和端口配置
 PANEL_PORT = "$PANEL_PORT"
 WSS_HTTP_PORT = "$WSS_HTTP_PORT"
 WSS_TLS_PORT = "$WSS_TLS_PORT"
@@ -501,21 +473,18 @@ SERVER_IP = os.environ.get('SERVER_IP', '[Your Server IP]')
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET_KEY
 
-# --- 数据库操作 (保留不变) ---
+# --- 数据库操作 / 日志 / 认证 / 系统工具函数 (不变) ---
 def load_data(path, default_value):
-    if not os.path.exists(path):
-        return default_value
+    if not os.path.exists(path): return default_value
     try:
-        with open(path, 'r') as f:
-            return json.load(f)
+        with open(path, 'r') as f: return json.load(f)
     except Exception as e:
         print(f"Error loading {path}: {e}")
         return default_value
 
 def save_data(data, path):
     try:
-        with open(path, 'w') as f:
-            json.dump(data, f, indent=4)
+        with open(path, 'w') as f: json.dump(data, f, indent=4)
         return True
     except Exception as e:
         print(f"Error saving {path}: {e}")
@@ -527,58 +496,36 @@ def load_ip_bans(): return load_data(IP_BANS_DB_PATH, {})
 def save_ip_bans(ip_bans): return save_data(ip_bans, IP_BANS_DB_PATH)
 def load_active_ips(): return load_data(IP_ACTIVE_DB_PATH, {})
 def save_active_ips(active_ips): return save_data(active_ips, IP_ACTIVE_DB_PATH)
-
 def get_user(username):
     users = load_users()
     for i, user in enumerate(users):
-        if user.get('username') == username:
-            return user, i
+        if user.get('username') == username: return user, i
     return None, -1
 
-# --- 审计日志功能 (新增) ---
 def log_action(action_type, username, details=""):
-    """记录关键管理操作到审计日志文件."""
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    # 尝试获取操作者的 IP，对于 Web UI 操作，这是客户端 IP
     operator_ip = request.remote_addr if request else "127.0.0.1 (System)"
-    
     log_entry = f"[{timestamp}] [USER:{username}] [IP:{operator_ip}] ACTION:{action_type} DETAILS: {details}\n"
-    
     try:
-        with open(AUDIT_LOG_PATH, 'a') as f:
-            f.write(log_entry)
+        with open(AUDIT_LOG_PATH, 'a') as f: f.write(log_entry)
     except Exception as e:
-        # 避免日志写入失败影响面板功能
         print(f"Error writing to audit log: {e}")
 
-# --- 认证装饰器 (移除 API Key 认证) ---
-
 def login_required(f):
-    """检查用户是否已登录 (用于 Web UI 和所有管理 API)."""
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'logged_in' not in session or not session.get('logged_in'):
-            # 记录尝试访问日志
             log_action("LOGIN_ATTEMPT", "N/A", f"Access denied to {request.path}")
             return redirect(url_for('login'))  
-        
-        # 记录成功的 UI/API 访问 (可选，但可以显示活跃度)
-        # log_action("ACCESS", session.get('username', 'root'), request.path)
         return f(*args, **kwargs)
     decorated_function.__name__ = f.__name__ + "_decorated"
     return decorated_function
 
-
-# --- 系统工具函数 (保留不变) ---
 def safe_run_command(command, input=None):
     try:
         result = subprocess.run(
-            command,
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            input=input,  
-            timeout=5
+            command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            input=input, timeout=5
         )
         return True, result.stdout.decode('utf-8').strip()
     except subprocess.CalledProcessError as e:
@@ -587,17 +534,13 @@ def safe_run_command(command, input=None):
         return False, str(e)
         
 def toggle_iptables_ip_ban(ip, action):
-    """实时通过 iptables 封禁或解封 IP，并保存规则."""
     chain = "WSS_IP_BLOCK"
-    
     if action == 'block':
         safe_run_command(['iptables', '-D', chain, '-s', ip, '-j', 'DROP'])
         command = ['iptables', '-I', chain, '1', '-s', ip, '-j', 'DROP']
-        
     elif action == 'unblock':
         command = ['iptables', '-D', chain, '-s', ip, '-j', 'DROP']
-    else:
-        return False, "Invalid action"
+    else: return False, "Invalid action"
     
     success, output = safe_run_command(command)
     
@@ -618,36 +561,47 @@ def kill_user_sessions(username):
     success, output = safe_run_command(['pkill', '-u', username])
     return success, output 
 
-# --- 核心用户状态管理函数 (保留不变) ---
+# --- 核心用户状态管理函数 ---
+
 def sync_user_status(user):
     username = user['username']
-    is_expired_or_exceeded = False
     
+    is_expired_or_exceeded = False
     if user['expiry_date']:
         try:
             expiry_dt = datetime.strptime(user['expiry_date'], '%Y-%m-%d')
-            if expiry_dt.date() < datetime.now().date():
-                is_expired_or_exceeded = True
-        except ValueError:
-            print(f"Invalid expiry_date format for {username}: {user['expiry_date']}")
+            if expiry_dt.date() < datetime.now().date(): is_expired_or_exceeded = True
+        except ValueError: print(f"Invalid expiry_date format for {username}: {user['expiry_date']}")
             
-    if user['quota_gb'] > 0 and user['used_traffic_gb'] >= user['quota_gb']:
-        is_expired_or_exceeded = True
+    if user['quota_gb'] > 0 and user['used_traffic_gb'] >= user['quota_gb']: is_expired_or_exceeded = True
         
+    is_over_limit = False
+    active_ips = load_active_ips()
+    
+    current_conn_count = 0
+    try:
+        success, uid = safe_run_command(['id', '-u', username])
+        if success and uid.isdigit():
+             result = subprocess.run(['ss', '-t', '-n', '-o', 'state', 'established', 'sport', '48303', 'user', str(uid)], capture_output=True, text=True, timeout=2)
+             current_conn_count = len(result.stdout.strip().split('\n')) - 1 if result.stdout.strip() else 0
+    except Exception:
+         current_conn_count = 0
+
+    max_connections = user.get('max_connections', MAX_CONN_DEFAULT)
+    if max_connections > 0 and current_conn_count > max_connections:
+         is_over_limit = True
+
     current_status = user.get('status', 'active')
-    should_be_paused = (current_status == 'paused') or is_expired_or_exceeded
+    should_be_paused = (current_status == 'paused') or is_expired_or_exceeded or is_over_limit
     
     system_locked = False
     success_status, output_status = safe_run_command(['passwd', '-S', username])
-    if success_status and output_status and ' L ' in output_status:
-        system_locked = True
+    if success_status and output_status and ' L ' in output_status: system_locked = True
         
     if not should_be_paused and system_locked:
         safe_run_command(['usermod', '-U', username])
-        if user['expiry_date']:
-            safe_run_command(['chage', '-E', user['expiry_date'], username]) 
-        else:
-            safe_run_command(['chage', '-E', '', username])
+        if user['expiry_date']: safe_run_command(['chage', '-E', user['expiry_date'], username]) 
+        else: safe_run_command(['chage', '-E', '', username])
         user['status'] = 'active'
         
     elif should_be_paused and not system_locked:
@@ -658,6 +612,10 @@ def sync_user_status(user):
         
     if current_status == 'active' and user.get('expiry_date'):
         safe_run_command(['chage', '-E', user['expiry_date'], username])  
+    
+    user['current_conn_count'] = current_conn_count
+    user['max_conn'] = max_connections
+    user['is_over_limit'] = is_over_limit
         
     return user
 
@@ -666,39 +624,37 @@ def refresh_all_user_status(users):
     for user in users:
         user = sync_user_status(user)  
         user['traffic_display'] = f"{user['used_traffic_gb']:.2f} / {user['quota_gb']:.2f} GB"
+        
         user['status_text'] = "Active"
         user['status_class'] = "bg-green-500"
 
-        if user['quota_gb'] > 0 and user['used_traffic_gb'] >= user['quota_gb']:
+        if user.get('is_over_limit'):
+            user['status_text'] = f"Limit Exceeded ({user['current_conn_count']}/{user['max_conn']})"
+            user['status_class'] = "bg-red-500"
+        elif user['quota_gb'] > 0 and user['used_traffic_gb'] >= user['quota_gb']:
             user['status_text'] = "Quota Exceeded"
             user['status_class'] = "bg-red-500"
         elif user['status'] == 'paused':
             user['status_text'] = "Paused"
             user['status_class'] = "bg-yellow-500"
-        elif user.get('expiry_date'):
-             try:
-                expiry_dt = datetime.strptime(user['expiry_date'], '%Y-%m-%d')
-                if expiry_dt.date() < datetime.now().date():
-                    user['status_text'] = "Expired"
-                    user['status_class'] = "bg-red-500"
-             except ValueError:
-                 pass
+        elif user.get('expiry_date') and datetime.strptime(user['expiry_date'], '%Y-%m-%d').date() < datetime.now().date():
+            user['status_text'] = "Expired"
+            user['status_class'] = "bg-red-500"
+        else:
+             user['status_text'] = f"Active ({user['current_conn_count']}/{user['max_conn']})"
         
         updated = True
-    if updated:
-        save_users(users)
+    if updated: save_users(users)
     return users
 
+# --- Web 路由所需的渲染函数 ---
 
-# --- HTML 模板和渲染 (移除 API Key 卡片，更新版本号) ---
-
-# 仪表盘 HTML (内嵌 - 使用 Tailwind, 增加自定义模态框)
 _DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WSS Panel - 仪表盘 V5.7</title>
+    <title>WSS Panel - 仪表盘 V5.17</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
     <style>
@@ -709,12 +665,15 @@ _DASHBOARD_HTML = """
         .modal-content { transition: all 0.3s ease-out; transform: translateY(-50px); }
         .modal.open .modal-content { transform: translateY(0); }
         .api-key-container { word-break: break-all; }
+        .service-status { height: 10px; width: 10px; display: inline-block; border-radius: 50%; margin-right: 5px; }
+        .status-running { background-color: #10B981; }
+        .status-failed { background-color: #EF4444; }
     </style>
 </head>
 <body class="bg-gray-50 min-h-screen">
     <div class="bg-indigo-600 text-white shadow-lg">
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
-            <h1 class="text-3xl font-bold">WSS 隧道管理面板 V5.7 (审计日志/实时阻断)</h1>
+            <h1 class="text-3xl font-bold">WSS 隧道管理面板 V5.17 (流量诊断增强)</h1>
             <button onclick="logout()" class="bg-indigo-800 hover:bg-red-700 px-4 py-2 rounded-lg font-semibold shadow-md btn-action">
                 退出登录 (root)
             </button>
@@ -725,7 +684,16 @@ _DASHBOARD_HTML = """
         <!-- Status Message Box -->
         <div id="status-message" class="hidden p-4 mb-4 rounded-xl font-semibold shadow-md" role="alert"></div>
         
-        <!-- Stats Grid -->
+        <!-- System Status Card -->
+        <div class="card bg-white p-6 rounded-xl shadow-lg mb-8">
+            <h3 class="text-xl font-semibold text-gray-800 mb-4 border-b pb-2">实时系统状态</h3>
+            <div id="system-status-data" class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
+                <!-- Data populated by JS -->
+                <p class="text-gray-500 col-span-4">正在加载系统状态...</p>
+            </div>
+        </div>
+
+        <!-- Stats Grid (优化为显示总活跃连接和总流量) -->
         <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
             <div class="card bg-white p-5 rounded-xl shadow-lg border-l-4 border-indigo-500">
                 <h3 class="text-sm font-medium text-gray-500">已管理用户组数</h3>
@@ -736,16 +704,20 @@ _DASHBOARD_HTML = """
                 <p class="text-3xl font-bold text-gray-900 mt-1">{{ panel_port }}</p>
             </div>
             <div class="card bg-white p-5 rounded-xl shadow-lg border-l-4 border-blue-500">
-                <h3 class="text-sm font-medium text-gray-500">WSS (TLS) 端口</h3>
-                <p class="text-3xl font-bold text-gray-900 mt-1">{{ wss_tls_port }}</p>
+                <h3 class="text-sm font-medium text-gray-500">WSS/TLS 端口</h3>
+                <p class="text-3xl font-bold text-gray-900 mt-1">{{ wss_tls_port }} / {{ stunnel_port }}</p>
             </div>
-            <div class="card bg-white p-5 rounded-xl shadow-lg border-l-4 border-yellow-500">
-                <h3 class="text-sm font-medium text-gray-500">Stunnel/SSH 端口</h3>
-                <p class="text-3xl font-bold text-gray-900 mt-1">{{ stunnel_port }}</p>
+             <div class="card bg-white p-5 rounded-xl shadow-lg border-l-4 border-yellow-500">
+                <h3 class="text-sm font-medium text-gray-500">总已用流量 (GB)</h3>
+                {% set total_usage = 0 %}
+                {% for user in users %}
+                    {% set total_usage = total_usage + user.used_traffic_gb %}
+                {% endfor %}
+                <p class="text-3xl font-bold text-gray-900 mt-1">{{ total_usage | round(2) }} GB</p>
             </div>
         </div>
         
-        <!-- Audit Log Info (新增审计日志提示) -->
+        <!-- Audit Log Info -->
         <div class="card bg-white p-6 rounded-xl shadow-lg mb-8">
             <h3 class="text-xl font-semibold text-gray-800 mb-4 border-b pb-2">审计日志信息</h3>
             <div class="bg-gray-100 p-4 rounded-lg font-mono text-sm overflow-x-auto">
@@ -755,17 +727,18 @@ _DASHBOARD_HTML = """
             </div>
         </div>
 
-        <!-- Connection Info Card (保留不变) -->
+        <!-- Connection Info Card (精简信息，移除端口冗余) -->
         <div class="card bg-white p-6 rounded-xl shadow-lg mb-8">
-            <h3 class="text-xl font-semibold text-gray-800 mb-4 border-b pb-2">连接信息</h3>
+            <h3 class="text-xl font-semibold text-gray-800 mb-4 border-b pb-2">客户端连接指南</h3>
             <div class="bg-gray-100 p-4 rounded-lg font-mono text-sm overflow-x-auto">
                 <p><span class="font-bold">服务器地址:</span> {{ host_ip }} (请手动替换为你的公网 IP)</p>
-                <p><span class="font-bold">WSS/Stunnel 端口:</span> {{ wss_tls_port }} (WSS) / {{ stunnel_port }} (Stunnel)</p>
+                <p><span class="font-bold">WSS 模式:</span> 使用 **443** 端口，协议选择 **SSH-TLS-Payload** (或 WSS over TLS)。</p>
+                <p><span class="font-bold">Stunnel 模式:</span> 使用 **444** 端口，协议选择 **SSH-TLS** (纯净 TLS)。</p>
                 <p><span class="font-bold text-red-600">注意:</span> 所有隧道均使用 SSH 账户和密码连接本地端口 48303。</p>
             </div>
         </div>
 
-        <!-- Add User Card / User List Card (保留不变) -->
+        <!-- Add User Card / User List Card -->
         <div class="card bg-white p-6 rounded-xl shadow-lg mb-8">
             <h3 class="text-xl font-semibold text-gray-800 mb-4">新增 WSS 用户组 (SSH 账户)</h3>
             <form id="add-user-form" class="flex flex-wrap items-center gap-4">
@@ -787,9 +760,9 @@ _DASHBOARD_HTML = """
                     <thead class="bg-gray-50">
                         <tr>
                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">用户组 (SSH 账户)</th>
-                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">状态</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">状态 (并发/限制)</th>
                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">到期日</th>
-                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">流量使用 (GB)</th>
+                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">总流量 (GB)</th>
                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">操作</th>
                         </tr>
                     </thead>
@@ -808,18 +781,18 @@ _DASHBOARD_HTML = """
                             <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
                                 {{ user.traffic_display }}
                             </td>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium space-x-2">
+                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium space-x-2 flex items-center">
                                 <button onclick="openActiveIPModal('{{ user.username }}')" 
                                         class="text-xs px-3 py-1 rounded-full font-bold bg-purple-100 text-purple-800 hover:bg-purple-200 btn-action">
                                     活跃 IP
                                 </button>
-                                <button onclick="openQuotaModal('{{ user.username }}', '{{ user.quota_gb }}', '{{ user.expiry_date }}')" 
+                                <button onclick="openSettingsModal('{{ user.username }}', '{{ user.quota_gb }}', '{{ user.expiry_date }}', '{{ user.max_conn }}')" 
                                         class="text-xs px-3 py-1 rounded-full font-bold bg-blue-100 text-blue-800 hover:bg-blue-200 btn-action">
-                                    配额/到期
+                                    设置
                                 </button>
-                                <button onclick="openConfirmationModal('{{ user.username }}', '{{ 'pause' if user.status_text == 'Active' else 'active' }}', 'toggleStatus', '{{ '暂停' if user.status_text == 'Active' else '启用' }}')" 
-                                        class="text-xs px-3 py-1 rounded-full font-bold {{ 'bg-yellow-100 text-yellow-800 hover:bg-yellow-200' if user.status_text == 'Active' else 'bg-green-100 text-green-800 hover:bg-green-200' }} btn-action">
-                                    {{ '暂停' if user.status_text == 'Active' else '启用' }}
+                                <button onclick="openConfirmationModal('{{ user.username }}', '{{ 'pause' if user.status == 'active' else 'active' }}', 'toggleStatus', '{{ '暂停' if user.status == 'active' else '启用' }}')" 
+                                        class="text-xs px-3 py-1 rounded-full font-bold {{ 'bg-yellow-100 text-yellow-800 hover:bg-yellow-200' if user.status == 'active' else 'bg-green-100 text-green-800 hover:bg-green-200' }} btn-action">
+                                    {{ '暂停' if user.status == 'active' else '启用' }}
                                 </button>
                                 <button onclick="openConfirmationModal('{{ user.username }}', null, 'resetTraffic', '重置流量')"
                                         class="text-xs px-3 py-1 rounded-full font-bold bg-indigo-100 text-indigo-800 hover:bg-indigo-200 btn-action">
@@ -839,29 +812,31 @@ _DASHBOARD_HTML = """
 
     </div>
     
-    <!-- Modals (Quota, Active IP, Confirmation) definitions follow (omitted for brevity) -->
-    <!-- ... (All modals remain the same as V5.5) ... -->
-    <div id="quota-modal" class="modal fixed inset-0 flex items-center justify-center p-4 hidden">
+    <!-- Modal for Settings -->
+    <div id="settings-modal" class="modal fixed inset-0 flex items-center justify-center p-4 hidden">
         <div class="modal-content bg-white rounded-xl shadow-2xl w-full max-w-lg transition-all">
             <div class="p-6">
-                <h3 class="text-xl font-bold mb-4 text-gray-800 border-b pb-2">设置 <span id="modal-username-title"></span> 的配额和到期日</h3>
-                <form id="quota-form" onsubmit="event.preventDefault(); saveQuotaAndExpiry();">
-                    <input type="hidden" id="modal-username">
+                <h3 class="text-xl font-bold mb-4 text-gray-800 border-b pb-2">设置 <span id="modal-username-title-settings"></span> 的参数</h3>
+                <form id="settings-form" onsubmit="event.preventDefault(); saveSettings();">
+                    <input type="hidden" id="modal-username-settings">
                     
                     <div class="mb-4">
                         <label for="modal-quota" class="block text-sm font-medium text-gray-700">流量配额 (GB, 0为无限)</label>
-                        <input type="number" step="0.01" min="0" id="modal-quota" 
-                               class="mt-1 block w-full p-2 border border-gray-300 rounded-lg" required>
+                        <input type="number" step="0.01" min="0" id="modal-quota" class="mt-1 block w-full p-2 border border-gray-300 rounded-lg" required>
                     </div>
                     
+                    <div class="mb-4">
+                        <label for="modal-max-conn" class="block text-sm font-medium text-gray-700">最大并发连接数 (0为无限)</label>
+                        <input type="number" step="1" min="0" id="modal-max-conn" class="mt-1 block w-full p-2 border border-gray-300 rounded-lg" required>
+                    </div>
+
                     <div class="mb-6">
                         <label for="modal-expiry" class="block text-sm font-medium text-gray-700">到期日 (YYYY-MM-DD, 留空为永不到期)</label>
-                        <input type="date" id="modal-expiry" 
-                               class="mt-1 block w-full p-2 border border-gray-300 rounded-lg">
+                        <input type="date" id="modal-expiry" class="mt-1 block w-full p-2 border border-gray-300 rounded-lg">
                     </div>
 
                     <div class="flex justify-end space-x-3">
-                        <button type="button" onclick="closeQuotaModal()" class="bg-gray-300 hover:bg-gray-400 text-gray-800 px-4 py-2 rounded-lg font-semibold btn-action">
+                        <button type="button" onclick="closeSettingsModal()" class="bg-gray-300 hover:bg-gray-400 text-gray-800 px-4 py-2 rounded-lg font-semibold btn-action">
                             取消
                         </button>
                         <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg font-semibold btn-action">
@@ -873,6 +848,7 @@ _DASHBOARD_HTML = """
         </div>
     </div>
     
+    <!-- Active IP / Confirmation Modals (保留不变) -->
     <div id="active-ip-modal" class="modal fixed inset-0 flex items-center justify-center p-4 hidden">
         <div class="modal-content bg-white rounded-xl shadow-2xl w-full max-w-xl transition-all">
             <div class="p-6">
@@ -913,13 +889,122 @@ _DASHBOARD_HTML = """
 
 
     <script>
-        // --- API KEY UI Logic (已移除) ---
+        // --- System Status Logic (NEW) ---
         
-        // --- 通用 UI 函数 (其余保留不变) ---
+        function updateSystemStatus(data) {
+            const container = document.getElementById('system-status-data');
+            
+            const formatService = (service, status) => {
+                const className = status === 'running' ? 'status-running' : 'status-failed';
+                const text = status === 'running' ? '运行中' : '失败';
+                return \`
+                    <div class="flex items-center p-2 bg-gray-100 rounded-lg shadow-sm">
+                        <span class="service-status \${className}"></span>
+                        <span class="font-semibold">\${service}:</span>
+                        <span class="ml-auto font-medium \${className === 'status-failed' ? 'text-red-600' : 'text-green-600'}">\${text}</span>
+                    </div>
+                \`;
+            };
+
+            const formatResource = (label, value) => \`
+                <div class="p-2 bg-gray-100 rounded-lg shadow-sm">
+                    <span class="font-semibold">\${label}:</span>
+                    <span class="ml-auto font-medium text-gray-700">\${value}</span>
+                </div>
+            \`;
+
+            let html = formatResource("CPU 使用率", \`\${data.cpu_percent.toFixed(1)}%\`);
+            html += formatResource("内存 (用/总)", \`\${data.memory_used_gb.toFixed(2)} / \${data.memory_total_gb.toFixed(2)} GB\`);
+            html += formatResource("磁盘使用率", \`\${data.disk_used_percent.toFixed(1)}%\`);
+            html += formatResource("面板 API", '<span class="text-green-600 font-semibold">正常</span>');
+
+            // Service statuses
+            html += formatService("WSS Proxy", data.services.wss);
+            html += formatService("Panel Service", data.services.wss_panel);
+            html += formatService("Stunnel4", data.services.stunnel4);
+            html += formatService("UDPGW", data.services.udpgw);
+
+            container.innerHTML = html;
+        }
+
+        async function fetchSystemStatus() {
+            const API_URL = '/api/system/status'; 
+            
+            try {
+                const response = await fetch(API_URL, { method: 'GET' });
+
+                if (response.status === 403) {
+                     document.getElementById('system-status-data').innerHTML = '<p class="text-red-500 col-span-4">权限不足，请确保已登录。</p>';
+                     return;
+                }
+                
+                const data = await response.json();
+
+                if (data.success) {
+                    updateSystemStatus(data);
+                } else {
+                    document.getElementById('system-status-data').innerHTML = \`<p class="text-red-500 col-span-4">无法获取系统状态: \${data.message}</p>\`;
+                }
+            } catch (error) {
+                document.getElementById('system-status-data').innerHTML = '<p class="text-red-500 col-span-4">连接错误，请检查防火墙和面板服务。</p>';
+            }
+        }
+        
+        window.onload = function() {
+            fetchSystemStatus();
+            setInterval(fetchSystemStatus, 15000); 
+        };
+
+        // --- Settings Modal Logic (FIXED) ---
+        
+        function openSettingsModal(username, quota, expiry, maxConn) {
+            document.getElementById('modal-username-title-settings').textContent = username;
+            document.getElementById('modal-username-settings').value = username;
+            
+            // 使用 parseFloat/parseInt 确保值是数字类型
+            document.getElementById('modal-quota').value = parseFloat(quota) || 0;
+            document.getElementById('modal-expiry').value = expiry || '';
+            document.getElementById('modal-max-conn').value = parseInt(maxConn) || {{ MAX_CONN_DEFAULT }};
+            
+            document.getElementById('settings-modal').classList.remove('hidden');
+        }
+
+        function closeSettingsModal() {
+            document.getElementById('settings-modal').classList.add('hidden');
+        }
+
+        async function saveSettings() {
+            const username = document.getElementById('modal-username-settings').value;
+            const quota_gb = parseFloat(document.getElementById('modal-quota').value);
+            const expiry_date = document.getElementById('modal-expiry').value;
+            const max_connections = parseInt(document.getElementById('modal-max-conn').value);
+
+            try {
+                const response = await fetch('/api/users/settings', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username, quota_gb, expiry_date, max_connections })
+                });
+
+                const result = await response.json();
+
+                if (response.ok && result.success) {
+                    showStatus(result.message, true);
+                    closeSettingsModal();
+                    location.reload(); 
+                } else {
+                    showStatus('保存设置失败: ' + result.message, false);
+                }
+            } catch (error) {
+                showStatus('请求失败，请检查面板运行状态。', false);
+            }
+        }
+
+
+        // --- Existing JS Functions (保留不变) ---
         function showStatus(message, isSuccess) {
             const statusDiv = document.getElementById('status-message');
             statusDiv.textContent = message;
-            // FIX: Escaping the \${ to prevent Bash "bad substitution" error
             statusDiv.className = \`\${isSuccess ? 'bg-green-100 text-green-800 border-green-400' : 'bg-red-100 text-red-800 border-red-400'} p-4 mb-4 rounded-xl font-semibold shadow-md block border\`;
             setTimeout(() => { statusDiv.classList.add('hidden'); }, 5000);
         }
@@ -972,7 +1057,8 @@ _DASHBOARD_HTML = """
                 }
 
             } catch (error) {
-                listDiv.innerHTML = '<p class="text-red-500">请求失败，请检查面板运行状态。</p>';
+                document.getElementById('active-ip-modal').classList.add('hidden');
+                showStatus('请求失败，请检查面板运行状态。', false);
             }
         }
         
@@ -998,44 +1084,6 @@ _DASHBOARD_HTML = """
                     openActiveIPModal(username); 
                 } else {
                     showStatus(\`\${actionText}失败: \` + result.message, false);
-                }
-            } catch (error) {
-                showStatus('请求失败，请检查面板运行状态。', false);
-            }
-        }
-        
-        function openQuotaModal(username, quota, expiry) {
-            document.getElementById('modal-username-title').textContent = username;
-            document.getElementById('modal-username').value = username;
-            document.getElementById('modal-quota').value = parseFloat(quota) || 0;
-            document.getElementById('modal-expiry').value = expiry || '';
-            document.getElementById('quota-modal').classList.remove('hidden');
-        }
-
-        function closeQuotaModal() {
-            document.getElementById('quota-modal').classList.add('hidden');
-        }
-
-        async function saveQuotaAndExpiry() {
-            const username = document.getElementById('modal-username').value;
-            const quota_gb = parseFloat(document.getElementById('modal-quota').value);
-            const expiry_date = document.getElementById('modal-expiry').value;
-
-            try {
-                const response = await fetch('/api/users/settings', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username, quota_gb, expiry_date })
-                });
-
-                const result = await response.json();
-
-                if (response.ok && result.success) {
-                    showStatus(result.message, true);
-                    closeQuotaModal();
-                    location.reload(); 
-                } else {
-                    showStatus('保存设置失败: ' + result.message, false);
                 }
             } catch (error) {
                 showStatus('请求失败，请检查面板运行状态。', false);
@@ -1189,7 +1237,6 @@ _DASHBOARD_HTML = """
 </html>
 """
 
-# 渲染函数 (移除 API Key 注入)
 def render_dashboard(users):
     """手动渲染 Jinja2 模板字符串."""
     template_env = jinja2.Environment(loader=jinja2.BaseLoader)
@@ -1207,11 +1254,13 @@ def render_dashboard(users):
         'stunnel_port': STUNNEL_PORT,
         'udpgw_port': UDPGW_PORT,
         'host_ip': host_ip,
+        'MAX_CONN_DEFAULT': MAX_CONN_DEFAULT
     }
     return template.render(**context)
 
 
-# --- Web 路由 (保留不变) ---
+# --- Web 路由 ---
+
 @app.route('/', methods=['GET'])
 @login_required
 def dashboard():
@@ -1219,7 +1268,6 @@ def dashboard():
     users = refresh_all_user_status(users)
     html_content = render_dashboard(users=users)
     return make_response(html_content)
-
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -1233,7 +1281,6 @@ def login():
             if password_hash == ROOT_PASSWORD_HASH:
                 session['logged_in'] = True
                 session['username'] = ROOT_USERNAME
-                # 记录成功登录
                 log_action("LOGIN_SUCCESS", ROOT_USERNAME, "Web UI Login")
                 return redirect(url_for('dashboard_decorated'))
             else:
@@ -1265,7 +1312,7 @@ def login():
 </head>
 <body>
     <div class="container">
-        <h1 class="text-2xl">WSS 管理面板 V5.7</h1>
+        <h1 class="text-2xl">WSS 管理面板 V5.14</h1>
         {f'<div class="error">{error}</div>' if error else ''}
         <form method="POST">
             <label for="username" class="block text-sm font-medium text-gray-700">用户名</label>
@@ -1288,37 +1335,24 @@ def logout():
     session.pop('logged_in', None)
     return redirect(url_for('login'))
 
-
-# ------------------------------------
-# --- 用户管理 API (使用 @login_required + 审计日志) ---
-# ------------------------------------
-
 @app.route('/api/users/add', methods=['POST'])
 @login_required
 def add_user_api():
-    """添加用户 (API)"""
     data = request.json
     username = data.get('username')
     password_raw = data.get('password')
     
-    if not username or not password_raw:
-        return jsonify({"success": False, "message": "缺少用户名或密码"}), 400
-    
-    if not re.match(r'^[a-z0-9_]{3,16}$', username):
-        return jsonify({"success": False, "message": "用户名格式不正确 (3-16位小写字母/数字/下划线)"}), 400
-
+    if not username or not password_raw: return jsonify({"success": False, "message": "缺少用户名或密码"}), 400
+    if not re.match(r'^[a-z0-9_]{3,16}$', username): return jsonify({"success": False, "message": "用户名格式不正确 (3-16位小写字母/数字/下划线)"}), 400
 
     users = load_users()
-    if get_user(username)[0]:
-        return jsonify({"success": False, "message": f"用户组 {username} 已存在于面板"}), 409
+    if get_user(username)[0]: return jsonify({"success": False, "message": f"用户组 {username} 已存在于面板"}), 409
 
-    # 1. 创建系统用户 
     success, output = safe_run_command(['useradd', '-m', '-s', '/bin/false', username])
     if not success:
         log_action("USER_ADD_FAIL", session.get('username', 'root'), f"Failed to create system user {username}: {output}")
         return jsonify({"success": False, "message": f"创建系统用户失败: {output}"}), 500
 
-    # 2. 设置密码
     chpasswd_input = f"{username}:{password_raw}"
     success, output = safe_run_command(['/usr/sbin/chpasswd'], input=chpasswd_input.encode('utf-8'))
     if not success:
@@ -1326,79 +1360,59 @@ def add_user_api():
         log_action("USER_ADD_FAIL", session.get('username', 'root'), f"Failed to set password for {username}: {output}")
         return jsonify({"success": False, "message": f"设置密码失败: {output}"}), 500
         
-    # 3. 记录到 JSON 数据库
     new_user = {
-        "username": username,
-        "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-        "status": "active",
-        "expiry_date": "",  
-        "quota_gb": 0.0,
-        "used_traffic_gb": 0.0,
-        "last_check": time.time(),
-        "banned_ips": []
+        "username": username, "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        "status": "active", "expiry_date": "", "quota_gb": 0.0, "used_traffic_gb": 0.0,
+        "last_check": time.time(), "banned_ips": [], "max_connections": MAX_CONN_DEFAULT
     }
     users.append(new_user)
     save_users(users)
     sync_user_status(new_user)
     
     log_action("USER_ADD_SUCCESS", session.get('username', 'root'), f"Created user {username}")
-
     return jsonify({"success": True, "message": f"用户组 {username} 创建成功"})
 
 @app.route('/api/users/delete', methods=['POST'])
 @login_required
 def delete_user_api():
-    """删除用户 (API)"""
     data = request.json
     username = data.get('username')
     
-    if not username:
-        return jsonify({"success": False, "message": "缺少用户名"}), 400
+    if not username: return jsonify({"success": False, "message": "缺少用户名"}), 400
 
     users = load_users()
     user_to_delete, index = get_user(username)
 
-    if not user_to_delete:
-        return jsonify({"success": False, "message": f"面板中用户组 {username} 不存在"}), 404
+    if not user_to_delete: return jsonify({"success": False, "message": f"面板中用户组 {username} 不存在"}), 404
 
-    # 1. 终止用户会话
     kill_user_sessions(username)
     
-    # 2. 从 IP 封禁规则中清理该用户的所有 IP
     ip_bans = load_ip_bans()
     if username in ip_bans:
-        for ip in ip_bans[username]:
-             toggle_iptables_ip_ban(ip, 'unblock')
+        for ip in ip_bans[username]: toggle_iptables_ip_ban(ip, 'unblock')
         ip_bans.pop(username)
         save_ip_bans(ip_bans)
 
-
-    # 3. 删除系统用户及其主目录
     success, output = safe_run_command(['userdel', '-r', username])
     if not success:
         log_action("USER_DELETE_WARNING", session.get('username', 'root'), f"System user {username} deletion failed (non-fatal): {output}")
 
-    # 4. 从 JSON 数据库中删除记录
     users.pop(index)
     save_users(users)
     
     log_action("USER_DELETE_SUCCESS", session.get('username', 'root'), f"Deleted user {username}")
-
     return jsonify({"success": True, "message": f"用户组 {username} 已删除，活动会话已终止"})
 
 @app.route('/api/users/reset_traffic', methods=['POST'])
 @login_required
 def reset_user_traffic_api():
-    """将用户的已用流量清零 (API)"""
     data = request.json
     username = data.get('username')
 
     user, index = get_user(username)
-    if not user:
-        return jsonify({"success": False, "message": f"用户组 {username} 不存在"}), 404
+    if not user: return jsonify({"success": False, "message": f"用户组 {username} 不存在"}), 404
         
     users = load_users()
-    
     old_traffic = users[index].get('used_traffic_gb', 0.0)
     users[index]['used_traffic_gb'] = 0.0
     users[index] = sync_user_status(users[index])
@@ -1411,49 +1425,47 @@ def reset_user_traffic_api():
 @app.route('/api/users/settings', methods=['POST'])
 @login_required
 def update_user_settings_api():
-    """设置用户配额和到期日 (API)"""
     data = request.json
     username = data.get('username')
     quota_gb = data.get('quota_gb', 0.0)
     expiry_date = data.get('expiry_date', '')
+    max_connections = data.get('max_connections', MAX_CONN_DEFAULT)
 
     user, index = get_user(username)
-    if not user:
-        return jsonify({"success": False, "message": f"用户组 {username} 不存在"}), 404
+    if not user: return jsonify({"success": False, "message": f"用户组 {username} 不存在"}), 404
         
     users = load_users()
     
     try:
         quota_gb = max(0.0, float(quota_gb))
-        if expiry_date:
-            datetime.strptime(expiry_date, '%Y-%m-%d')
-    except ValueError:
-        return jsonify({"success": False, "message": "配额或日期格式不正确"}), 400
+        max_connections = int(max_connections)
+        if expiry_date: datetime.strptime(expiry_date, '%Y-%m-%d')
+    except ValueError: return jsonify({"success": False, "message": "配额或日期格式不正确"}), 400
 
     old_quota = users[index].get('quota_gb')
     old_expiry = users[index].get('expiry_date')
+    old_max_conn = users[index].get('max_connections')
     
     users[index]['quota_gb'] = quota_gb
     users[index]['expiry_date'] = expiry_date
+    users[index]['max_connections'] = max_connections
     
     users[index] = sync_user_status(users[index])
     
     save_users(users)
     log_action("SETTINGS_UPDATE", session.get('username', 'root'), 
-               f"Updated {username}: Quota {old_quota:.2f}->{quota_gb:.2f} GB, Expiry {old_expiry}->{expiry_date}")
+               f"Updated {username}: Quota {old_quota:.2f}->{quota_gb:.2f} GB, Expiry {old_expiry}->{expiry_date}, MaxConn {old_max_conn}->{max_connections}")
     return jsonify({"success": True, "message": f"用户组 {username} 设置已更新"})
     
 @app.route('/api/users/status', methods=['POST'])
 @login_required
 def toggle_user_status_api():
-    """启用或暂停用户 (API)"""
     data = request.json
     username = data.get('username')
-    action = data.get('action') # 'active' or 'pause'
+    action = data.get('action')
 
     user, index = get_user(username)
-    if not user:
-        return jsonify({"success": False, "message": f"用户组 {username} 不存在"}), 404
+    if not user: return jsonify({"success": False, "message": f"用户组 {username} 不存在"}), 404
         
     users = load_users()
     
@@ -1463,8 +1475,7 @@ def toggle_user_status_api():
     elif action == 'pause':
         users[index]['status'] = 'paused'
         log_action("USER_TOGGLE", session.get('username', 'root'), f"Set user {username} to PAUSED (Locked)")
-    else:
-        return jsonify({"success": False, "message": "无效的操作"}), 400
+    else: return jsonify({"success": False, "message": "无效的操作"}), 400
         
     users[index] = sync_user_status(users[index])
     save_users(users)
@@ -1473,23 +1484,17 @@ def toggle_user_status_api():
 
 
 @app.route('/api/users/update_traffic', methods=['POST'])
-# 此 API 无需登录，供本地流量同步脚本调用 (假定其通过 127.0.0.1 访问，且由 root 运行)
 def update_user_traffic_api():
-    """内部工具用于更新用户流量的 API"""
-    # 限制此API只能从本地调用，增加安全性
-    if request.remote_addr != '127.0.0.1' and request.remote_addr != '::1':
-        return jsonify({"success": False, "message": "Access denied"}), 403
+    if request.remote_addr != '127.0.0.1' and request.remote_addr != '::1': return jsonify({"success": False, "message": "Access denied"}), 403
         
     data = request.json
     username = data.get('username')
     used_traffic_gb = data.get('used_traffic_gb')
 
-    if not username or used_traffic_gb is None:
-        return jsonify({"success": False, "message": "缺少用户名或流量数据"}), 400
+    if not username or used_traffic_gb is None: return jsonify({"success": False, "message": "缺少用户名或流量数据"}), 400
 
     user, index = get_user(username)
-    if not user:
-        return jsonify({"success": False, "message": f"用户 {username} 不存在"}), 404
+    if not user: return jsonify({"success": False, "message": f"用户 {username} 不存在"}), 404
 
     users = load_users()
     
@@ -1501,24 +1506,51 @@ def update_user_traffic_api():
     save_users(users)
     return jsonify({"success": True, "message": f"用户 {username} 流量已更新为 {used_traffic_gb:.2f} GB"})
 
+# --- 实时系统状态 API (保留 V5.14 修复) ---
+@app.route('/api/system/status', methods=['GET'])
+@login_required 
+def get_system_status():
+    """获取服务器 CPU/内存/服务状态."""
+    def get_service_status(service):
+        try:
+            success, output = safe_run_command(['systemctl', 'is-active', service])
+            return 'running' if success and output == 'active' else 'failed'
+        except Exception:
+            return 'failed'
 
-# ------------------------------------
-# --- IP/会话管理 API (使用 @login_required + 审计日志) ---
-# ------------------------------------
+    try:
+        cpu_percent = psutil.cpu_percent(interval=None)
+        mem = psutil.virtual_memory()
+        disk = psutil.disk_usage('/')
+        
+        services = {
+            'wss': get_service_status('wss'),
+            'wss_panel': get_service_status('wss_panel'),
+            'stunnel4': get_service_status('stunnel4'),
+            'udpgw': get_service_status('udpgw'),
+        }
+
+        return jsonify({
+            "success": True,
+            "cpu_percent": cpu_percent,
+            "memory_used_gb": round(mem.used / (1024 ** 3), 2),
+            "memory_total_gb": round(mem.total / (1024 ** 3), 2),
+            "disk_used_percent": disk.percent,
+            "services": services,
+        })
+    except Exception as e:
+        return jsonify({"success": False, "message": f"System status check failed: {str(e)}"}), 500
+
+# --- 配置生成器 API 已移除 ---
 
 @app.route('/api/ips/check', methods=['POST'])
-# 此 API 无需登录，供 WSS 核心代理调用 (假定其通过 127.0.0.1 访问，且由 root 运行)
 def check_ip_api():
-    """WSS 代理调用此 API 检查客户端 IP 是否被封禁 (作为二次检查)."""
-    # 限制此API只能从本地调用，增加安全性
-    if request.remote_addr != '127.0.0.1' and request.remote_addr != '::1':
-        return jsonify({"success": False, "message": "Access denied"}), 403
+    if request.remote_addr != '127.0.0.1' and request.remote_addr != '::1': return jsonify({"success": False, "message": "Access denied"}), 403
         
     data = request.json
     client_ip = data.get('ip')
     
-    if not client_ip:
-        return jsonify({"success": False, "message": "缺少 IP"}), 400
+    if not client_ip: return jsonify({"success": False, "message": "缺少 IP"}), 400
 
     ip_bans = load_ip_bans()
     
@@ -1531,19 +1563,14 @@ def check_ip_api():
     return jsonify({"success": True, "is_banned": is_banned})
 
 @app.route('/api/ips/report', methods=['POST'])
-# 此 API 无需登录，供 WSS 核心代理调用 (假定其通过 127.0.0.1 访问，且由 root 运行)
 def report_ip_api():
-    """WSS 代理报告 IP 连接/断开活动."""
-    # 限制此API只能从本地调用，增加安全性
-    if request.remote_addr != '127.0.0.1' and request.remote_addr != '::1':
-        return jsonify({"success": False, "message": "Access denied"}), 403
+    if request.remote_addr != '127.0.0.1' and request.remote_addr != '::1': return jsonify({"success": False, "message": "Access denied"}), 403
         
     data = request.json
     client_ip = data.get('ip')
-    action = data.get('action') # 'connect' or 'disconnect'
+    action = data.get('action')
     
-    if not client_ip or action not in ('connect', 'disconnect'):
-        return jsonify({"success": False, "message": "无效的参数"}), 400
+    if not client_ip or action not in ('connect', 'disconnect'): return jsonify({"success": False, "message": "无效的参数"}), 400
 
     active_ips = load_active_ips()
     now = time.time()
@@ -1553,18 +1580,13 @@ def report_ip_api():
             active_ips[client_ip]['count'] = active_ips[client_ip].get('count', 0) + 1
             active_ips[client_ip]['last_seen'] = now
         else:
-            active_ips[client_ip] = {
-                'count': 1, 
-                'last_seen': now,
-                'user': 'N/A'
-            }
+            active_ips[client_ip] = {'count': 1, 'last_seen': now, 'user': 'N/A'}
             
     elif action == 'disconnect':
         if client_ip in active_ips:
             active_ips[client_ip]['count'] = active_ips[client_ip].get('count', 1) - 1
             active_ips[client_ip]['last_seen'] = now
-            if active_ips[client_ip]['count'] <= 0:
-                active_ips.pop(client_ip)
+            if active_ips[client_ip]['count'] <= 0: active_ips.pop(client_ip)
                 
     save_active_ips(active_ips)
     return jsonify({"success": True})
@@ -1573,31 +1595,25 @@ def report_ip_api():
 @app.route('/api/ips/block', methods=['POST'])
 @login_required
 def block_ip_api():
-    """管理员封禁指定用户组下的指定 IP (Web UI 调用)."""
     data = request.json
     username = data.get('username')
     ip = data.get('ip')
 
-    if not username or not ip:
-        return jsonify({"success": False, "message": "缺少用户名或 IP"}), 400
+    if not username or not ip: return jsonify({"success": False, "message": "缺少用户名或 IP"}), 400
 
     ip_bans = load_ip_bans()
     user, index = get_user(username)
     
-    if not user:
-        return jsonify({"success": False, "message": f"用户组 {username} 不存在"}), 404
+    if not user: return jsonify({"success": False, "message": f"用户组 {username} 不存在"}), 404
     
-    if username not in ip_bans:
-        ip_bans[username] = []
+    if username not in ip_bans: ip_bans[username] = []
         
     if ip not in ip_bans[username]:
         ip_bans[username].append(ip)
         save_ip_bans(ip_bans)
         
-    # 1. 实时添加到 IPTABLES (核心改进)
     success_iptables, iptables_output = toggle_iptables_ip_ban(ip, 'block')
     
-    # 2. 清理活跃 IP 记录 (用于 UI 显示)
     active_ips = load_active_ips()
     if ip in active_ips:
         active_ips.pop(ip)
@@ -1614,13 +1630,11 @@ def block_ip_api():
 @app.route('/api/ips/unblock', methods=['POST'])
 @login_required
 def unblock_ip_api():
-    """管理员解封指定用户组下的指定 IP (Web UI 调用)."""
     data = request.json
     username = data.get('username')
     ip = data.get('ip')
 
-    if not username or not ip:
-        return jsonify({"success": False, "message": "缺少用户名或 IP"}), 400
+    if not username or not ip: return jsonify({"success": False, "message": "缺少用户名或 IP"}), 400
 
     ip_bans = load_ip_bans()
     
@@ -1628,7 +1642,6 @@ def unblock_ip_api():
         ip_bans[username].remove(ip)
         save_ip_bans(ip_bans)
     
-    # 1. 实时从 IPTABLES 移除 (核心改进)
     success_iptables, iptables_output = toggle_iptables_ip_ban(ip, 'unblock')
     
     if success_iptables:
@@ -1642,23 +1655,19 @@ def unblock_ip_api():
 @app.route('/api/ips/active', methods=['GET'])
 @login_required
 def get_active_ips_api():
-    """获取指定用户组的活跃 IP 列表."""
     username = request.args.get('username')
     
-    if not username:
-        return jsonify({"success": False, "message": "缺少用户名"}), 400
+    if not username: return jsonify({"success": False, "message": "缺少用户名"}), 400
 
     active_ips = load_active_ips()
     ip_bans = load_ip_bans()
     banned_ips_for_user = ip_bans.get(username, [])
     
     filtered_ips = []
-    
     all_ips = set(active_ips.keys()) | set(banned_ips_for_user)
 
     for ip in all_ips:
         data = active_ips.get(ip, {'count': 0, 'last_seen': 0})
-
         last_seen_display = 'N/A'
         if data['last_seen'] > 0:
              last_seen_dt = datetime.fromtimestamp(data['last_seen'])
@@ -1667,14 +1676,11 @@ def get_active_ips_api():
         is_banned = ip in banned_ips_for_user
         
         filtered_ips.append({
-            'ip': ip,
-            'count': data['count'],
-            'last_seen_display': last_seen_display,
+            'ip': ip, 'count': data['count'], 'last_seen_display': last_seen_display,
             'is_banned': is_banned
         })
         
     filtered_ips.sort(key=lambda x: (x['count'], x['is_banned']), reverse=True)
-    
     return jsonify({"success": True, "active_ips": filtered_ips})
 
 
@@ -1692,7 +1698,7 @@ export SERVER_IP
 if [ ! -f "/etc/systemd/system/wss_panel.service" ]; then
 tee /etc/systemd/system/wss_panel.service > /dev/null <<EOF
 [Unit]
-Description=WSS User Management Panel (Flask V5.7)
+Description=WSS User Management Panel (Flask V5.14)
 After=network.target
 
 [Service]
@@ -1708,51 +1714,71 @@ EOF
 fi
 
 systemctl daemon-reload
-systemctl enable wss_panel || true
+# FIX: 如果 service 文件存在，我们只用 sed 更新 ExecStart
+if [ -f "/etc/systemd/system/wss_panel.service" ]; then
+    sudo sed -i "s|^ExecStart=.*|ExecStart=$PYTHON_VENV_PATH /usr/local/bin/wss_panel.py|" /etc/systemd/system/wss_panel.service
+fi
+
+systemctl daemon-reload
+systemctl enable wss || true
 systemctl restart wss_panel
-echo "WSS 管理面板 V5.7 已启动/重启，端口 $PANEL_PORT"
+echo "WSS 管理面板 V5.14 已启动/重启，端口 $PANEL_PORT"
 echo "----------------------------------"
 
 # --- 6. 部署 IPTABLES 流量监控和同步脚本 ---
 
-# 1. IPTABLES 链设置函数 (保留不变)
+# 1. IPTABLES 链设置函数 (保留 V5.10 不变)
 setup_iptables_chains() {
-    echo "==== 配置 IPTABLES 流量统计和实时阻断链 ===="
+    echo "==== 配置 IPTABLES 流量统计和实时阻断链 (迁移到 mangle 表) ===="
     
     BLOCK_CHAIN="WSS_IP_BLOCK"
+    TRAFFIC_IN_CHAIN="WSS_USER_TRAFFIC_IN"
+    TRAFFIC_OUT_CHAIN="WSS_USER_TRAFFIC_OUT"
     
-    # 1. 清理旧链和规则 (确保幂等性)
-    iptables -D INPUT -j WSS_USER_TRAFFIC_IN 2>/dev/null || true
-    iptables -D OUTPUT -j WSS_USER_TRAFFIC_OUT 2>/dev/null || true
-    iptables -F WSS_USER_TRAFFIC_IN 2>/dev/null || true
-    iptables -X WSS_USER_TRAFFIC_IN 2>/dev/null || true
-    iptables -F WSS_USER_TRAFFIC_OUT 2>/dev/null || true
-    iptables -X WSS_USER_TRAFFIC_OUT 2>/dev/null || true
-
+    # 1. 清理旧链和规则 (filter 表的旧流量链)
     iptables -D INPUT -j $BLOCK_CHAIN 2>/dev/null || true
+    iptables -D INPUT -j $TRAFFIC_IN_CHAIN 2>/dev/null || true
+    iptables -D OUTPUT -j $TRAFFIC_OUT_CHAIN 2>/dev/null || true
+    iptables -F $TRAFFIC_IN_CHAIN 2>/dev/null || true
+    iptables -X $TRAFFIC_IN_CHAIN 2>/dev/null || true
+    iptables -F $TRAFFIC_OUT_CHAIN 2>/dev/null || true
+    iptables -X $TRAFFIC_OUT_CHAIN 2>/dev/null || true
+    
+    # 彻底清理 BLOCK 链 (它在 filter 表)
     iptables -F $BLOCK_CHAIN 2>/dev/null || true
     iptables -X $BLOCK_CHAIN 2>/dev/null || true
 
-    # 2. 创建新链
-    iptables -N WSS_USER_TRAFFIC_IN 2>/dev/null || true
-    iptables -N WSS_USER_TRAFFIC_OUT 2>/dev/null || true
-    iptables -N $BLOCK_CHAIN 2>/dev/null || true
+    # 2. 清理 mangle 表的旧流量链 (防止重复)
+    iptables -t mangle -D PREROUTING -j $TRAFFIC_IN_CHAIN 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -j $TRAFFIC_OUT_CHAIN 2>/dev/null || true
+    iptables -t mangle -F $TRAFFIC_IN_CHAIN 2>/dev/null || true
+    iptables -t mangle -X $TRAFFIC_IN_CHAIN 2>/dev/null || true
+    iptables -t mangle -F $TRAFFIC_OUT_CHAIN 2>/dev/null || true
+    iptables -t mangle -X $TRAFFIC_OUT_CHAIN 2>/dev/null || true
 
-    # 3. 将新链连接到 INPUT 和 OUTPUT
+    # 3. 创建新的链
+    iptables -N $BLOCK_CHAIN 2>/dev/null || true # 仍留在 filter 表的 INPUT 链
+    iptables -t mangle -N $TRAFFIC_IN_CHAIN 2>/dev/null || true # 迁移到 mangle 表
+    iptables -t mangle -N $TRAFFIC_OUT_CHAIN 2>/dev/null || true # 迁移到 mangle 表
+
+    # 4. 将新链连接到主链
+    # 阻断链 (filter 表) 必须在最前面
     iptables -I INPUT 1 -j $BLOCK_CHAIN
-    iptables -I INPUT 2 -j WSS_USER_TRAFFIC_IN
-    iptables -I OUTPUT 1 -j WSS_USER_TRAFFIC_OUT
     
-    # 4. 保存规则
+    # 流量统计链 (迁移到 mangle 表)
+    iptables -t mangle -I PREROUTING 1 -j $TRAFFIC_IN_CHAIN
+    iptables -t mangle -I OUTPUT 1 -j $TRAFFIC_OUT_CHAIN
+    
+    # 5. 保存规则
     if command -v iptables-save >/dev/null; then
         iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
         echo "IPTABLES 规则已保存到 /etc/iptables/rules.v4。"
     fi
 
-    echo "IPTABLES 流量统计和实时阻断链创建/清理完成，已连接到 INPUT/OUTPUT。"
+    echo "IPTABLES 流量统计规则已迁移到 mangle 表，实时阻断功能已启用。"
 }
 
-# 2. 流量同步 Python 脚本 (新增 IP 清理逻辑)
+# 2. 流量同步 Python 脚本 (增强错误追踪)
 tee /usr/local/bin/wss_traffic_sync.py > /dev/null <<EOF
 # -*- coding: utf-8 -*-
 import json
@@ -1769,6 +1795,7 @@ PANEL_PORT = "$PANEL_PORT"
 API_URL_UPDATE = f"http://127.0.0.1:{PANEL_PORT}/api/users/update_traffic"
 IPTABLES_CHAIN_IN = "WSS_USER_TRAFFIC_IN"
 IPTABLES_CHAIN_OUT = "WSS_USER_TRAFFIC_OUT"
+IPTABLES_TABLE = "mangle" 
 
 # IP 不活跃阈值：3600秒 = 1小时
 STALE_IP_THRESHOLD = 3600 
@@ -1777,194 +1804,179 @@ STALE_IP_THRESHOLD = 3600
 def safe_run_command(command, input_data=None):
     try:
         result = subprocess.run(
-            command,
-            check=False,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            input=input_data,
-            timeout=5
+            command, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            input=input_data, timeout=5
         )
         return True, result.stdout.decode('utf-8').strip()
     except Exception:
         return False, ""
 
 def load_data(path, default_value):
-    if not os.path.exists(path):
-        return default_value
+    if not os.path.exists(path): return default_value
     try:
-        with open(path, 'r') as f:
-            return json.load(f)
-    except Exception:
-        return default_value
+        with open(path, 'r') as f: return json.load(f)
+    except Exception: return default_value
 
 def save_data(data, path):
     try:
-        with open(path, 'w') as f:
-            json.dump(data, f, indent=4)
+        with open(path, 'w') as f: json.dump(data, f, indent=4)
         return True
-    except Exception:
-        return False
+    except Exception: return False
 
 def load_users(): return load_data(USER_DB_PATH, [])
 def load_active_ips(): return load_data(IP_ACTIVE_DB_PATH, {})
 def save_active_ips(active_ips): return save_data(active_ips, IP_ACTIVE_DB_PATH)
+def bytes_to_gb(bytes_val): return bytes_val / (1024 * 1024 * 1024)
 
-def bytes_to_gb(bytes_val):
-    return bytes_val / (1024 * 1024 * 1024)
-
-# --- IP 清理函数 (新增) ---
+# --- IP 清理函数 (保留 V5.9 不变) ---
 def clean_stale_ips():
-    """清理 ip_active.json 中超过 STALE_IP_THRESHOLD 秒不活跃的 IP 记录."""
     active_ips = load_active_ips()
     now = time.time()
     updated = False
     
     ips_to_delete = []
     for ip, data in active_ips.items():
-        if (now - data.get('last_seen', 0)) > STALE_IP_THRESHOLD:
-            ips_to_delete.append(ip)
+        if (now - data.get('last_seen', 0)) > STALE_IP_THRESHOLD: ips_to_delete.append(ip)
             
     for ip in ips_to_delete:
         del active_ips[ip]
         updated = True
         
-    if updated:
-        save_active_ips(active_ips)
-        # print(f"Cleaned {len(ips_to_delete)} stale IP records.")
-
+    if updated: save_active_ips(active_ips)
 
 # --- Core Logic (IPTables Setup and Reading) ---
 
 def setup_iptables_rules(users):
-    """根据用户列表设置/更新 iptables 流量统计规则 (清空链并重建规则)."""
+    """根据用户列表设置/更新 iptables 流量统计规则 (清空 mangle 表链并重建规则)."""
     
-    safe_run_command(['iptables', '-F', IPTABLES_CHAIN_IN])
-    safe_run_command(['iptables', '-F', IPTABLES_CHAIN_OUT])
+    safe_run_command(['iptables', '-t', IPTABLES_TABLE, '-F', IPTABLES_CHAIN_IN])
+    safe_run_command(['iptables', '-t', IPTABLES_TABLE, '-F', IPTABLES_CHAIN_OUT])
 
     for user in users:
         username = user['username']
         
         success, uid = safe_run_command(['id', '-u', username])
-        if not success or not uid.isdigit():
+        if not success or not uid.isdigit(): 
+            print(f"ERROR: Failed to get UID for user {username}")
             continue
 
-        # INPUT: 目标端口 48303 (SSH) - 客户端发来的数据
-        safe_run_command([
-            'iptables', '-A', IPTABLES_CHAIN_IN, 
-            '-p', 'tcp', '--dport', '48303', 
-            '-m', 'owner', '--uid-owner', uid, 
-            '-j', 'ACCEPT'
-        ])
+        # --- WSS_USER_TRAFFIC_IN: 匹配所有 dport 48303 的流量 (IN/OUT 总流量) ---
+        cmd_in = ['iptables', '-t', IPTABLES_TABLE, '-A', IPTABLES_CHAIN_IN, '-p', 'tcp', '--dport', '48303', '-j', 'ACCEPT']
+        success_in, output_in = safe_run_command(cmd_in)
+        if not success_in:
+            print(f"ERROR: Failed to insert IN rule for {username}: {output_in}")
+
+        # --- WSS_USER_TRAFFIC_OUT: 匹配与该用户关联的返回流量 (精确下载量) ---
+        cmd_out = ['iptables', '-t', IPTABLES_TABLE, '-A', IPTABLES_CHAIN_OUT, '-p', 'tcp', '--sport', '48303', '-m', 'owner', '--uid-owner', uid, '-j', 'ACCEPT']
+        success_out, output_out = safe_run_command(cmd_out)
+        if not success_out:
+            print(f"ERROR: Failed to insert OUT rule for {username}: {output_out}")
         
-        # OUTPUT: 源端口 48303 (SSH) - 客户端收到的数据
-        safe_run_command([
-            'iptables', '-A', IPTABLES_CHAIN_OUT, 
-            '-p', 'tcp', '--sport', '48303', 
-            '-m', 'owner', '--uid-owner', uid, 
-            '-j', 'ACCEPT'
-        ])
-        
-    safe_run_command(['iptables', '-A', IPTABLES_CHAIN_IN, '-j', 'RETURN'])
-    safe_run_command(['iptables', '-A', IPTABLES_CHAIN_OUT, '-j', 'RETURN'])
+    safe_run_command(['iptables', '-t', IPTABLES_TABLE, '-A', IPTABLES_CHAIN_IN, '-j', 'RETURN'])
+    safe_run_command(['iptables', '-t', IPTABLES_TABLE, '-A', IPTABLES_CHAIN_OUT, '-j', 'RETURN'])
 
 
 def read_and_report_traffic():
     """读取 iptables 计数器并调用 Flask API 更新流量."""
     users = load_users()
-    if not users:
-        return
+    if not users: return
 
-    # 1. 确保 IPTABLES 流量规则是最新的
     setup_iptables_rules(users)
 
-    # 2. 读取 IPTABLES 计数器
-    success, output = safe_run_command(['iptables-save', '-c'])
-    if not success:
-        return
+    success_in, output_in = safe_run_command(['iptables', '-t', IPTABLES_TABLE, '-L', IPTABLES_CHAIN_IN, '-v', '-n'])
+    success_out, output_out = safe_run_command(['iptables', '-t', IPTABLES_TABLE, '-L', IPTABLES_CHAIN_OUT, '-v', '-n'])
+    
+    if not success_in or not success_out: return
 
     traffic_data = {}
-    
     uid_to_username = {}
     for user in users:
         success_uid, uid = safe_run_command(['id', '-u', user['username']])
-        if success_uid and uid.isdigit():
-            uid_to_username[uid] = user['username']
+        if success_uid and uid.isdigit(): uid_to_username[uid] = user['username']
 
-    for line in output.split('\n'):
-        if ('owner' in line) and ('ACCEPT' in line):
+    # --- 解析 IN 链 (PREROUTING, dport 48303) - 捕获 INPUT 总流量 ---
+    total_in_bytes = 0
+    
+    for line in output_in.split('\n'):
+        if 'dport 48303' in line and 'ACCEPT' in line:
             try:
-                parts = line.split('[')[1].split(']')
-                total_bytes = int(parts[0].split(':')[1])
-                uid = line.split('--uid-owner')[1].split()[0]
+                parts = line.split()
+                total_in_bytes = int(parts[1])
+                break
+            except Exception: continue
+            
+    # --- 解析 OUT 链 (OUTPUT, sport 48303) - 捕获精确的用户下载流量 ---
+    for line in output_out.split('\n'):
+        if 'sport 48303' in line and 'owner UID match' in line:
+            try:
+                parts = line.split()
+                total_bytes = int(parts[1])
+                uid = parts[-1] 
                 
-                if uid not in uid_to_username:
-                    continue
-
+                if uid not in uid_to_username: continue
                 username = uid_to_username[uid]
                 
-                if username not in traffic_data:
-                    traffic_data[username] = {'in': 0, 'out': 0, 'uid': uid}
+                if username not in traffic_data: traffic_data[username] = {'in': 0, 'out': 0, 'uid': uid}
                 
-                if IPTABLES_CHAIN_IN in line and 'dport 48303' in line:
-                    traffic_data[username]['in'] += total_bytes
-                elif IPTABLES_CHAIN_OUT in line and 'sport 48303' in line:
-                    traffic_data[username]['out'] += total_bytes
-                    
-            except Exception:
-                continue
+                traffic_data[username]['out'] += total_bytes
+
+            except Exception: continue
+
 
     # 3. 计算并上报流量，然后清零计数器
     for user in users:
         username = user['username']
         current_used_gb = user.get('used_traffic_gb', 0.0)
         
-        if username not in traffic_data:
-             continue
+        out_bytes = traffic_data.get(username, {}).get('out', 0)
         
-        in_bytes = traffic_data[username].get('in', 0)
-        out_bytes = traffic_data[username].get('out', 0)
+        # 核心逻辑：由于 IN 链无法精确区分用户，将其总和分配给唯一用户。
+        in_bytes = 0
+        if len(users) == 1 and users[0]['username'] == username:
+             in_bytes = total_in_bytes
+
         total_transfer_bytes = in_bytes + out_bytes
+        
+        if total_transfer_bytes == 0: continue 
         
         new_used_gb = current_used_gb + bytes_to_gb(total_transfer_bytes)
         rounded_gb = round(new_used_gb, 2)
-        uid = traffic_data[username]['uid']
+        uid = safe_run_command(['id', '-u', username])[1] 
         
-        payload_json = {
-            "username": username,
-            "used_traffic_gb": rounded_gb
-        }
+        payload_json = {"username": username, "used_traffic_gb": rounded_gb}
 
+        # --- 错误追踪增强：捕获网络请求失败 ---
         try:
             response = requests.post(API_URL_UPDATE, json=payload_json, timeout=3)
             response_json = response.json()
             
             if response.status_code == 200 and response_json.get('success'):
-                # 成功上报后清零计数器
+                # 成功上报后清零 mangle 表的计数器
                 safe_run_command([
-                    'iptables', '-Z', IPTABLES_CHAIN_IN, 
-                    '-p', 'tcp', '--dport', '48303', 
-                    '-m', 'owner', '--uid-owner', uid
+                    'iptables', '-t', IPTABLES_TABLE, '-Z', IPTABLES_CHAIN_IN, 
+                    '-p', 'tcp', '--dport', '48303'
                 ])
                 safe_run_command([
-                    'iptables', '-Z', IPTABLES_CHAIN_OUT, 
-                    '-p', 'tcp', '--sport', '48303', 
-                    '-m', 'owner', '--uid-owner', uid
+                    'iptables', '-t', IPTABLES_TABLE, '-Z', IPTABLES_CHAIN_OUT, 
+                    '-p', 'tcp', '--sport', '48303', '-m', 'owner', '--uid-owner', uid
                 ])
+            else:
+                 # API 调用成功，但 Flask 返回了错误 (e.g., 400/500)
+                 print(f"API ERROR: Failed to update {username}. HTTP Status: {response.status_code}. Response: {response.text}")
             
-        except requests.exceptions.RequestException:
-            pass
+        except requests.exceptions.RequestException as e:
+            # 网络请求完全失败 (e.g., Connection refused)
+            print(f"NETWORK ERROR: Failed to reach Flask API for {username}: {str(e)}")
 
 
 if __name__ == '__main__':
-    # 步骤 1: 清理不活跃 IP 记录
     clean_stale_ips()
-    # 步骤 2: 读取和报告流量
     read_and_report_traffic()
 EOF
 
 chmod +x /usr/local/bin/wss_traffic_sync.py
 
-# 3. 创建定时任务 (Cron Job) 运行流量同步脚本 (ExecStart 更新为 VENV 路径)
+# 3. 创建定时任务 (Cron Job) 运行流量同步脚本 (保留 V5.9 不变)
 echo "==== 设置 Cron 定时任务 (每 5 分钟同步一次流量, 使用 VENV 隔离环境) ===="
 
 mkdir -p /etc/cron.d
@@ -1988,27 +2000,33 @@ echo "----------------------------------"
 setup_iptables_chains
 
 
-# --- 7. SSHD 安全配置 (保留不变) ---
+# --- 7. SSHD 安全配置 (核心修改：添加 ClientAliveInterval) ---
 SSHD_CONFIG="/etc/ssh/sshd_config"
 BACKUP_SUFFIX=".bak.wss$(date +%s)"
 SSHD_SERVICE=$(systemctl list-units --full -all | grep -E "sshd\.service|ssh\.service" | grep -v "not-found" | head -n 1 | awk '{print $1}' | cut -d'.' -f1 || echo "sshd")
 
-echo "==== 配置 SSHD 安全策略 ===="
+echo "==== 配置 SSHD 安全策略 (增强连接稳定性) ===="
 cp -a "$SSHD_CONFIG" "${SSHD_CONFIG}${BACKUP_SUFFIX}"
 echo "SSHD 配置已备份到 ${SSHD_CONFIG}${BACKUP_SUFFIX}"
 
+# 1. 删除旧的 WSS 匹配配置段
 sed -i '/# WSS_TUNNEL_BLOCK_START/,/# WSS_TUNNEL_BLOCK_END/d' "$SSHD_CONFIG"
 
+# 2. 写入新的 WSS 隧道策略 (增加 ClientAliveInterval)
 cat >> "$SSHD_CONFIG" <<EOF
 
-# WSS_TUNNEL_BLOCK_START -- managed by deploy_wss_panel.sh
+# WSS_TUNNEL_BLOCK_START -- managed by deploy_wss_panel.sh (V5.18)
+# 统一策略: 允许所有用户通过本机 (127.0.0.1, ::1) 使用密码进行认证。
 Match Address 127.0.0.1,::1
     PasswordAuthentication yes
     PermitTTY no
     X11Forwarding no
     AllowTcpForwarding yes
     ForceCommand /bin/false
-# WSS_TUNNEL_BLOCK_END -- managed by deploy_wss_panel.sh
+    # 增加连接活跃检查，防止连接因闲置被断开
+    ClientAliveInterval 30
+    ClientAliveCountMax 120
+# WSS_TUNNEL_BLOCK_END -- managed by deploy_wss_panel.sh (V5.18)
 
 EOF
 
@@ -2017,37 +2035,20 @@ chmod 600 "$SSHD_CONFIG"
 echo "重新加载并重启 ssh 服务 ($SSHD_SERVICE)"
 systemctl daemon-reload
 systemctl restart "$SSHD_SERVICE"
-echo "SSHD 配置更新完成。"
+echo "SSHD 配置更新完成，连接稳定性已增强。"
 echo "----------------------------------"
 
 # 清理敏感变量
 unset PANEL_ROOT_PASS_RAW
 
 echo "=================================================="
-echo "✅ WSS 管理面板部署完成！ (V5.7 审计日志/实时阻断生效)"
+echo "✅ WSS 管理面板部署完成！ (V5.18 流量追踪增强)"
 echo "=================================================="
 echo ""
-echo "🔥 基础设施已启动。面板管理操作已启用审计日志。"
-echo "🌐 审计日志路径: /etc/wss-panel/audit.log"
-echo ""
-echo "--- 访问信息 ---"
-echo "Web 面板地址: http://$SERVER_IP:$PANEL_PORT"
-echo "Web 面板用户名: root"
-echo "Web 面板密码: [您刚才设置的密码]"
-echo ""
-echo "--- 端口状态检查 ---"
-echo "WSS (HTTP/WebSocket): $WSS_HTTP_PORT"
-check_port "$WSS_HTTP_PORT"
-echo "WSS (TLS/WebSocket): $WSS_TLS_PORT"
-check_port "$WSS_TLS_PORT"
-echo "Stunnel (TLS 隧道): $STUNNEL_PORT"
-check_port "$STUNNEL_PORT"
-echo "面板端口 (Flask): $PANEL_PORT"
-check_port "$PANEL_PORT"
-
-echo ""
-echo "--- 故障排查/日志命令 ---"
-echo "WSS 核心代理状态: sudo systemctl status wss -l"
-echo "Web 面板状态: sudo systemctl status wss_panel -l"
-echo "审计日志命令: cat /etc/wss-panel/audit.log | tail -n 20"
+echo "✨ 脚本已更新，现在任何流量同步失败都会被记录。"
+echo "🚨 请立即执行以下操作来查找错误："
+echo "1. 产生流量，然后手动执行同步脚本："
+echo "   sudo $PYTHON_VENV_PATH /usr/local/bin/wss_traffic_sync.py"
+echo "2. 立即查看 Journalctl 日志，查找 'NETWORK ERROR' 或 'API ERROR'："
+echo "   sudo journalctl -u wss_panel -n 50 --no-pager"
 echo "=================================================="
