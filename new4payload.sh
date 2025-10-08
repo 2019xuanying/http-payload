@@ -2,8 +2,7 @@
 set -eu
 
 # =======================================================
-# WSS 隧道/Stunnel/管理面板部署脚本 V6.2 - 优化版 (集成 uvloop, SSH端口可配置)
-# 变更: 性能优化 (uvloop)，可配置 SSH 目标端口，代码精简。
+# WSS 隧道/Stunnel/管理面板部署脚本
 # =======================================================
 
 # --- 全局变量和工具函数 ---
@@ -403,13 +402,13 @@ echo "==== 部署 WSS 用户管理面板 (Python/Flask) V6.2 优化版 ===="
 PANEL_DIR="/etc/wss-panel"
 USER_DB="$PANEL_DIR/users.json"
 IP_BANS_DB="$PANEL_DIR/ip_bans.json"
-IP_ACTIVE_DB="$PANEL_DIR/ip_active.json"
 ROOT_HASH_FILE="$PANEL_DIR/root_hash.txt"
 
 mkdir -p "$PANEL_DIR"
 
 [ ! -f "$IP_BANS_DB" ] && echo "{}" > "$IP_BANS_DB"
-[ ! -f "$IP_ACTIVE_DB" ] && echo "{}" > "$IP_ACTIVE_DB"
+# 移除 IP_ACTIVE_DB 的创建，因为我们使用实时查询
+
 if [ ! -f "$ROOT_HASH_FILE" ]; then
     echo "$PANEL_ROOT_PASS_HASH" > "$ROOT_HASH_FILE"
 fi
@@ -467,7 +466,7 @@ import psutil
 PANEL_DIR = "/etc/wss-panel"
 USER_DB_PATH = os.path.join(PANEL_DIR, "users.json")
 IP_BANS_DB_PATH = os.path.join(PANEL_DIR, "ip_bans.json")
-IP_ACTIVE_DB_PATH = os.path.join(PANEL_DIR, "ip_active.json")
+# 移除了 IP_ACTIVE_DB_PATH，改为实时查询
 AUDIT_LOG_PATH = os.path.join(PANEL_DIR, "audit.log")
 ROOT_HASH_FILE = os.path.join(PANEL_DIR, "root_hash.txt")
 
@@ -525,8 +524,7 @@ def load_users(): return load_data(USER_DB_PATH, [])
 def save_users(users): return save_data(users, USER_DB_PATH)
 def load_ip_bans(): return load_data(IP_BANS_DB_PATH, {})
 def save_ip_bans(ip_bans): return save_data(ip_bans, IP_BANS_DB_PATH)
-def load_active_ips(): return load_data(IP_ACTIVE_DB_PATH, {})
-def save_active_ips(active_ips): return save_data(active_ips, IP_ACTIVE_DB_PATH)
+# 移除了 load_active_ips 和 save_active_ips
 def get_user(username):
     users = load_users()
     for i, user in enumerate(users):
@@ -617,7 +615,7 @@ def sync_user_status(user):
             if expiry_dt.date() < datetime.now().date(): is_expired_or_exceeded = True
         except ValueError: print(f"Invalid expiry_date format for {username}: {user['expiry_date']}")
 
-    # 检查并发限制
+    # 检查并发限制 (使用 ss 命令检查活跃连接数)
     current_conn_count = 0
     max_connections = user.get('max_connections', MAX_CONN_DEFAULT)
     is_over_limit = False
@@ -627,6 +625,7 @@ def sync_user_status(user):
         if success and uid.isdigit():
             # 检查用户 uid 拥有的所有到 SSH_TARGET_PORT 的 established TCP 连接
             result = subprocess.run(['ss', '-t', '-n', '-o', 'state', 'established', 'dport', str(SSH_TARGET_PORT), 'user', str(uid)], capture_output=True, text=True, timeout=2)
+            # ss 命令输出的第一行是标题，所以要减去 1
             current_conn_count = len(result.stdout.strip().split('\n')) - 1 if result.stdout.strip() and len(result.stdout.strip().split('\n')) > 1 else 0
     except Exception:
         current_conn_count = 0
@@ -691,6 +690,46 @@ def get_service_status(service):
     except Exception:
         return 'failed'
 
+# --- 实时连接查询函数 (NEW) ---
+def get_live_connections_for_user(username, target_port):
+    """使用 ss 命令获取指定用户连接到目标端口的实时远程 IP和计数。"""
+    try:
+        success, uid = safe_run_command(['id', '-u', username])
+        if not success or not uid.isdigit():
+            return {}
+        
+        # 使用 ss 命令获取 Established 状态的连接，过滤到目标端口，并按用户ID过滤
+        command = ['ss', '-t', '-n', '-o', 'state', 'established', 'dport', str(target_port), 'user', str(uid)]
+        success_ss, output_ss = safe_run_command(command)
+        
+        if not success_ss:
+            return {}
+            
+        active_ips = {}
+        lines = output_ss.strip().split('\n')
+        
+        # 跳过标题行
+        if len(lines) > 0 and 'Netid' in lines[0]:
+            lines.pop(0)
+
+        for line in lines:
+            if not line.strip(): continue
+            parts = line.split()
+            # 远程地址/端口通常在第 5 列 (index 4)
+            if len(parts) > 4 and ':' in parts[4]:
+                remote_addr_port = parts[4]
+                # 提取 IP (例如 1.2.3.4:5678 -> 1.2.3.4)
+                client_ip = remote_addr_port.rsplit(':', 1)[0]
+                active_ips[client_ip] = active_ips.get(client_ip, 0) + 1
+        
+        # 返回格式兼容 get_active_ips_api
+        return {ip: {'count': count, 'last_seen': int(time.time())} for ip, count in active_ips.items()}
+        
+    except Exception as e:
+        print(f"Error checking live connections for {username}: {e}")
+        return {}
+
+
 # --- Web 路由所需的渲染函数 ---
 
 _DASHBOARD_HTML = """
@@ -717,7 +756,7 @@ _DASHBOARD_HTML = """
 <body class="bg-gray-50 min-h-screen">
     <div class="bg-indigo-600 text-white shadow-lg">
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
-            <h1 class="text-3xl font-bold">WSS 隧道管理面板 </h1>
+            <h1 class="text-3xl font-bold">WSS 隧道管理面板 V6.2 (优化版)</h1>
             <div class="flex space-x-3">
                 <button onclick="openRootPasswordModal()" class="bg-indigo-700 hover:bg-indigo-800 px-4 py-2 rounded-lg font-semibold shadow-md btn-action">
                     修改 Root 密码
@@ -1258,15 +1297,18 @@ _DASHBOARD_HTML = """
                         const isBanned = ipInfo.is_banned;
                         const actionText = isBanned ? '解除封禁' : '封禁';
                         const actionClass = isBanned ? 'bg-green-500 hover:bg-green-600' : 'bg-red-500 hover:bg-red-600';
-                        const statusText = isBanned ? '已封禁' : (ipInfo.count > 0 ? '活跃' : '已记录');
+                        // 根据 count 判断是否实时活跃，is_banned 优先
+                        const statusText = isBanned ? '已封禁' : (ipInfo.count > 0 ? '活跃' : '已记录 (无连接)');
                         const statusClass = isBanned ? 'bg-red-100 text-red-800' : (ipInfo.count > 0 ? 'bg-green-100 text-green-800' : 'bg-gray-200 text-gray-800');
+                        
+                        const lastSeen = ipInfo.count > 0 ? 'LIVE' : 'N/A'; // 仅显示 LIVE 或 N/A
 
                         return \`
                             <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between p-3 bg-gray-50 rounded-lg shadow-sm border border-gray-200">
                                 <div class="font-mono text-sm text-gray-800 mb-2 sm:mb-0">
                                     <strong>\${ipInfo.ip}</strong> 
                                     <span class="ml-2 px-2 text-xs leading-5 font-semibold rounded-full \${statusClass}">\${statusText}</span>
-                                    <span class="text-xs text-gray-500 block sm:inline"> | 连接数: \${ipInfo.count} | 最后活动: \${ipInfo.last_seen_display}</span>
+                                    <span class="text-xs text-gray-500 block sm:inline"> | 连接数: \${ipInfo.count} | 状态: \${lastSeen}</span>
                                 </div>
                                 <button onclick="toggleIPBan('\${username}', '\${ipInfo.ip}', \${isBanned})"
                                         class="text-xs text-white px-3 py-1 rounded-full font-semibold btn-action \${actionClass}">
@@ -1631,6 +1673,7 @@ def delete_user_api():
     
     ip_bans = load_ip_bans()
     if username in ip_bans:
+        # 清除 IPTABLES 规则
         for ip in ip_bans[username]: toggle_iptables_ip_ban(ip, 'unblock')
         ip_bans.pop(username)
         save_ip_bans(ip_bans)
@@ -1836,10 +1879,7 @@ def block_ip_api():
         
     success_iptables, iptables_output = toggle_iptables_ip_ban(ip, 'block')
     
-    active_ips = load_active_ips()
-    if ip in active_ips:
-        active_ips.pop(ip)
-        save_active_ips(active_ips)
+    # 移除了清理 active_ips 的逻辑
         
     if success_iptables:
         log_action("IP_BLOCK_SUCCESS", session.get('username', 'root'), f"Blocked IP {ip} for user {username}")
@@ -1881,22 +1921,25 @@ def get_active_ips_api():
     
     if not username: return jsonify({"success": False, "message": "缺少用户名"}), 400
 
-    active_ips = load_active_ips()
+    # 1. 获取实时连接信息
+    live_connections = get_live_connections_for_user(username, SSH_TARGET_PORT)
+    
+    # 2. 获取面板中的 IP 封禁列表
     ip_bans = load_ip_bans()
     banned_ips_for_user = ip_bans.get(username, [])
     
+    # 3. 合并实时连接 IP 和被封禁 IP 列表
+    all_ips = set(live_connections.keys()) | set(banned_ips_for_user)
+
     filtered_ips = []
     
-    all_ips = set(active_ips.keys()) | set(banned_ips_for_user)
-
     for ip in all_ips:
-        data = active_ips.get(ip, {'count': 0, 'last_seen': 0})
-        last_seen_display = 'N/A'
-        if data['last_seen'] > 0:
-             last_seen_dt = datetime.fromtimestamp(data['last_seen'])
-             last_seen_display = last_seen_dt.strftime('%H:%M:%S')
+        data = live_connections.get(ip, {'count': 0, 'last_seen': 0})
         
         is_banned = ip in banned_ips_for_user
+        
+        # 兼容前端格式，但 last_seen 仅用于指示活跃状态
+        last_seen_display = 'LIVE' if data['count'] > 0 else 'N/A' 
         
         filtered_ips.append({
             'ip': ip, 'count': data['count'], 'last_seen_display': last_seen_display,
@@ -1950,24 +1993,42 @@ echo "----------------------------------"
 # --- 6. 部署 IPTABLES 阻断链设置 ---
 
 setup_iptables_chains() {
-    echo "==== 配置 IPTABLES IP 实时阻断链 ===="
+    echo "==== 配置 IPTABLES 规则 (开放服务端口并设置 IP 阻断链) ===="
     
     BLOCK_CHAIN="WSS_IP_BLOCK"
     
+    # 清理旧的 WSS 链和规则
     iptables -D INPUT -j $BLOCK_CHAIN 2>/dev/null || true
     iptables -F $BLOCK_CHAIN 2>/dev/null || true
     iptables -X $BLOCK_CHAIN 2>/dev/null || true
-
-    iptables -N $BLOCK_CHAIN 2>/dev/null || true 
-
-    iptables -I INPUT 1 -j $BLOCK_CHAIN
     
+    # 允许 loopback 接口
+    iptables -A INPUT -i lo -j ACCEPT
+    # 允许已建立的和相关的连接
+    iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+    # 1. 创建并插入 IP 阻断链 (必须在端口开放规则之前，以实现实时封禁)
+    iptables -N $BLOCK_CHAIN 2>/dev/null || true 
+    iptables -I INPUT 1 -j $BLOCK_CHAIN # 插入到最前面
+
+    # 2. 开放 TCP 服务端口
+    echo "开放 TCP 端口: $WSS_HTTP_PORT(HTTP), $WSS_TLS_PORT(TLS), $STUNNEL_PORT(Stunnel), $PANEL_PORT(Panel)"
+    iptables -A INPUT -p tcp --dport $WSS_HTTP_PORT -j ACCEPT
+    iptables -A INPUT -p tcp --dport $WSS_TLS_PORT -j ACCEPT
+    iptables -A INPUT -p tcp --dport $STUNNEL_PORT -j ACCEPT
+    iptables -A INPUT -p tcp --dport $PANEL_PORT -j ACCEPT
+
+    # 3. 开放 UDPGW 端口
+    echo "开放 UDP 端口: $UDPGW_PORT(UDPGW)"
+    iptables -A INPUT -p udp --dport $UDPGW_PORT -j ACCEPT
+    
+    # 4. 保存规则
     if command -v iptables-save >/dev/null; then
         iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
         echo "IPTABLES 规则已保存到 /etc/iptables/rules.v4。"
     fi
 
-    echo "IPTABLES IP 阻断功能已启用。"
+    echo "IPTABLES 规则更新完成，所有服务端口已开放。"
 }
 
 setup_iptables_chains
@@ -2017,8 +2078,9 @@ echo "----------------------------------"
 unset PANEL_ROOT_PASS_RAW
 
 echo "=================================================="
-echo "✅ WSS 管理面板部署完成！ (V6.2 优化版)"
+echo "✅ WSS 管理面板部署完成！"
 echo "=================================================="
 echo "WSS 核心代理已集成 uvloop，性能提升显著。"
 echo "SSH 隧道目标端口已配置为: $SSH_TARGET_PORT"
+echo "面板访问端口: $PANEL_PORT (已在防火墙中开放)"
 echo "=================================================="
