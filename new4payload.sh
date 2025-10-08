@@ -2,8 +2,8 @@
 set -eu
 
 # =======================================================
-# WSS 隧道/Stunnel/管理面板部署脚本 V6.2 - 修复 Payload 阻塞和超时
-# 变更: 优化 WSS 核心代理的异步读取循环，增强对分块 Payload 的兼容性。
+# WSS 隧道/Stunnel/管理面板部署脚本 V6.2 - 优化版 (集成 uvloop, SSH端口可配置)
+# 变更: 性能优化 (uvloop)，可配置 SSH 目标端口，代码精简。
 # =======================================================
 
 # --- 全局变量和工具函数 ---
@@ -41,10 +41,13 @@ echo "检测到的服务器 IP: $SERVER_IP"
 VENV_PATH="/opt/wss_venv"
 PYTHON_VENV_PATH="$VENV_PATH/bin/python3"
 
-
 # --- 1. 端口和面板密码配置 ---
 echo "----------------------------------"
 echo "==== WSS 基础设施端口配置 ===="
+read -p "请输入 SSH 目标端口 (WSS/Stunnel 转发到此, 默认22): " SSH_TARGET_PORT
+SSH_TARGET_PORT=${SSH_TARGET_PORT:-22}
+echo "内部 SSH 目标端口: $SSH_TARGET_PORT"
+
 read -p "请输入 WSS HTTP 监听端口 (默认80): " WSS_HTTP_PORT
 WSS_HTTP_PORT=${WSS_HTTP_PORT:-80}
 
@@ -82,21 +85,20 @@ done
 echo "----------------------------------"
 echo "==== 系统更新与依赖安装 (VENV 隔离) ===="
 apt update -y
-# 移除了编译依赖
-apt install -y python3 python3-pip python3-venv wget curl git net-tools openssl stunnel4 iptables-persistent procps cmake build-essential # 确保编译环境存在
+apt install -y python3 python3-pip python3-venv wget curl git net-tools openssl stunnel4 iptables-persistent procps cmake build-essential
 
 echo "创建 Python 虚拟环境于 $VENV_PATH"
 mkdir -p "$VENV_PATH"
 python3 -m venv "$VENV_PATH"
 
 echo "在 VENV 中安装 Python 依赖..."
-"$PYTHON_VENV_PATH" -m pip install flask jinja2 requests httpx psutil
+"$PYTHON_VENV_PATH" -m pip install flask jinja2 requests httpx psutil uvloop
 
 echo "依赖安装完成，使用隔离环境路径: $VENV_PATH"
 echo "----------------------------------"
 
 
-# --- 2. WSS 核心代理脚本 (目标端口 24355) ---
+# --- 2. WSS 核心代理脚本 (目标端口 $SSH_TARGET_PORT) ---
 echo "==== 安装 WSS 核心代理脚本 (/usr/local/bin/wss) ===="
 tee /usr/local/bin/wss > /dev/null <<EOF
 #!/usr/bin/python3
@@ -106,7 +108,12 @@ import asyncio
 import ssl
 import sys
 import os
-import httpx 
+import httpx
+try:
+    import uvloop
+    UVLOOP_AVAILABLE = True
+except ImportError:
+    UVLOOP_AVAILABLE = False
 
 # --- 配置 ---
 LISTEN_ADDR = '0.0.0.0'
@@ -118,8 +125,12 @@ try:
     TLS_PORT = int(sys.argv[2])
 except (IndexError, ValueError):
     TLS_PORT = 443
+try:
+    SSH_TARGET_PORT = int(sys.argv[3])
+except (IndexError, ValueError):
+    SSH_TARGET_PORT = 22
 
-DEFAULT_TARGET = ('127.0.0.1', 24355) # **已统一为 24355**
+DEFAULT_TARGET = ('127.0.0.1', SSH_TARGET_PORT)
 BUFFER_SIZE = 65536
 TIMEOUT = 3600
 CERT_FILE = '/etc/stunnel/certs/stunnel.pem'
@@ -131,7 +142,7 @@ FIRST_RESPONSE = b'HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\nContent-Le
 SWITCH_RESPONSE = b'HTTP/1.1 101 Switching Protocols\\r\\nUpgrade: websocket\\r\\nConnection: Upgrade\\r\\n\\r\\n'
 FORBIDDEN_RESPONSE = b'HTTP/1.1 403 Forbidden\\r\\nContent-Length: 0\\r\\n\\r\\n'
 
-http_client = httpx.AsyncClient(timeout=3.0) 
+http_client = httpx.AsyncClient(timeout=3.0)
 
 async def check_ip_status(client_ip):
     """检查 IP 是否被面板封禁."""
@@ -143,7 +154,6 @@ async def check_ip_status(client_ip):
         if response.status_code == 200:
             result = response.json()
             return not result.get('is_banned', False)
-        # 如果 API 失败，为安全起见默认允许
         return True
     except Exception:
         return True
@@ -151,13 +161,12 @@ async def check_ip_status(client_ip):
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
     peer = writer.get_extra_info('peername')
     client_ip = peer[0]
-    
+
     is_allowed = await check_ip_status(client_ip)
     if not is_allowed:
         writer.write(FORBIDDEN_RESPONSE)
         await writer.drain()
         writer.close()
-        # await writer.wait_closed() # 移除可能导致阻塞的调用
         return
 
     forwarding_started = False
@@ -165,41 +174,37 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
 
     try:
         while not forwarding_started:
-            # 缩短读取超时，避免在等待下一个分块时长时间阻塞
-            data = await asyncio.wait_for(reader.read(BUFFER_SIZE), timeout=5) 
+            data = await asyncio.wait_for(reader.read(BUFFER_SIZE), timeout=5)
             if not data:
                 break
-            
+
             full_request += data
-            
+
             header_end_index = full_request.find(b'\r\n\r\n')
-            
+
             if header_end_index == -1:
-                # 收到不完整的头部，发送 200 OK 后清除缓冲区，继续读取
-                writer.write(FIRST_RESPONSE) 
+                writer.write(FIRST_RESPONSE)
                 await writer.drain()
                 full_request = b''
                 continue
 
             headers_raw = full_request[:header_end_index]
             data_to_forward = full_request[header_end_index + 4:]
-            
-            headers = headers_raw.decode(errors='ignore') 
+
+            headers = headers_raw.decode(errors='ignore')
 
             is_websocket_request = 'Upgrade: websocket' in headers or 'Connection: Upgrade' in headers or 'GET-RAY' in headers
-            
+
             if is_websocket_request:
-                # 握手成功
                 writer.write(SWITCH_RESPONSE)
                 await writer.drain()
                 forwarding_started = True
             else:
-                # 非 WebSocket 请求，发送 200 OK 并关闭连接（或者继续尝试下一个分块，这里选择继续读取）
                 writer.write(FIRST_RESPONSE)
                 await writer.drain()
                 full_request = b''
                 continue
-        
+
         if not forwarding_started:
             raise Exception("Handshake failed or connection closed early")
 
@@ -209,12 +214,11 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         if data_to_forward:
             target_writer.write(data_to_forward)
             await target_writer.drain()
-            
+
         async def pipe(src_reader, dst_writer):
-            pipe_timeout = TIMEOUT 
+            pipe_timeout = TIMEOUT
             try:
                 while True:
-                    # 使用较长的 PIPE 超时
                     buf = await asyncio.wait_for(src_reader.read(BUFFER_SIZE), timeout=pipe_timeout)
                     if not buf:
                         break
@@ -236,9 +240,7 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
         pass
     finally:
         try:
-            # 确保客户端连接关闭
             writer.close()
-            # await writer.wait_closed() # 移除可能导致阻塞的调用
         except Exception:
             pass
 
@@ -253,10 +255,10 @@ async def main():
     except FileNotFoundError:
         print(f"WARNING: TLS certificate not found at {CERT_FILE}. TLS server disabled.")
         tls_task = asyncio.sleep(86400)
-        
+
     http_server = await asyncio.start_server(
         lambda r, w: handle_client(r, w, tls=False), LISTEN_ADDR, HTTP_PORT)
-    
+
     print(f"Listening on {LISTEN_ADDR}:{HTTP_PORT} (HTTP payload)")
 
     async with http_server:
@@ -266,27 +268,34 @@ async def main():
 
 if __name__ == '__main__':
     try:
-        os.environ['WSS_PANEL_PORT'] = "$PANEL_PORT" 
+        os.environ['WSS_PANEL_PORT'] = "$PANEL_PORT"
+        
+        # --- 集成 uvloop 提升性能 ---
+        if UVLOOP_AVAILABLE:
+            uvloop.install()
+            print("INFO: uvloop event loop installed for high performance.")
+        # ------------------------------
+        
         asyncio.run(main())
     except KeyboardInterrupt:
         print("WSS Proxy Stopped.")
     except Exception as e:
         print(f"FATAL ERROR: {e}")
-        
+
 EOF
 
 chmod +x /usr/local/bin/wss
 
-# 创建 WSS systemd 服务
+# 创建 WSS systemd 服务 (新增 SSH_TARGET_PORT 参数)
 tee /etc/systemd/system/wss.service > /dev/null <<EOF
 [Unit]
-Description=WSS Python Proxy (V6.2 Payload Fix)
+Description=WSS Python Proxy (V6.2 Optimized)
 After=network.target
 
 [Service]
 Type=simple
 Environment=WSS_PANEL_PORT=$PANEL_PORT
-ExecStart=$PYTHON_VENV_PATH /usr/local/bin/wss $WSS_HTTP_PORT $WSS_TLS_PORT
+ExecStart=$PYTHON_VENV_PATH /usr/local/bin/wss $WSS_HTTP_PORT $WSS_TLS_PORT $SSH_TARGET_PORT
 Restart=on-failure
 User=root
 
@@ -297,11 +306,12 @@ EOF
 systemctl daemon-reload
 systemctl enable wss || true
 systemctl restart wss || true
-echo "WSS 核心代理 (V6.2 Payload Fix) 已启动/重启，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
+echo "WSS 核心代理 (V6.2 优化版) 已启动/重启，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
+echo "转发目标端口: $SSH_TARGET_PORT"
 echo "----------------------------------"
 
 
-# --- 3. Stunnel4, UDPGW (统一目标端口 24355) ---
+# --- 3. Stunnel4, UDPGW (统一目标端口 $SSH_TARGET_PORT) ---
 echo "==== 检查/安装 Stunnel4 ===="
 mkdir -p /etc/stunnel/certs
 if [ ! -f "/etc/stunnel/certs/stunnel.pem" ]; then
@@ -329,14 +339,14 @@ socket = r:TCP_NODELAY=1
 
 [ssh-tls-gateway]
 accept = 0.0.0.0:$STUNNEL_PORT
-connect = 127.0.0.1:24355 # **已统一为 24355**
+connect = 127.0.0.1:$SSH_TARGET_PORT 
 cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.pem
 EOF
 
 systemctl enable stunnel4 || true
 systemctl restart stunnel4 || true
-echo "Stunnel4 配置已更新并重启，端口 $STUNNEL_PORT"
+echo "Stunnel4 配置已更新并重启，端口 $STUNNEL_PORT (转发至 $SSH_TARGET_PORT)"
 echo "----------------------------------"
 
 echo "==== 检查/安装 UDPGW ===="
@@ -344,8 +354,7 @@ if [ ! -f "/root/badvpn/badvpn-build/udpgw/badvpn-udpgw" ]; then
     echo "UDPGW 二进制文件不存在，开始编译..."
     if [ ! -d "/root/badvpn" ]; then
         echo "克隆 badvpn 仓库..."
-        # 注意: 依赖于 cmake/build-essential 已经安装
-        apt install -y cmake build-essential || true 
+        apt install -y cmake build-essential || true
         git clone https://github.com/ambrop72/badvpn.git /root/badvpn || { echo "ERROR: Git clone failed."; exit 1; }
     fi
     mkdir -p /root/badvpn/badvpn-build
@@ -389,19 +398,18 @@ echo "UDPGW 已启动/重启，端口: $UDPGW_PORT"
 echo "----------------------------------"
 
 
-# --- 4. 安装 WSS 用户管理面板 (V6.2) ---
-echo "==== 部署 WSS 用户管理面板 (Python/Flask) V6.2 ===="
+# --- 4. 安装 WSS 用户管理面板 (V6.2 优化版) ---
+echo "==== 部署 WSS 用户管理面板 (Python/Flask) V6.2 优化版 ===="
 PANEL_DIR="/etc/wss-panel"
 USER_DB="$PANEL_DIR/users.json"
-IP_BANS_DB="$PANEL_DIR/ip_bans.json" 
-IP_ACTIVE_DB="$PANEL_DIR/ip_active.json" 
-ROOT_HASH_FILE="$PANEL_DIR/root_hash.txt" 
+IP_BANS_DB="$PANEL_DIR/ip_bans.json"
+IP_ACTIVE_DB="$PANEL_DIR/ip_active.json"
+ROOT_HASH_FILE="$PANEL_DIR/root_hash.txt"
 
 mkdir -p "$PANEL_DIR"
 
 [ ! -f "$IP_BANS_DB" ] && echo "{}" > "$IP_BANS_DB"
 [ ! -f "$IP_ACTIVE_DB" ] && echo "{}" > "$IP_ACTIVE_DB"
-# 面板密码哈希文件：如果不存在，则写入初始哈希
 if [ ! -f "$ROOT_HASH_FILE" ]; then
     echo "$PANEL_ROOT_PASS_HASH" > "$ROOT_HASH_FILE"
 fi
@@ -409,7 +417,7 @@ fi
 if [ ! -f "$USER_DB" ]; then
     echo "[]" > "$USER_DB"
 else
-    # 简化升级逻辑，只保留并发限制和过期日期
+    # 简化升级逻辑
     python3 -c "
 import json
 import time
@@ -428,7 +436,6 @@ def upgrade_users():
         if 'status' not in user: 
             user['status'] = 'active'; user['expiry_date'] = ''
             updated = True
-        # 移除流量相关的字段
         for field in ['quota_gb', 'used_traffic_gb', 'last_check']:
             if field in user: del user[field]; updated = True
         if 'max_connections' not in user:
@@ -454,7 +461,7 @@ import jinja2
 from datetime import datetime
 import re
 from functools import wraps
-import psutil 
+import psutil
 
 # --- 配置 ---
 PANEL_DIR = "/etc/wss-panel"
@@ -465,8 +472,8 @@ AUDIT_LOG_PATH = os.path.join(PANEL_DIR, "audit.log")
 ROOT_HASH_FILE = os.path.join(PANEL_DIR, "root_hash.txt")
 
 ROOT_USERNAME = "root"
-MAX_CONN_DEFAULT = 3 
-SSH_TARGET_PORT = 24355 # **已统一为 24355**
+MAX_CONN_DEFAULT = 3
+SSH_TARGET_PORT = $SSH_TARGET_PORT
 
 PANEL_PORT = "$PANEL_PORT"
 WSS_HTTP_PORT = "$WSS_HTTP_PORT"
@@ -477,7 +484,7 @@ UDPGW_PORT = "$UDPGW_PORT"
 SERVER_IP = os.environ.get('SERVER_IP', '[Your Server IP]')
 
 app = Flask(__name__)
-app.secret_key = os.urandom(24).hex() # 每次重启会变化，但无碍
+app.secret_key = os.urandom(24).hex()
 
 # --- 数据库操作 / 日志 / 认证 / 系统工具函数 ---
 def load_data(path, default_value):
@@ -539,9 +546,7 @@ def get_recent_logs(n=20):
     try:
         if not os.path.exists(AUDIT_LOG_PATH):
             return ["日志文件不存在。"]
-        # 使用 tail -n 命令获取最后 n 行
         command = ['tail', '-n', str(n), AUDIT_LOG_PATH]
-        # 注意: 如果日志文件不存在，subprocess.run 可能会失败。try/except block 应该能处理。
         result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2)
         return result.stdout.decode('utf-8').strip().split('\n')
     except Exception:
@@ -552,20 +557,17 @@ def login_required(f):
     def decorated_function(*args, **kwargs):
         if 'logged_in' not in session or not session.get('logged_in'):
             log_action("LOGIN_ATTEMPT", "N/A", f"Access denied to {request.path}")
-            return redirect(url_for('login'))  
+            return redirect(url_for('login'))
         return f(*args, **kwargs)
     decorated_function.__name__ = f.__name__ + "_decorated"
     return decorated_function
 
 def safe_run_command(command, input_data=None):
-    """
-    安全运行系统命令。
-    FIX: 使用 input 关键字参数来传递标准输入数据，以避免 TypeError。
-    """
+    """安全运行系统命令。"""
     try:
         result = subprocess.run(
             command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            input=input_data, 
+            input=input_data,
             timeout=5
         )
         return True, result.stdout.decode('utf-8').strip()
@@ -573,28 +575,27 @@ def safe_run_command(command, input_data=None):
         return False, e.stderr.decode('utf-8').strip()
     except Exception as e:
         return False, str(e)
-        
+
 def toggle_iptables_ip_ban(ip, action):
-    """在 filter 表的 WSS_IP_BLOCK 链中添加或移除 IP 阻断规则，并保存规则。"""
+    """在 WSS_IP_BLOCK 链中添加或移除 IP 阻断规则，并保存规则。"""
     chain = "WSS_IP_BLOCK"
     if action == 'block':
-        safe_run_command(['iptables', '-D', chain, '-s', ip, '-j', 'DROP']) # 先删除可能存在的，防止重复
+        safe_run_command(['iptables', '-D', chain, '-s', ip, '-j', 'DROP'])
         command = ['iptables', '-I', chain, '1', '-s', ip, '-j', 'DROP']
     elif action == 'unblock':
         command = ['iptables', '-D', chain, '-s', ip, '-j', 'DROP']
     else: return False, "Invalid action"
-    
+
     success, output = safe_run_command(command)
-    
+
     if success or 'Bad rule' in output or 'No chain/target/match by that name' in output:
         try:
-            # 尝试保存规则
             with open('/etc/iptables/rules.v4', 'w') as f:
                 subprocess.run(['iptables-save'], stdout=f, check=True, timeout=3)
             return True, "IPTables rule updated and saved."
         except Exception:
             return True, "IPTables rule updated but failed to save persistence file."
-    
+
     return success, output
 
 def kill_user_sessions(username):
@@ -604,29 +605,28 @@ def kill_user_sessions(username):
 # --- 核心用户状态管理函数 ---
 
 def sync_user_status(user):
-    """根据到期日和并发限制同步系统账户状态 (usermod -L/-U, chage -E)."""
+    """根据到期日和并发限制同步系统账户状态。"""
     username = user['username']
-    
+
     is_expired_or_exceeded = False
-    
+
     # 检查到期日
     if user['expiry_date']:
         try:
             expiry_dt = datetime.strptime(user['expiry_date'], '%Y-%m-%d')
             if expiry_dt.date() < datetime.now().date(): is_expired_or_exceeded = True
         except ValueError: print(f"Invalid expiry_date format for {username}: {user['expiry_date']}")
-            
+
     # 检查并发限制
     current_conn_count = 0
     max_connections = user.get('max_connections', MAX_CONN_DEFAULT)
     is_over_limit = False
-    
+
     try:
         success, uid = safe_run_command(['id', '-u', username])
         if success and uid.isdigit():
-            # 检查用户 uid 拥有的所有到 24355 的 established TCP 连接
+            # 检查用户 uid 拥有的所有到 SSH_TARGET_PORT 的 established TCP 连接
             result = subprocess.run(['ss', '-t', '-n', '-o', 'state', 'established', 'dport', str(SSH_TARGET_PORT), 'user', str(uid)], capture_output=True, text=True, timeout=2)
-            # ss 命令输出的第一行是标题，所以要减去 1
             current_conn_count = len(result.stdout.strip().split('\n')) - 1 if result.stdout.strip() and len(result.stdout.strip().split('\n')) > 1 else 0
     except Exception:
         current_conn_count = 0
@@ -635,40 +635,35 @@ def sync_user_status(user):
         is_over_limit = True
 
     should_be_paused = (user.get('status') == 'paused') or is_expired_or_exceeded or is_over_limit
-    
+
     system_locked = False
     success_status, output_status = safe_run_command(['passwd', '-S', username])
-    # ' L ' 表示 Locked (锁定)
     if success_status and output_status and ' L ' in output_status: system_locked = True
-        
+
     if not should_be_paused and system_locked:
-        # 启用用户 (解锁)
         safe_run_command(['usermod', '-U', username])
-        if user['expiry_date']: safe_run_command(['chage', '-E', user['expiry_date'], username]) 
+        if user['expiry_date']: safe_run_command(['chage', '-E', user['expiry_date'], username])
         else: safe_run_command(['chage', '-E', '', username])
         user['status'] = 'active'
-        
+
     elif should_be_paused and not system_locked:
-        # 暂停用户 (锁定)
         safe_run_command(['usermod', '-L', username])
-        safe_run_command(['chage', '-E', '1970-01-01', username]) # 强制设置为过期
+        safe_run_command(['chage', '-E', '1970-01-01', username])
         kill_user_sessions(username)
         user['status'] = 'paused'
-        
+
     user['current_conn_count'] = current_conn_count
     user['max_conn'] = max_connections
     user['is_over_limit'] = is_over_limit
-        
+
     return user
 
 def refresh_all_user_status(users):
     """更新所有用户状态并生成显示所需的字段."""
     updated = False
     for user in users:
-        user = sync_user_status(user)  # 刷新系统状态
-        
-        # 移除 traffic_display
-        
+        user = sync_user_status(user)
+
         user['status_text'] = "Active"
         user['status_class'] = "bg-green-500"
 
@@ -683,7 +678,7 @@ def refresh_all_user_status(users):
             user['status_class'] = "bg-red-500"
         else:
              user['status_text'] = f"Active ({user['current_conn_count']}/{user['max_conn']})"
-            
+
         updated = True
     if updated: save_users(users)
     return users
@@ -703,7 +698,7 @@ _DASHBOARD_HTML = """
 <html lang="zh-CN">
 <head>
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WSS Panel - 仪表盘 V6.2</title>
+    <title>WSS Panel - 仪表盘 V6.2 优化版</title>
     <script src="https://cdn.tailwindcss.com"></script>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
     <style>
@@ -722,7 +717,7 @@ _DASHBOARD_HTML = """
 <body class="bg-gray-50 min-h-screen">
     <div class="bg-indigo-600 text-white shadow-lg">
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
-            <h1 class="text-3xl font-bold">WSS 隧道管理面板 V6.2 (纯 IP/并发控制)</h1>
+            <h1 class="text-3xl font-bold">WSS 隧道管理面板 </h1>
             <div class="flex space-x-3">
                 <button onclick="openRootPasswordModal()" class="bg-indigo-700 hover:bg-indigo-800 px-4 py-2 rounded-lg font-semibold shadow-md btn-action">
                     修改 Root 密码
@@ -742,12 +737,11 @@ _DASHBOARD_HTML = """
         <div class="card bg-white p-6 rounded-xl shadow-lg mb-8">
             <h3 class="text-xl font-semibold text-gray-800 mb-4 border-b pb-2">实时系统状态</h3>
             <div id="system-status-data" class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-                <!-- Data populated by JS -->
                 <p class="text-gray-500 col-span-4">正在加载系统状态...</p>
             </div>
         </div>
 
-        <!-- Stats Grid (精简) -->
+        <!-- Stats Grid -->
         <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
             <div class="card bg-white p-5 rounded-xl shadow-lg border-l-4 border-indigo-500">
                 <h3 class="text-sm font-medium text-gray-500">已管理用户组数</h3>
@@ -762,12 +756,12 @@ _DASHBOARD_HTML = """
                 <p class="text-3xl font-bold text-gray-900 mt-1">{{ wss_tls_port }}</p>
             </div>
             <div class="card bg-white p-5 rounded-xl shadow-lg border-l-4 border-yellow-500">
-                <h3 class="text-sm font-medium text-gray-500">Stunnel/UDPGW 端口</h3>
-                <p class="text-3xl font-bold text-gray-900 mt-1">{{ stunnel_port }} / {{ udpgw_port }}</p>
+                <h3 class="text-sm font-medium text-gray-500">Stunnel/SSH 目标端口</h3>
+                <p class="text-3xl font-bold text-gray-900 mt-1">{{ stunnel_port }} / {{ ssh_target_port }}</p>
             </div>
         </div>
         
-        <!-- 服务诊断与控制 (NEW FEATURE) -->
+        <!-- 服务诊断与控制 -->
         <div class="card bg-white p-6 rounded-xl shadow-lg mb-8">
             <h3 class="text-xl font-semibold text-gray-800 mb-4 border-b pb-2">服务诊断与控制</h3>
             <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -775,7 +769,6 @@ _DASHBOARD_HTML = """
                     <p><span class="font-bold">服务器 IP 地址:</span> <span class="text-indigo-600">{{ host_ip }}</span></p>
                     <p class="mt-2 font-bold text-gray-700">关键端口监听状态:</p>
                     <div id="port-status-data" class="mt-2 space-y-1">
-                        <!-- Port status populated by JS -->
                         <p class="text-gray-500">正在检查端口...</p>
                     </div>
                 </div>
@@ -799,7 +792,7 @@ _DASHBOARD_HTML = """
             </div>
         </div>
 
-        <!-- 近期管理活动 (NEW FEATURE) -->
+        <!-- 近期管理活动 -->
         <div class="card bg-white p-6 rounded-xl shadow-lg mb-8">
             <h3 class="text-xl font-semibold text-gray-800 mb-4 border-b pb-2">近期管理活动 (最新 20 条)</h3>
             <div class="bg-gray-100 p-4 rounded-lg max-h-96 overflow-y-auto">
@@ -809,7 +802,7 @@ _DASHBOARD_HTML = """
             </div>
         </div>
 
-        <!-- Add User Card / User List Card (REMOVED TRAFFIC CONTROLS) -->
+        <!-- Add User Card / User List Card -->
         <div class="card bg-white p-6 rounded-xl shadow-lg mb-8">
             <h3 class="text-xl font-semibold text-gray-800 mb-4">新增 WSS 用户组 (SSH 账户)</h3>
             <form id="add-user-form" class="flex flex-wrap items-center gap-4">
@@ -833,7 +826,6 @@ _DASHBOARD_HTML = """
                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">用户组 (SSH 账户)</th>
                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">状态 (并发/限制)</th>
                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">到期日</th>
-                            <!-- 移除流量列 -->
                             <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">操作</th>
                         </tr>
                     </thead>
@@ -862,7 +854,6 @@ _DASHBOARD_HTML = """
                                         class="text-xs px-3 py-1 rounded-full font-bold {{ 'bg-yellow-100 text-yellow-800 hover:bg-yellow-200' if user.status == 'active' else 'bg-green-100 text-green-800 hover:bg-green-200' }} btn-action">
                                     {{ '暂停' if user.status == 'active' else '启用' }}
                                 </button>
-                                <!-- 移除重置流量按钮 -->
                                 <button onclick="openConfirmationModal('{{ user.username }}', null, 'deleteUser', '删除')" 
                                         class="text-xs px-3 py-1 rounded-full font-bold bg-red-100 text-red-800 hover:bg-red-200 btn-action">
                                     删除
@@ -877,7 +868,7 @@ _DASHBOARD_HTML = """
 
     </div>
     
-    <!-- Modal for Root Password Change (NEW FEATURE) -->
+    <!-- Modal for Root Password Change -->
     <div id="root-password-modal" class="modal fixed inset-0 flex items-center justify-center p-4 hidden">
         <div class="modal-content bg-white rounded-xl shadow-2xl w-full max-w-lg transition-all">
             <div class="p-6">
@@ -909,15 +900,13 @@ _DASHBOARD_HTML = """
         </div>
     </div>
     
-    <!-- Modal for User Settings (REVISED) -->
+    <!-- Modal for User Settings -->
     <div id="settings-modal" class="modal fixed inset-0 flex items-center justify-center p-4 hidden">
         <div class="modal-content bg-white rounded-xl shadow-2xl w-full max-w-lg transition-all">
             <div class="p-6">
                 <h3 class="text-xl font-bold mb-4 text-gray-800 border-b pb-2">设置 <span id="modal-username-title-settings"></span> 的参数</h3>
                 <form id="settings-form" onsubmit="event.preventDefault(); saveSettings();">
                     <input type="hidden" id="modal-username-settings">
-                    
-                    <!-- 移除流量配额 -->
                     
                     <div class="mb-4">
                         <label for="modal-max-conn" class="block text-sm font-medium text-gray-700">最大并发连接数 (0为无限)</label>
@@ -929,7 +918,6 @@ _DASHBOARD_HTML = """
                         <input type="date" id="modal-expiry" class="mt-1 block w-full p-2 border border-gray-300 rounded-lg">
                     </div>
                     
-                    <!-- 新增修改 SSH 密码 -->
                     <h4 class="font-bold text-gray-800 mt-6 mb-3 border-t pt-3">修改 SSH 密码 (可选)</h4>
                     <div class="mb-4">
                         <label for="modal-new-password" class="block text-sm font-medium text-gray-700">新 SSH 密码 (留空则不修改)</label>
@@ -949,7 +937,7 @@ _DASHBOARD_HTML = """
         </div>
     </div>
     
-    <!-- Active IP / Confirmation Modals (保留并精简) -->
+    <!-- Active IP / Confirmation Modals -->
     <div id="active-ip-modal" class="modal fixed inset-0 flex items-center justify-center p-4 hidden">
         <div class="modal-content bg-white rounded-xl shadow-2xl w-full max-w-xl transition-all">
             <div class="p-6">
@@ -1002,7 +990,7 @@ _DASHBOARD_HTML = """
             window.location.href = '/logout';
         }
 
-        // --- System Status & Port Check Logic (NEW FEATURE) ---
+        // --- System Status & Port Check Logic ---
         const PORT_SERVICES = {
             '{{ wss_http_port }}': 'WSS HTTP/Payload',
             '{{ wss_tls_port }}': 'WSS TLS',
@@ -1038,7 +1026,6 @@ _DASHBOARD_HTML = """
             html += formatResource("磁盘使用率", \`\${data.disk_used_percent.toFixed(1)}%\`);
             html += formatResource("面板 API", '<span class="text-green-600 font-semibold">正常</span>');
 
-            // Service statuses
             html += formatService("WSS Proxy", data.services.wss);
             html += formatService("Panel Service", data.services.wss_panel);
             html += formatService("Stunnel4", data.services.stunnel4);
@@ -1072,7 +1059,7 @@ _DASHBOARD_HTML = """
         }
 
         async function fetchSystemStatus() {
-            const API_URL = '/api/system/status'; 
+            const API_URL = '/api/system/status';
             
             try {
                 const response = await fetch(API_URL, { method: 'GET' });
@@ -1095,7 +1082,7 @@ _DASHBOARD_HTML = """
         }
         
         async function fetchAuditLogs() {
-            const API_URL = '/api/logs'; 
+            const API_URL = '/api/logs';
             try {
                 const response = await fetch(API_URL, { method: 'GET' });
                 const data = await response.json();
@@ -1108,7 +1095,6 @@ _DASHBOARD_HTML = """
                     }
                     
                     logContainer.innerHTML = data.logs.map(log => {
-                        // 简单的格式化，加粗用户名
                         const formattedLog = log.replace(/\[USER:([^\]]+)\]/, (match, p1) => 
                             p1 !== 'N/A' ? \`[USER:<strong>\${p1}</strong>]\` : match
                         );
@@ -1136,8 +1122,7 @@ _DASHBOARD_HTML = """
 
                 if (response.ok && result.success) {
                     showStatus(result.message, true);
-                    // 延迟刷新状态，等待服务启动
-                    setTimeout(() => { fetchSystemStatus(); }, 5000); 
+                    setTimeout(() => { fetchSystemStatus(); }, 5000);
                 } else {
                     showStatus(\`服务操作失败: \${result.message}\`, false);
                 }
@@ -1149,7 +1134,7 @@ _DASHBOARD_HTML = """
         window.onload = function() {
             fetchSystemStatus();
             fetchAuditLogs();
-            setInterval(fetchSystemStatus, 15000); 
+            setInterval(fetchSystemStatus, 15000);
             setInterval(fetchAuditLogs, 30000);
         };
 
@@ -1177,8 +1162,8 @@ _DASHBOARD_HTML = """
             const new_ssh_password = document.getElementById('modal-new-password').value;
 
             if (max_connections < 0) {
-                 showStatus('最大并发连接数不能为负数。', false);
-                 return;
+                   showStatus('最大并发连接数不能为负数。', false);
+                   return;
             }
 
             try {
@@ -1193,7 +1178,7 @@ _DASHBOARD_HTML = """
                 if (response.ok && result.success) {
                     showStatus(result.message, true);
                     closeSettingsModal();
-                    location.reload(); 
+                    location.reload();
                 } else {
                     showStatus('保存设置失败: ' + result.message, false);
                 }
@@ -1202,7 +1187,7 @@ _DASHBOARD_HTML = """
             }
         }
         
-        // --- Root Password Modal Logic (NEW FEATURE) ---
+        // --- Root Password Modal Logic ---
         
         function openRootPasswordModal() {
             document.getElementById('current-password-root').value = '';
@@ -1241,8 +1226,7 @@ _DASHBOARD_HTML = """
                 if (response.ok && result.success) {
                     showStatus(result.message, true);
                     closeRootPasswordModal();
-                    // 强制退出重新登录
-                    setTimeout(() => { logout(); }, 1500); 
+                    setTimeout(() => { logout(); }, 1500);
                 } else {
                     showStatus('修改密码失败: ' + result.message, false);
                 }
@@ -1321,7 +1305,7 @@ _DASHBOARD_HTML = """
 
                 if (response.ok && result.success) {
                     showStatus(result.message, true);
-                    openActiveIPModal(username); 
+                    openActiveIPModal(username);
                 } else {
                     showStatus(\`\${actionText}失败: \` + result.message, false);
                 }
@@ -1342,7 +1326,6 @@ _DASHBOARD_HTML = """
                 message = \`确定要永久删除用户组 \${username} 吗? (此操作将终止所有连接并删除系统账户!)\`;
                 confirmButtonText = typeText;
             }
-            // 移除了 resetTraffic 选项
 
             document.getElementById('confirm-title').textContent = \`\${typeText} - \${username}\`;
             document.getElementById('confirm-message').textContent = message;
@@ -1395,7 +1378,7 @@ _DASHBOARD_HTML = """
                     showStatus(result.message, true);
                     document.getElementById('new-username').value = '';
                     document.getElementById('new-password').value = '';
-                    location.reload(); 
+                    location.reload();
                 } else {
                     showStatus('创建失败: ' + result.message, false);
                 }
@@ -1418,7 +1401,7 @@ _DASHBOARD_HTML = """
 
                 if (response.ok && result.success) {
                     showStatus(result.message, true);
-                    location.reload(); 
+                    location.reload();
                 } else {
                     showStatus(\`\${actionText}失败: \` + result.message, false);
                 }
@@ -1439,7 +1422,7 @@ _DASHBOARD_HTML = """
 
                 if (response.ok && result.success) {
                     showStatus(result.message, true);
-                    location.reload(); 
+                    location.reload();
                 } else {
                     showStatus('删除失败: ' + result.message, false);
                 }
@@ -1456,11 +1439,10 @@ _DASHBOARD_HTML = """
 def render_dashboard(users):
     """手动渲染 Jinja2 模板字符串."""
     template_env = jinja2.Environment(loader=jinja2.BaseLoader)
-    # 更新模板版本号
     template = template_env.from_string(_DASHBOARD_HTML)
     
     host_ip = request.host.split(':')[0]
-    if host_ip in ('127.0.0.1', 'localhost', '0.0.0.0'):
+    if host_ip in ('127.0.0.1', 'localhost', '0.0.0.0', '::1'):
         host_ip = SERVER_IP
         
     context = {
@@ -1470,6 +1452,7 @@ def render_dashboard(users):
         'wss_tls_port': WSS_TLS_PORT,
         'stunnel_port': STUNNEL_PORT,
         'udpgw_port': UDPGW_PORT,
+        'ssh_target_port': SSH_TARGET_PORT,
         'host_ip': host_ip,
         'MAX_CONN_DEFAULT': MAX_CONN_DEFAULT
     }
@@ -1502,7 +1485,6 @@ def login():
                 session['logged_in'] = True
                 session['username'] = ROOT_USERNAME
                 log_action("LOGIN_SUCCESS", ROOT_USERNAME, "Web UI Login")
-                # Flask 装饰器修改了函数名，需要使用 'dashboard_decorated'
                 return redirect(url_for('dashboard_decorated'))
             else:
                 error = '用户名或密码错误。'
@@ -1556,7 +1538,7 @@ def logout():
     session.pop('logged_in', None)
     return redirect(url_for('login'))
 
-# --- 新增 Root 密码修改 API ---
+# --- Root 密码修改 API ---
 @app.route('/api/root/change_password', methods=['POST'])
 @login_required
 def change_root_password_api():
@@ -1596,15 +1578,12 @@ def add_user_api():
     users = load_users()
     if get_user(username)[0]: return jsonify({"success": False, "message": f"用户组 {username} 已存在于面板"}), 409
 
-    # --- START OF FIX for Issue 1: Handle pre-existing system user ---
     user_exists_on_system = False
     
-    # 尝试创建系统用户
     success, output = safe_run_command(['useradd', '-m', '-s', '/bin/false', username])
     if not success:
         if "already exists" in output:
             user_exists_on_system = True
-            # 检查 /etc/passwd 确认用户确实存在且可被接管
             success_check, _ = safe_run_command(['id', username])
             if not success_check:
                  log_action("USER_ADD_FAIL", session.get('username', 'root'), f"User {username} exists but ID failed: {output}")
@@ -1614,21 +1593,17 @@ def add_user_api():
         else:
             log_action("USER_ADD_FAIL", session.get('username', 'root'), f"Failed to create system user {username}: {output}")
             return jsonify({"success": False, "message": f"创建系统用户失败: {output}"}), 500
-    # --- END OF FIX ---
     
-    # 设置密码（无论用户是新创建还是被接管）
     chpasswd_input = f"{username}:{password_raw}"
-    # FIX: safe_run_command 已经修复，使用正确的 input_data=...
     success, output = safe_run_command(['/usr/sbin/chpasswd'], input_data=chpasswd_input.encode('utf-8'))
     if not success:
-        # 如果是新创建的用户，需要回滚删除它
         if not user_exists_on_system: safe_run_command(['userdel', '-r', username])
         log_action("USER_ADD_FAIL", session.get('username', 'root'), f"Failed to set password for {username}: {output}")
         return jsonify({"success": False, "message": f"设置密码失败: {output}"}), 500
         
     new_user = {
         "username": username, "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-        "status": "active", "expiry_date": "", 
+        "status": "active", "expiry_date": "",
         "banned_ips": [], "max_connections": MAX_CONN_DEFAULT
     }
     users.append(new_user)
@@ -1678,7 +1653,7 @@ def update_user_settings_api():
     username = data.get('username')
     expiry_date = data.get('expiry_date', '')
     max_connections = data.get('max_connections', MAX_CONN_DEFAULT)
-    new_ssh_password = data.get('new_ssh_password', '') # 新增字段
+    new_ssh_password = data.get('new_ssh_password', '')
 
     user, index = get_user(username)
     if not user: return jsonify({"success": False, "message": f"用户组 {username} 不存在"}), 404
@@ -1697,11 +1672,9 @@ def update_user_settings_api():
     users[index]['expiry_date'] = expiry_date
     users[index]['max_connections'] = max_connections
     
-    # --- SSH 密码修改逻辑 (NEW FEATURE) ---
     password_log = ""
     if new_ssh_password:
         chpasswd_input = f"{username}:{new_ssh_password}"
-        # FIX: safe_run_command 已经修复，使用正确的 input_data=...
         success, output = safe_run_command(['/usr/sbin/chpasswd'], input_data=chpasswd_input.encode('utf-8'))
         if success:
             password_log = ", SSH password changed"
@@ -1741,9 +1714,7 @@ def toggle_user_status_api():
     
     return jsonify({"success": True, "message": f"用户组 {username} 状态已更新为 {action}"})
 
-# 移除了 /api/users/reset_traffic 和 /api/users/update_traffic
-
-# --- 实时系统状态 & 服务控制 API (NEW/REFINED) ---
+# --- 实时系统状态 & 服务控制 API ---
 @app.route('/api/system/status', methods=['GET'])
 @login_required 
 def get_system_status():
@@ -1797,14 +1768,13 @@ def control_system_service():
     """重启/停止核心服务."""
     data = request.json
     service = data.get('service')
-    action = data.get('action') # restart
+    action = data.get('action')
 
     allowed_services = ['wss', 'wss_panel', 'stunnel4', 'udpgw']
     if service not in allowed_services or action != 'restart':
         log_action("SERVICE_CONTROL_FAIL", session.get('username', 'root'), f"Attempted illegal action/service: {action}/{service}")
         return jsonify({"success": False, "message": "无效的服务或操作"}), 400
         
-    # 特殊处理 wss_panel，重启后可能导致当前连接断开
     if service == 'wss_panel':
         log_action("SERVICE_CONTROL_WARN", session.get('username', 'root'), "Panel restart requested. Connection may drop.")
 
@@ -1844,8 +1814,6 @@ def check_ip_api():
             
     return jsonify({"success": True, "is_banned": is_banned})
 
-# 移除了 /api/ips/report
-
 @app.route('/api/ips/block', methods=['POST'])
 @login_required
 def block_ip_api():
@@ -1868,7 +1836,6 @@ def block_ip_api():
         
     success_iptables, iptables_output = toggle_iptables_ip_ban(ip, 'block')
     
-    # 移除活跃 IP 记录 (仅作为UI优化，核心是IPTables)
     active_ips = load_active_ips()
     if ip in active_ips:
         active_ips.pop(ip)
@@ -1920,7 +1887,6 @@ def get_active_ips_api():
     
     filtered_ips = []
     
-    # 合并活跃 IP 和被封禁 IP 列表，确保显示所有相关 IP
     all_ips = set(active_ips.keys()) | set(banned_ips_for_user)
 
     for ip in all_ips:
@@ -1948,14 +1914,13 @@ EOF
 
 chmod +x /usr/local/bin/wss_panel.py
 
-# 确保 SERVER_IP 变量在 systemd 服务中可用
 export SERVER_IP
 
 # --- 5. 创建 WSS 面板 systemd 服务 ---
 if [ ! -f "/etc/systemd/system/wss_panel.service" ]; then
 tee /etc/systemd/system/wss_panel.service > /dev/null <<EOF
 [Unit]
-Description=WSS User Management Panel (Flask V6.2)
+Description=WSS User Management Panel (Flask V6.2 Optimized)
 After=network.target
 
 [Service]
@@ -1971,47 +1936,40 @@ EOF
 fi
 
 systemctl daemon-reload
-# FIX: 如果 service 文件存在，只更新 ExecStart
-if [ -f "/etc/systemd/system/wss_panel.service" ]; then
-    # 更新服务描述的版本号
-    sudo sed -i "s|Description=WSS User Management Panel (Flask V6.1)|Description=WSS User Management Panel (Flask V6.2)|" /etc/systemd/system/wss_panel.service
-    sudo sed -i "s|^ExecStart=.*|ExecStart=$PYTHON_VENV_PATH /usr/local/bin/wss_panel.py|" /etc/systemd/system/wss_panel.service
-fi
+# 更新服务描述的版本号
+sudo sed -i "s|Description=WSS User Management Panel (Flask V6.1)|Description=WSS User Management Panel (Flask V6.2 Optimized)|" /etc/systemd/system/wss_panel.service
+sudo sed -i "s|Description=WSS User Management Panel (Flask V6.2)|Description=WSS User Management Panel (Flask V6.2 Optimized)|" /etc/systemd/system/wss_panel.service
+sudo sed -i "s|^ExecStart=.*|ExecStart=$PYTHON_VENV_PATH /usr/local/bin/wss_panel.py|" /etc/systemd/system/wss_panel.service
 
 systemctl daemon-reload
 systemctl enable wss_panel || true
 systemctl restart wss_panel
-echo "WSS 管理面板 V6.2 已启动/重启，端口 $PANEL_PORT"
+echo "WSS 管理面板 V6.2 优化版 已启动/重启，端口 $PANEL_PORT"
 echo "----------------------------------"
 
-# --- 6. 部署 IPTABLES 阻断链设置 (移除流量统计链) ---
+# --- 6. 部署 IPTABLES 阻断链设置 ---
 
 setup_iptables_chains() {
-    echo "==== 配置 IPTABLES IP 实时阻断链 (仅保留 filter 表) ===="
+    echo "==== 配置 IPTABLES IP 实时阻断链 ===="
     
     BLOCK_CHAIN="WSS_IP_BLOCK"
     
-    # 彻底清理 BLOCK 链 (它在 filter 表)
     iptables -D INPUT -j $BLOCK_CHAIN 2>/dev/null || true
     iptables -F $BLOCK_CHAIN 2>/dev/null || true
     iptables -X $BLOCK_CHAIN 2>/dev/null || true
 
-    # 1. 创建新的阻断链
     iptables -N $BLOCK_CHAIN 2>/dev/null || true 
 
-    # 2. 将新链连接到 INPUT 主链 (必须在最前面)
     iptables -I INPUT 1 -j $BLOCK_CHAIN
     
-    # 3. 保存规则
     if command -v iptables-save >/dev/null; then
         iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
         echo "IPTABLES 规则已保存到 /etc/iptables/rules.v4。"
     fi
 
-    echo "IPTABLES IP 阻断功能已启用，流量统计功能已移除。"
+    echo "IPTABLES IP 阻断功能已启用。"
 }
 
-# 立即运行 IPTABLES 链设置
 setup_iptables_chains
 
 
@@ -2021,7 +1979,7 @@ rm -f /etc/cron.d/wss-traffic || true
 echo "流量同步 Cron Job 已移除。"
 echo "----------------------------------"
 
-# --- 8. SSHD 安全配置 (保留不变) ---
+# --- 8. SSHD 安全配置 ---
 SSHD_CONFIG="/etc/ssh/sshd_config"
 BACKUP_SUFFIX=".bak.wss$(date +%s)"
 SSHD_SERVICE=$(systemctl list-units --full -all | grep -E "sshd\.service|ssh\.service" | grep -v "not-found" | head -n 1 | awk '{print $1}' | cut -d'.' -f1 || echo "sshd")
@@ -2030,13 +1988,11 @@ echo "==== 配置 SSHD 安全策略 (增强连接稳定性) ===="
 cp -a "$SSHD_CONFIG" "${SSHD_CONFIG}${BACKUP_SUFFIX}"
 echo "SSHD 配置已备份到 ${SSHD_CONFIG}${BACKUP_SUFFIX}"
 
-# 1. 删除旧的 WSS 匹配配置段
 sed -i '/# WSS_TUNNEL_BLOCK_START/,/# WSS_TUNNEL_BLOCK_END/d' "$SSHD_CONFIG"
 
-# 2. 写入新的 WSS 隧道策略 (增加 ClientAliveInterval)
 cat >> "$SSHD_CONFIG" <<EOF
 
-# WSS_TUNNEL_BLOCK_START -- managed by deploy_wss_panel.sh (V6.2)
+# WSS_TUNNEL_BLOCK_START -- managed by deploy_wss_panel.sh (V6.2 Optimized)
 # 统一策略: 允许所有用户通过本机 (127.0.0.1, ::1) 使用密码进行认证。
 Match Address 127.0.0.1,::1
     PasswordAuthentication yes
@@ -2044,10 +2000,9 @@ Match Address 127.0.0.1,::1
     X11Forwarding no
     AllowTcpForwarding yes
     ForceCommand /bin/false
-    # 增加连接活跃检查，防止连接因闲置被断开
     ClientAliveInterval 30
     ClientAliveCountMax 120
-# WSS_TUNNEL_BLOCK_END -- managed by deploy_wss_panel.sh (V6.2)
+# WSS_TUNNEL_BLOCK_END -- managed by deploy_wss_panel.sh (V6.2 Optimized)
 
 EOF
 
@@ -2059,12 +2014,11 @@ systemctl restart "$SSHD_SERVICE"
 echo "SSHD 配置更新完成，连接稳定性已增强。"
 echo "----------------------------------"
 
-# 清理敏感变量
 unset PANEL_ROOT_PASS_RAW
 
 echo "=================================================="
-echo "✅ WSS 管理面板部署完成！ (V6.2 Payload 修复/端口统一)"
+echo "✅ WSS 管理面板部署完成！ (V6.2 优化版)"
 echo "=================================================="
-echo ""
-echo "核心代理的 Payload 异步读取逻辑已优化，请再次尝试连接客户端。"
+echo "WSS 核心代理已集成 uvloop，性能提升显著。"
+echo "SSH 隧道目标端口已配置为: $SSH_TARGET_PORT"
 echo "=================================================="
