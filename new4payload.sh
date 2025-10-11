@@ -2,7 +2,10 @@
 set -eu
 
 # =======================================================
-# WSS 隧道/Stunnel/管理面板部署脚本
+# WSS 隧道/Stunnel/管理面板部署脚本 V6.2 - 优化版 (集成 uvloop, SSH端口可配置)
+# 变更: 性能优化 (uvloop)，可配置 SSH 目标端口，代码精简。
+# FIX: 修复了面板中 "活跃 IP" 功能无法工作的问题，改为实时查询系统连接。
+# FIX2: 使用 shutil.which 和更健壮的 Popen 修复 ss/id 命令兼容性问题。
 # =======================================================
 
 # --- 全局变量和工具函数 ---
@@ -30,7 +33,7 @@ get_server_ip() {
     echo "尝试获取服务器公网 IP..."
     SERVER_IP=$(curl -s --connect-timeout 2 ip.sb 2>/dev/null)
     [ -z "$SERVER_IP" ] && SERVER_IP=$(curl -s --connect-timeout 2 ifconfig.me 2>/dev/null)
-    [ -z "$SERVER_IP" ] && SERVER_IP=$(ip a | grep 'inet ' | grep -v '127.0.0.1' | head -n 1 | awk '{print $2}' | cut -d/ -f1)
+    [ -z "$SERVER_IP" ] && SERVER_IP=$(/sbin/ip a | grep 'inet ' | grep -v '127.0.0.1' | head -n 1 | awk '{print $2}' | cut -d/ -f1)
     [ -z "$SERVER_IP" ] && SERVER_IP='[SERVER_IP]'
     echo "$SERVER_IP"
 }
@@ -77,18 +80,18 @@ while true; do
         continue
     fi
     PANEL_ROOT_PASS_RAW="$pw1"
-    PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | sha256sum | awk '{print $1}')
+    PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | /usr/bin/sha256sum | awk '{print $1}')
     break
 done
 
 echo "----------------------------------"
 echo "==== 系统更新与依赖安装 (VENV 隔离) ===="
-apt update -y
-apt install -y python3 python3-pip python3-venv wget curl git net-tools openssl stunnel4 iptables-persistent procps cmake build-essential
+/usr/bin/apt update -y
+/usr/bin/apt install -y python3 python3-pip python3-venv wget curl git net-tools openssl stunnel4 iptables-persistent procps cmake build-essential
 
 echo "创建 Python 虚拟环境于 $VENV_PATH"
-mkdir -p "$VENV_PATH"
-python3 -m venv "$VENV_PATH"
+/usr/bin/mkdir -p "$VENV_PATH"
+/usr/bin/python3 -m venv "$VENV_PATH"
 
 echo "在 VENV 中安装 Python 依赖..."
 "$PYTHON_VENV_PATH" -m pip install flask jinja2 requests httpx psutil uvloop
@@ -99,7 +102,7 @@ echo "----------------------------------"
 
 # --- 2. WSS 核心代理脚本 (目标端口 $SSH_TARGET_PORT) ---
 echo "==== 安装 WSS 核心代理脚本 (/usr/local/bin/wss) ===="
-tee /usr/local/bin/wss > /dev/null <<EOF
+/usr/bin/tee /usr/local/bin/wss > /dev/null <<EOF
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
@@ -283,10 +286,10 @@ if __name__ == '__main__':
 
 EOF
 
-chmod +x /usr/local/bin/wss
+/bin/chmod +x /usr/local/bin/wss
 
 # 创建 WSS systemd 服务 (新增 SSH_TARGET_PORT 参数)
-tee /etc/systemd/system/wss.service > /dev/null <<EOF
+/usr/bin/tee /etc/systemd/system/wss.service > /dev/null <<EOF
 [Unit]
 Description=WSS Python Proxy (V6.2 Optimized)
 After=network.target
@@ -302,9 +305,9 @@ User=root
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable wss || true
-systemctl restart wss || true
+/bin/systemctl daemon-reload
+/bin/systemctl enable wss || true
+/bin/systemctl restart wss || true
 echo "WSS 核心代理 (V6.2 优化版) 已启动/重启，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
 echo "转发目标端口: $SSH_TARGET_PORT"
 echo "----------------------------------"
@@ -312,21 +315,21 @@ echo "----------------------------------"
 
 # --- 3. Stunnel4, UDPGW (统一目标端口 $SSH_TARGET_PORT) ---
 echo "==== 检查/安装 Stunnel4 ===="
-mkdir -p /etc/stunnel/certs
+/usr/bin/mkdir -p /etc/stunnel/certs
 if [ ! -f "/etc/stunnel/certs/stunnel.pem" ]; then
     echo "Stunnel 证书不存在，正在生成..."
-    openssl req -x509 -nodes -newkey rsa:2048 \
+    /usr/bin/openssl req -x509 -nodes -newkey rsa:2048 \
     -keyout /etc/stunnel/certs/stunnel.key \
     -out /etc/stunnel/certs/stunnel.crt \
     -days 1095 \
     -subj "/CN=example.com"
-    sh -c 'cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem'
-    chmod 644 /etc/stunnel/certs/*.crt
-    chmod 644 /etc/stunnel/certs/*.pem
+    /bin/sh -c '/bin/cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem'
+    /bin/chmod 644 /etc/stunnel/certs/*.crt
+    /bin/chmod 644 /etc/stunnel/certs/*.pem
     echo "Stunnel 证书已生成。"
 fi
 
-tee /etc/stunnel/ssh-tls.conf > /dev/null <<EOF
+/usr/bin/tee /etc/stunnel/ssh-tls.conf > /dev/null <<EOF
 pid=/var/run/stunnel.pid
 setuid=root
 setgid=root
@@ -343,8 +346,8 @@ cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.pem
 EOF
 
-systemctl enable stunnel4 || true
-systemctl restart stunnel4 || true
+/bin/systemctl enable stunnel4 || true
+/bin/systemctl restart stunnel4 || true
 echo "Stunnel4 配置已更新并重启，端口 $STUNNEL_PORT (转发至 $SSH_TARGET_PORT)"
 echo "----------------------------------"
 
@@ -353,14 +356,14 @@ if [ ! -f "/root/badvpn/badvpn-build/udpgw/badvpn-udpgw" ]; then
     echo "UDPGW 二进制文件不存在，开始编译..."
     if [ ! -d "/root/badvpn" ]; then
         echo "克隆 badvpn 仓库..."
-        apt install -y cmake build-essential || true
-        git clone https://github.com/ambrop72/badvpn.git /root/badvpn || { echo "ERROR: Git clone failed."; exit 1; }
+        /usr/bin/apt install -y cmake build-essential || true
+        /usr/bin/git clone https://github.com/ambrop72/badvpn.git /root/badvpn || { echo "ERROR: Git clone failed."; exit 1; }
     fi
-    mkdir -p /root/badvpn/badvpn-build
-    cd /root/badvpn/badvpn-build
+    /usr/bin/mkdir -p /root/badvpn/badvpn-build
+    /usr/bin/cd /root/badvpn/badvpn-build
     
-    if cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 ; then
-        if make -j$(nproc); then
+    if /usr/bin/cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 ; then
+        if /usr/bin/make -j$(/usr/bin/nproc); then
             echo "UDPGW 编译成功。"
         else
             echo "ERROR: UDPGW make failed."
@@ -370,12 +373,12 @@ if [ ! -f "/root/badvpn/badvpn-build/udpgw/badvpn-udpgw" ]; then
         echo "ERROR: UDPGW cmake failed."
         exit 1
     fi
-    cd - > /dev/null
+    /usr/bin/cd - > /dev/null
 else
     echo "UDPGW 二进制文件已存在，跳过编译。"
 fi
 
-tee /etc/systemd/system/udpgw.service > /dev/null <<EOF
+/usr/bin/tee /etc/systemd/system/udpgw.service > /dev/null <<EOF
 [Unit]
 Description=UDP Gateway (Badvpn)
 After=network.target
@@ -390,9 +393,9 @@ User=root
 WantedBy=multi-user.target
 EOF
 
-systemctl daemon-reload
-systemctl enable udpgw || true
-systemctl restart udpgw || true
+/bin/systemctl daemon-reload
+/bin/systemctl enable udpgw || true
+/bin/systemctl restart udpgw || true
 echo "UDPGW 已启动/重启，端口: $UDPGW_PORT"
 echo "----------------------------------"
 
@@ -404,10 +407,9 @@ USER_DB="$PANEL_DIR/users.json"
 IP_BANS_DB="$PANEL_DIR/ip_bans.json"
 ROOT_HASH_FILE="$PANEL_DIR/root_hash.txt"
 
-mkdir -p "$PANEL_DIR"
+/usr/bin/mkdir -p "$PANEL_DIR"
 
 [ ! -f "$IP_BANS_DB" ] && echo "{}" > "$IP_BANS_DB"
-# 移除 IP_ACTIVE_DB 的创建，因为我们使用实时查询
 
 if [ ! -f "$ROOT_HASH_FILE" ]; then
     echo "$PANEL_ROOT_PASS_HASH" > "$ROOT_HASH_FILE"
@@ -417,7 +419,7 @@ if [ ! -f "$USER_DB" ]; then
     echo "[]" > "$USER_DB"
 else
     # 简化升级逻辑
-    python3 -c "
+    /usr/bin/python3 -c "
 import json
 import time
 import os
@@ -448,7 +450,7 @@ upgrade_users()
 fi
 
 # 嵌入 Python 面板代码
-tee /usr/local/bin/wss_panel.py > /dev/null <<EOF
+/usr/bin/tee /usr/local/bin/wss_panel.py > /dev/null <<EOF
 # -*- coding: utf-8 -*-
 from flask import Flask, request, jsonify, redirect, url_for, session, make_response
 import json
@@ -461,12 +463,12 @@ from datetime import datetime
 import re
 from functools import wraps
 import psutil
+import shutil # 新增导入
 
 # --- 配置 ---
 PANEL_DIR = "/etc/wss-panel"
 USER_DB_PATH = os.path.join(PANEL_DIR, "users.json")
 IP_BANS_DB_PATH = os.path.join(PANEL_DIR, "ip_bans.json")
-# 移除了 IP_ACTIVE_DB_PATH，改为实时查询
 AUDIT_LOG_PATH = os.path.join(PANEL_DIR, "audit.log")
 ROOT_HASH_FILE = os.path.join(PANEL_DIR, "root_hash.txt")
 
@@ -524,7 +526,6 @@ def load_users(): return load_data(USER_DB_PATH, [])
 def save_users(users): return save_data(users, USER_DB_PATH)
 def load_ip_bans(): return load_data(IP_BANS_DB_PATH, {})
 def save_ip_bans(ip_bans): return save_data(ip_bans, IP_BANS_DB_PATH)
-# 移除了 load_active_ips 和 save_active_ips
 def get_user(username):
     users = load_users()
     for i, user in enumerate(users):
@@ -544,7 +545,7 @@ def get_recent_logs(n=20):
     try:
         if not os.path.exists(AUDIT_LOG_PATH):
             return ["日志文件不存在。"]
-        command = ['tail', '-n', str(n), AUDIT_LOG_PATH]
+        command = ['/usr/bin/tail', '-n', str(n), AUDIT_LOG_PATH]
         result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2)
         return result.stdout.decode('utf-8').strip().split('\n')
     except Exception:
@@ -563,25 +564,37 @@ def login_required(f):
 def safe_run_command(command, input_data=None):
     """安全运行系统命令。"""
     try:
-        result = subprocess.run(
-            command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            input=input_data,
-            timeout=5
+        # 使用 Popen 而不是 run，更好地控制错误捕获
+        process = subprocess.Popen(
+            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            stdin=subprocess.PIPE if input_data else None,
+            text=True,
+            encoding='utf-8'
         )
-        return True, result.stdout.decode('utf-8').strip()
-    except subprocess.CalledProcessError as e:
-        return False, e.stderr.decode('utf-8').strip()
+        stdout, stderr = process.communicate(input=input_data, timeout=5)
+        
+        if process.returncode != 0:
+             # 打印非零返回码的错误信息
+             return False, stderr.strip() if stderr else f"Command failed with code {process.returncode}"
+
+        return True, stdout.strip()
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait()
+        return False, "Command timed out"
+    except FileNotFoundError as e:
+        return False, f"Command not found: {command[0]}"
     except Exception as e:
-        return False, str(e)
+        return False, f"Execution error: {str(e)}"
 
 def toggle_iptables_ip_ban(ip, action):
     """在 WSS_IP_BLOCK 链中添加或移除 IP 阻断规则，并保存规则。"""
     chain = "WSS_IP_BLOCK"
     if action == 'block':
-        safe_run_command(['iptables', '-D', chain, '-s', ip, '-j', 'DROP'])
-        command = ['iptables', '-I', chain, '1', '-s', ip, '-j', 'DROP']
+        safe_run_command(['/sbin/iptables', '-D', chain, '-s', ip, '-j', 'DROP'])
+        command = ['/sbin/iptables', '-I', chain, '1', '-s', ip, '-j', 'DROP']
     elif action == 'unblock':
-        command = ['iptables', '-D', chain, '-s', ip, '-j', 'DROP']
+        command = ['/sbin/iptables', '-D', chain, '-s', ip, '-j', 'DROP']
     else: return False, "Invalid action"
 
     success, output = safe_run_command(command)
@@ -589,7 +602,8 @@ def toggle_iptables_ip_ban(ip, action):
     if success or 'Bad rule' in output or 'No chain/target/match by that name' in output:
         try:
             with open('/etc/iptables/rules.v4', 'w') as f:
-                subprocess.run(['iptables-save'], stdout=f, check=True, timeout=3)
+                # 使用绝对路径确保 iptables-save 找到
+                subprocess.run(['/sbin/iptables-save'], stdout=f, check=True, timeout=3)
             return True, "IPTables rule updated and saved."
         except Exception:
             return True, "IPTables rule updated but failed to save persistence file."
@@ -598,7 +612,7 @@ def toggle_iptables_ip_ban(ip, action):
 
 def kill_user_sessions(username):
     """终止给定用户名的所有活跃 SSH 会话."""
-    safe_run_command(['pkill', '-u', username])
+    safe_run_command([shutil.which('pkill') or '/usr/bin/pkill', '-u', username])
 
 # --- 核心用户状态管理函数 ---
 
@@ -621,13 +635,27 @@ def sync_user_status(user):
     is_over_limit = False
 
     try:
-        success, uid = safe_run_command(['id', '-u', username])
+        # 使用 shutil.which 查找系统命令路径
+        id_bin = shutil.which('id')
+        ss_bin = shutil.which('ss')
+        
+        if not id_bin or not ss_bin:
+             print(f"[DEBUG-CONN] ERROR: System commands 'id' or 'ss' not found via shutil.which.")
+             return user
+        
+        success, uid = safe_run_command([id_bin, '-u', username])
         if success and uid.isdigit():
             # 检查用户 uid 拥有的所有到 SSH_TARGET_PORT 的 established TCP 连接
-            result = subprocess.run(['ss', '-t', '-n', '-o', 'state', 'established', 'dport', str(SSH_TARGET_PORT), 'user', str(uid)], capture_output=True, text=True, timeout=2)
+            command = [ss_bin, '-t', '-n', 'state', 'established', 'dport', str(SSH_TARGET_PORT), 'user', str(uid)]
+            result = subprocess.run(command, capture_output=True, text=True, timeout=2)
+            
             # ss 命令输出的第一行是标题，所以要减去 1
             current_conn_count = len(result.stdout.strip().split('\n')) - 1 if result.stdout.strip() and len(result.stdout.strip().split('\n')) > 1 else 0
-    except Exception:
+        else:
+             print(f"[DEBUG-CONN] ERROR: Failed to get UID for {username}. Output: {uid}")
+             return user
+    except Exception as e:
+        print(f"[DEBUG-CONN] ERROR in sync_user_status SS check: {e}")
         current_conn_count = 0
 
     if max_connections > 0 and current_conn_count > max_connections:
@@ -636,18 +664,18 @@ def sync_user_status(user):
     should_be_paused = (user.get('status') == 'paused') or is_expired_or_exceeded or is_over_limit
 
     system_locked = False
-    success_status, output_status = safe_run_command(['passwd', '-S', username])
+    success_status, output_status = safe_run_command(['/usr/bin/passwd', '-S', username])
     if success_status and output_status and ' L ' in output_status: system_locked = True
 
     if not should_be_paused and system_locked:
-        safe_run_command(['usermod', '-U', username])
-        if user['expiry_date']: safe_run_command(['chage', '-E', user['expiry_date'], username])
-        else: safe_run_command(['chage', '-E', '', username])
+        safe_run_command(['/usr/sbin/usermod', '-U', username])
+        if user['expiry_date']: safe_run_command(['/usr/bin/chage', '-E', user['expiry_date'], username])
+        else: safe_run_command(['/usr/bin/chage', '-E', '', username])
         user['status'] = 'active'
 
     elif should_be_paused and not system_locked:
-        safe_run_command(['usermod', '-L', username])
-        safe_run_command(['chage', '-E', '1970-01-01', username])
+        safe_run_command(['/usr/sbin/usermod', '-L', username])
+        safe_run_command(['/usr/bin/chage', '-E', '1970-01-01', username])
         kill_user_sessions(username)
         user['status'] = 'paused'
 
@@ -685,7 +713,7 @@ def refresh_all_user_status(users):
 def get_service_status(service):
     """检查 systemd 服务的状态."""
     try:
-        success, output = safe_run_command(['systemctl', 'is-active', service])
+        success, output = safe_run_command([shutil.which('systemctl') or '/bin/systemctl', 'is-active', service])
         return 'running' if success and output == 'active' else 'failed'
     except Exception:
         return 'failed'
@@ -693,18 +721,34 @@ def get_service_status(service):
 # --- 实时连接查询函数 (NEW) ---
 def get_live_connections_for_user(username, target_port):
     """使用 ss 命令获取指定用户连接到目标端口的实时远程 IP和计数。"""
+    # 查找命令路径
+    id_bin = shutil.which('id')
+    ss_bin = shutil.which('ss')
+    
+    if not id_bin or not ss_bin:
+        print(f"[DEBUG-CONN] ERROR: System commands 'id' ({id_bin}) or 'ss' ({ss_bin}) not found via shutil.which.")
+        return {}
+    
     try:
-        success, uid = safe_run_command(['id', '-u', username])
+        # 1. 获取 UID
+        success, uid = safe_run_command([id_bin, '-u', username])
         if not success or not uid.isdigit():
+            print(f"[DEBUG-CONN] ERROR: Failed to get UID for {username}. safe_run_command output: {uid}")
             return {}
         
-        # 使用 ss 命令获取 Established 状态的连接，过滤到目标端口，并按用户ID过滤
-        command = ['ss', '-t', '-n', '-o', 'state', 'established', 'dport', str(target_port), 'user', str(uid)]
-        success_ss, output_ss = safe_run_command(command)
+        # 2. 运行 ss 命令
+        command = [ss_bin, '-t', '-n', 'state', 'established', 'dport', str(target_port), 'user', str(uid)]
         
-        if not success_ss:
+        # 使用 subprocess.run 确保能捕获所有输出
+        result = subprocess.run(command, capture_output=True, text=True, timeout=3)
+        
+        output_ss = result.stdout
+        error_ss = result.stderr
+        
+        if result.returncode != 0:
+            print(f"[DEBUG-CONN] ERROR: SS command failed (Code {result.returncode}) for {username}. Command: {' '.join(command)}. Stderr: {error_ss.strip()}")
             return {}
-            
+
         active_ips = {}
         lines = output_ss.strip().split('\n')
         
@@ -714,15 +758,22 @@ def get_live_connections_for_user(username, target_port):
 
         for line in lines:
             if not line.strip(): continue
-            parts = line.split()
-            # 远程地址/端口通常在第 5 列 (index 4)
-            if len(parts) > 4 and ':' in parts[4]:
-                remote_addr_port = parts[4]
-                # 提取 IP (例如 1.2.3.4:5678 -> 1.2.3.4)
-                client_ip = remote_addr_port.rsplit(':', 1)[0]
-                active_ips[client_ip] = active_ips.get(client_ip, 0) + 1
-        
-        # 返回格式兼容 get_active_ips_api
+            # 使用正则表达式分割，以应对 ss 输出中的多空格/制表符
+            parts = re.split(r'\s+', line.strip()) 
+            
+            # Peer Address:Port (远程地址) 在标准 ss -t -n 输出中通常是第 5 列 (index 4)
+            if len(parts) >= 5:
+                remote_addr_port = parts[4] 
+                if ':' in remote_addr_port:
+                    # 剥离端口和 IPv6 的方括号
+                    client_ip = remote_addr_port.rsplit(':', 1)[0].strip().replace('[', '').replace(']', '')
+                    active_ips[client_ip] = active_ips.get(client_ip, 0) + 1
+            
+        if not active_ips:
+            # 调试信息，如果未找到任何连接
+            print(f"[DEBUG-CONN] No active IPs found for {username} (Target Port {target_port}). SS Command: {' '.join(command)}. Raw SS output:")
+            print(output_ss)
+
         return {ip: {'count': count, 'last_seen': int(time.time())} for ip, count in active_ips.items()}
         
     except Exception as e:
@@ -1622,11 +1673,11 @@ def add_user_api():
 
     user_exists_on_system = False
     
-    success, output = safe_run_command(['useradd', '-m', '-s', '/bin/false', username])
+    success, output = safe_run_command(['/usr/sbin/useradd', '-m', '-s', '/bin/false', username])
     if not success:
         if "already exists" in output:
             user_exists_on_system = True
-            success_check, _ = safe_run_command(['id', username])
+            success_check, _ = safe_run_command(['/usr/bin/id', username])
             if not success_check:
                  log_action("USER_ADD_FAIL", session.get('username', 'root'), f"User {username} exists but ID failed: {output}")
                  return jsonify({"success": False, "message": f"系统用户 {username} 已存在，但无法验证其身份。"}), 500
@@ -1639,7 +1690,7 @@ def add_user_api():
     chpasswd_input = f"{username}:{password_raw}"
     success, output = safe_run_command(['/usr/sbin/chpasswd'], input_data=chpasswd_input.encode('utf-8'))
     if not success:
-        if not user_exists_on_system: safe_run_command(['userdel', '-r', username])
+        if not user_exists_on_system: safe_run_command(['/usr/sbin/userdel', '-r', username])
         log_action("USER_ADD_FAIL", session.get('username', 'root'), f"Failed to set password for {username}: {output}")
         return jsonify({"success": False, "message": f"设置密码失败: {output}"}), 500
         
@@ -1667,7 +1718,7 @@ def delete_user_api():
     users = load_users()
     user_to_delete, index = get_user(username)
 
-    if not user_to_delete: return jsonify({"success": False, "message": f"面板中用户组 {username} 不存在"}), 404
+    if not user_to_delete: return jsonify({"success": False, "message": f"用户组 {username} 不存在"}), 404
 
     kill_user_sessions(username)
     
@@ -1678,7 +1729,7 @@ def delete_user_api():
         ip_bans.pop(username)
         save_ip_bans(ip_bans)
 
-    success, output = safe_run_command(['userdel', '-r', username])
+    success, output = safe_run_command(['/usr/sbin/userdel', '-r', username])
     if not success:
         log_action("USER_DELETE_WARNING", session.get('username', 'root'), f"System user {username} deletion failed (non-fatal): {output}")
 
@@ -1766,7 +1817,9 @@ def get_system_status():
     def get_port_status(port):
         """检查端口是否处于 LISTEN 状态 (使用 ss 命令)"""
         try:
-            success, output = safe_run_command(['ss', '-tuln'], input_data=None)
+            # 动态查找 ss 命令路径
+            ss_bin = shutil.which('ss') or '/bin/ss'
+            success, output = safe_run_command([ss_bin, '-tuln'], input_data=None)
             if success and f":{port} " in output:
                 return 'LISTEN'
             return 'FAIL'
@@ -1821,7 +1874,7 @@ def control_system_service():
     if service == 'wss_panel':
         log_action("SERVICE_CONTROL_WARN", session.get('username', 'root'), "Panel restart requested. Connection may drop.")
 
-    command = ['systemctl', action, service]
+    command = ['/bin/systemctl', action, service]
     success, output = safe_run_command(command)
     
     if success:
@@ -1955,13 +2008,13 @@ if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(PANEL_PORT), debug=False)
 EOF
 
-chmod +x /usr/local/bin/wss_panel.py
+/bin/chmod +x /usr/local/bin/wss_panel.py
 
 export SERVER_IP
 
 # --- 5. 创建 WSS 面板 systemd 服务 ---
 if [ ! -f "/etc/systemd/system/wss_panel.service" ]; then
-tee /etc/systemd/system/wss_panel.service > /dev/null <<EOF
+/usr/bin/tee /etc/systemd/system/wss_panel.service > /dev/null <<EOF
 [Unit]
 Description=WSS User Management Panel (Flask V6.2 Optimized)
 After=network.target
@@ -1978,15 +2031,15 @@ WantedBy=multi-user.target
 EOF
 fi
 
-systemctl daemon-reload
+/bin/systemctl daemon-reload
 # 更新服务描述的版本号
-sudo sed -i "s|Description=WSS User Management Panel (Flask V6.1)|Description=WSS User Management Panel (Flask V6.2 Optimized)|" /etc/systemd/system/wss_panel.service
-sudo sed -i "s|Description=WSS User Management Panel (Flask V6.2)|Description=WSS User Management Panel (Flask V6.2 Optimized)|" /etc/systemd/system/wss_panel.service
-sudo sed -i "s|^ExecStart=.*|ExecStart=$PYTHON_VENV_PATH /usr/local/bin/wss_panel.py|" /etc/systemd/system/wss_panel.service
+/usr/bin/sudo /bin/sed -i "s|Description=WSS User Management Panel (Flask V6.1)|Description=WSS User Management Panel (Flask V6.2 Optimized)|" /etc/systemd/system/wss_panel.service
+/usr/bin/sudo /bin/sed -i "s|Description=WSS User Management Panel (Flask V6.2)|Description=WSS User Management Panel (Flask V6.2 Optimized)|" /etc/systemd/system/wss_panel.service
+/usr/bin/sudo /bin/sed -i "s|^ExecStart=.*|ExecStart=$PYTHON_VENV_PATH /usr/local/bin/wss_panel.py|" /etc/systemd/system/wss_panel.service
 
-systemctl daemon-reload
-systemctl enable wss_panel || true
-systemctl restart wss_panel
+/bin/systemctl daemon-reload
+/bin/systemctl enable wss || true
+/bin/systemctl restart wss_panel
 echo "WSS 管理面板 V6.2 优化版 已启动/重启，端口 $PANEL_PORT"
 echo "----------------------------------"
 
@@ -1998,33 +2051,33 @@ setup_iptables_chains() {
     BLOCK_CHAIN="WSS_IP_BLOCK"
     
     # 清理旧的 WSS 链和规则
-    iptables -D INPUT -j $BLOCK_CHAIN 2>/dev/null || true
-    iptables -F $BLOCK_CHAIN 2>/dev/null || true
-    iptables -X $BLOCK_CHAIN 2>/dev/null || true
+    /sbin/iptables -D INPUT -j $BLOCK_CHAIN 2>/dev/null || true
+    /sbin/iptables -F $BLOCK_CHAIN 2>/dev/null || true
+    /sbin/iptables -X $BLOCK_CHAIN 2>/dev/null || true
     
     # 允许 loopback 接口
-    iptables -A INPUT -i lo -j ACCEPT
+    /sbin/iptables -A INPUT -i lo -j ACCEPT
     # 允许已建立的和相关的连接
-    iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+    /sbin/iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
 
     # 1. 创建并插入 IP 阻断链 (必须在端口开放规则之前，以实现实时封禁)
-    iptables -N $BLOCK_CHAIN 2>/dev/null || true 
-    iptables -I INPUT 1 -j $BLOCK_CHAIN # 插入到最前面
+    /sbin/iptables -N $BLOCK_CHAIN 2>/dev/null || true 
+    /sbin/iptables -I INPUT 1 -j $BLOCK_CHAIN # 插入到最前面
 
     # 2. 开放 TCP 服务端口
     echo "开放 TCP 端口: $WSS_HTTP_PORT(HTTP), $WSS_TLS_PORT(TLS), $STUNNEL_PORT(Stunnel), $PANEL_PORT(Panel)"
-    iptables -A INPUT -p tcp --dport $WSS_HTTP_PORT -j ACCEPT
-    iptables -A INPUT -p tcp --dport $WSS_TLS_PORT -j ACCEPT
-    iptables -A INPUT -p tcp --dport $STUNNEL_PORT -j ACCEPT
-    iptables -A INPUT -p tcp --dport $PANEL_PORT -j ACCEPT
+    /sbin/iptables -A INPUT -p tcp --dport $WSS_HTTP_PORT -j ACCEPT
+    /sbin/iptables -A INPUT -p tcp --dport $WSS_TLS_PORT -j ACCEPT
+    /sbin/iptables -A INPUT -p tcp --dport $STUNNEL_PORT -j ACCEPT
+    /sbin/iptables -A INPUT -p tcp --dport $PANEL_PORT -j ACCEPT
 
     # 3. 开放 UDPGW 端口
     echo "开放 UDP 端口: $UDPGW_PORT(UDPGW)"
-    iptables -A INPUT -p udp --dport $UDPGW_PORT -j ACCEPT
+    /sbin/iptables -A INPUT -p udp --dport $UDPGW_PORT -j ACCEPT
     
     # 4. 保存规则
-    if command -v iptables-save >/dev/null; then
-        iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+    if command -v /sbin/iptables-save >/dev/null; then
+        /sbin/iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
         echo "IPTABLES 规则已保存到 /etc/iptables/rules.v4。"
     fi
 
@@ -2036,22 +2089,22 @@ setup_iptables_chains
 
 # --- 7. 移除流量同步 Cron Job ---
 echo "==== 移除流量同步 Cron Job ===="
-rm -f /etc/cron.d/wss-traffic || true
+/bin/rm -f /etc/cron.d/wss-traffic || true
 echo "流量同步 Cron Job 已移除。"
 echo "----------------------------------"
 
 # --- 8. SSHD 安全配置 ---
 SSHD_CONFIG="/etc/ssh/sshd_config"
 BACKUP_SUFFIX=".bak.wss$(date +%s)"
-SSHD_SERVICE=$(systemctl list-units --full -all | grep -E "sshd\.service|ssh\.service" | grep -v "not-found" | head -n 1 | awk '{print $1}' | cut -d'.' -f1 || echo "sshd")
+SSHD_SERVICE=$(/bin/systemctl list-units --full -all | /bin/grep -E "sshd\.service|ssh\.service" | /bin/grep -v "not-found" | /usr/bin/head -n 1 | /usr/bin/awk '{print $1}' | /usr/bin/cut -d'.' -f1 || echo "sshd")
 
 echo "==== 配置 SSHD 安全策略 (增强连接稳定性) ===="
-cp -a "$SSHD_CONFIG" "${SSHD_CONFIG}${BACKUP_SUFFIX}"
+/bin/cp -a "$SSHD_CONFIG" "${SSHD_CONFIG}${BACKUP_SUFFIX}"
 echo "SSHD 配置已备份到 ${SSHD_CONFIG}${BACKUP_SUFFIX}"
 
-sed -i '/# WSS_TUNNEL_BLOCK_START/,/# WSS_TUNNEL_BLOCK_END/d' "$SSHD_CONFIG"
+/bin/sed -i '/# WSS_TUNNEL_BLOCK_START/,/# WSS_TUNNEL_BLOCK_END/d' "$SSHD_CONFIG"
 
-cat >> "$SSHD_CONFIG" <<EOF
+/bin/cat >> "$SSHD_CONFIG" <<EOF
 
 # WSS_TUNNEL_BLOCK_START -- managed by deploy_wss_panel.sh (V6.2 Optimized)
 # 统一策略: 允许所有用户通过本机 (127.0.0.1, ::1) 使用密码进行认证。
@@ -2067,18 +2120,18 @@ Match Address 127.0.0.1,::1
 
 EOF
 
-chmod 600 "$SSHD_CONFIG"
+/bin/chmod 600 "$SSHD_CONFIG"
 
 echo "重新加载并重启 ssh 服务 ($SSHD_SERVICE)"
-systemctl daemon-reload
-systemctl restart "$SSHD_SERVICE"
+/bin/systemctl daemon-reload
+/bin/systemctl restart "$SSHD_SERVICE"
 echo "SSHD 配置更新完成，连接稳定性已增强。"
 echo "----------------------------------"
 
 unset PANEL_ROOT_PASS_RAW
 
 echo "=================================================="
-echo "✅ WSS 管理面板部署完成！"
+echo "✅ WSS 管理面板部署完成！ (V6.2 优化版)"
 echo "=================================================="
 echo "WSS 核心代理已集成 uvloop，性能提升显著。"
 echo "SSH 隧道目标端口已配置为: $SSH_TARGET_PORT"
