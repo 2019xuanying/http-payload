@@ -31,8 +31,9 @@ STUNNEL_PORT=${STUNNEL_PORT:-444}
 read -p "请输入 UDPGW 端口 (默认7300): " UDPGW_PORT
 UDPGW_PORT=${UDPGW_PORT:-7300}
 
-read -p "请输入 WSS/Stunnel 内部 SSH 转发端口 (默认22, 此为 WSS/Stunnel 连接到 SSH 的端口): " INTERNAL_FORWARD_PORT
-INTERNAL_FORWARD_PORT=${INTERNAL_FORWARD_PORT:-22}
+# === 内部转发端口提示 ===
+read -p "请输入 WSS/Stunnel 内部 SSH 转发端口 (默认48303, 此为 WSS/Stunnel 连接到 SSH 的端口): " INTERNAL_FORWARD_PORT
+INTERNAL_FORWARD_PORT=${INTERNAL_FORWARD_PORT:-48303}
 # ==============================
 
 echo "----------------------------------"
@@ -64,14 +65,14 @@ echo "----------------------------------"
 echo "==== 系统更新与依赖安装 ===="
 apt update -y
 apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4
-# 额外安装 jinja2 用于手动渲染模板
-pip3 install flask jinja2
+# 额外安装 flask, jinja2 和 uvloop (用于高性能 event loop)
+pip3 install flask jinja2 uvloop
 echo "依赖安装完成"
 echo "----------------------------------"
 
 
 # =============================
-# WSS 核心代理脚本 (使用 <<EOF 允许变量替换)
+# WSS 核心代理脚本
 # =============================
 echo "==== 安装 WSS 核心代理脚本 (/usr/local/bin/wss) ===="
 tee /usr/local/bin/wss > /dev/null <<EOF
@@ -79,6 +80,7 @@ tee /usr/local/bin/wss > /dev/null <<EOF
 # -*- coding: utf-8 -*-
 
 import asyncio, ssl, sys
+import uvloop # 导入 uvloop, 用于高性能 event loop
 
 LISTEN_ADDR = '0.0.0.0'
 
@@ -208,6 +210,8 @@ async def main():
 
 if __name__ == '__main__':
     try:
+        # 使用 uvloop 作为 event loop 实现，提供性能加速
+        uvloop.install() 
         asyncio.run(main())
     except KeyboardInterrupt:
         print("WSS Proxy Stopped.")
