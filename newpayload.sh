@@ -3,14 +3,9 @@
 set -eu
 
 # ==========================================================
-# WSS 隧道与用户管理面板一键部署脚本
+# WSS 隧道与用户管理面板一键部署脚本 (功能升级版)
 # ----------------------------------------------------------
-# 包含 WSS 代理、Stunnel4、UDPGW 以及基于 Flask 的用户管理面板。
-# Panel 默认端口: 54321 (可修改)
-# WSS 默认端口: HTTP 80, TLS 443
-# Stunnel 默认端口: 444
-# UDPGW 默认端口: 7300
-# 内部转发端口: 48303 (可修改)
+# Panel 新功能: 实时服务/端口状态监控, 资源使用率, 服务重启, 自动刷新日志
 # ==========================================================
 
 # =============================
@@ -65,7 +60,7 @@ echo "----------------------------------"
 echo "==== 系统更新与依赖安装 ===="
 apt update -y
 apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4
-# 额外安装 flask, jinja2 和 uvloop (用于高性能 event loop)
+# 额外安装 flask, jinja2, uvloop, 和 ss (用于端口检查)
 pip3 install flask jinja2 uvloop
 echo "依赖安装完成"
 echo "----------------------------------"
@@ -328,7 +323,7 @@ if [ ! -f "$USER_DB" ]; then
     echo "[]" > "$USER_DB"
 fi
 
-# 嵌入 Python 面板代码
+# 嵌入 Python 面板代码 (包含新的API和逻辑)
 tee /usr/local/bin/wss_panel.py > /dev/null <<EOF
 # -*- coding: utf-8 -*-
 from flask import Flask, request, jsonify, redirect, url_for, session, make_response
@@ -337,7 +332,7 @@ import subprocess
 import os
 import hashlib
 import time
-import jinja2 # 引入 Jinja2
+import jinja2
 
 # --- 配置 ---
 USER_DB_PATH = "$USER_DB"
@@ -352,12 +347,12 @@ WSS_HTTP_PORT = "$WSS_HTTP_PORT"
 WSS_TLS_PORT = "$WSS_TLS_PORT"
 STUNNEL_PORT = "$STUNNEL_PORT"
 UDPGW_PORT = "$UDPGW_PORT"
-INTERNAL_FORWARD_PORT = "$INTERNAL_FORWARD_PORT" # 新增内部转发端口
+INTERNAL_FORWARD_PORT = "$INTERNAL_FORWARD_PORT" 
 
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET_KEY
 
-# --- 数据库操作 ---
+# --- 数据库操作/认证装饰器/系统工具函数 (保持不变) ---
 
 def load_users():
     """从 JSON 文件加载用户列表."""
@@ -386,8 +381,6 @@ def get_user(username):
             return user
     return None
 
-# --- 认证装饰器 ---
-
 def login_required(f):
     """检查用户是否已登录."""
     def decorated_function(*args, **kwargs):
@@ -396,8 +389,6 @@ def login_required(f):
         return f(*args, **kwargs)
     decorated_function.__name__ = f.__name__
     return decorated_function
-
-# --- 系统工具函数 ---
 
 def safe_run_command(command, input=None):
     """安全执行系统命令并返回结果."""
@@ -408,14 +399,226 @@ def safe_run_command(command, input=None):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             input=input, # 接受 bytes 输入
+            timeout=5 # 增加超时保护
         )
-        return True, result.stdout.decode('utf-8').strip()
+        return True, result.stdout.decode('utf-8', errors='ignore').strip()
     except subprocess.CalledProcessError as e:
-        return False, e.stderr.decode('utf-8').strip()
+        return False, e.stderr.decode('utf-8', errors='ignore').strip()
     except FileNotFoundError:
         return False, "Command not found."
+    except subprocess.TimeoutExpired:
+        return False, "Command timed out."
+        
+# --- System Monitoring Functions ---
 
-# --- HTML 模板和渲染 (修复后的逻辑) ---
+def get_cpu_usage():
+    """Calculates CPU usage percentage."""
+    try:
+        # Use mpstat for robust CPU usage reading. Requires sysstat if not present, but widely available.
+        success, output = safe_run_command(['bash', '-c', "LC_ALL=C mpstat 1 1 | awk '/^Average:/ {print 100 - \$NF}'"])
+        if success and output:
+            # mpstat output is usually more complex, so we fallback to reading /proc/stat if mpstat is not installed/fails
+            if "not found" in output:
+                # Simpler approximation by reading /proc/stat
+                with open('/proc/stat', 'r') as f:
+                    line1 = f.readline().split()
+                time.sleep(0.1)
+                with open('/proc/stat', 'r') as f:
+                    line2 = f.readline().split()
+
+                total1 = sum(int(x) for x in line1[1:])
+                idle1 = int(line1[4])
+                total2 = sum(int(x) for x in line2[1:])
+                idle2 = int(line2[4])
+
+                total_diff = total2 - total1
+                idle_diff = idle2 - idle1
+                
+                if total_diff == 0:
+                    return 0.0
+                    
+                cpu_usage = 100.0 * (total_diff - idle_diff) / total_diff
+                return round(cpu_usage, 1)
+            
+            return round(float(output), 1)
+        return "N/A"
+    except Exception:
+        return "N/A"
+
+def get_memory_usage():
+    """Calculates memory usage percentage and total/used."""
+    try:
+        # Get data from /proc/meminfo
+        success, output = safe_run_command(['free', '-m'])
+        if success:
+            lines = output.split('\n')
+            # Look for the Mem line (usually the second line)
+            mem_line = lines[1].split()
+            total = int(mem_line[1])
+            used = int(mem_line[2])
+            
+            if total > 0:
+                usage = (used / total) * 100
+                return {
+                    "usage": round(usage, 1),
+                    "total_mb": total,
+                    "used_mb": used
+                }
+        return {"usage": "N/A", "total_mb": "N/A", "used_mb": "N/A"}
+    except Exception:
+        return {"usage": "N/A", "total_mb": "N/A", "used_mb": "N/A"}
+
+
+def get_disk_usage():
+    """Gets root filesystem disk usage."""
+    try:
+        success, output = safe_run_command(['df', '-h', '/'])
+        if success:
+            lines = output.split('\n')
+            # The last line should contain the root partition usage
+            disk_line = lines[-1].split()
+            if len(disk_line) >= 5:
+                # Usage is the 5th column, remove the '%' sign
+                usage_str = disk_line[4].replace('%', '')
+                return {"usage": int(usage_str)}
+        return {"usage": "N/A"}
+    except Exception:
+        return {"usage": "N/A"}
+
+def get_service_status_detail(service_name):
+    """Returns service status and a descriptive label/color."""
+    success, output = safe_run_command(['systemctl', 'is-active', service_name])
+    status = output.strip()
+    
+    if success and status == 'active':
+        return "active", "运行中", "#2ecc71"
+    elif status == 'inactive':
+        return "inactive", "已停止", "#f39c12"
+    else:
+        # Check if failed for better feedback
+        failed_check = safe_run_command(['systemctl', 'is-failed', service_name])
+        if failed_check[0] and failed_check[1] == 'failed':
+            return "failed", "失败", "#e74c3c"
+        return status.capitalize() or "unknown", "未知", "#888"
+
+def get_port_status_detail(port):
+    """Checks if a port is listening using 'ss'."""
+    port_str = str(port)
+    # Using 'ss' (better performance than netstat)
+    success, output = safe_run_command(['ss', '-tuln'])
+    
+    # Check for both TCP/UDP on the port (only checking for the port number string)
+    if success and (f':{port_str}' in output or f' {port_str}' in output):
+        return "监听中", "#2ecc71"
+    return "未监听", "#e74c3c"
+
+def get_logs_data(service_name, lines=50):
+    """Retrieves journalctl logs."""
+    # Using 'journalctl -u' which handles systemd service logs
+    success, output = safe_run_command(['journalctl', '-u', service_name, f'-n {lines}', '--no-pager', '--utc'])
+    return output if success else f"错误: 无法获取 {service_name} 日志. 请检查服务是否安装或运行. {output}"
+
+
+# --- API Routes ---
+
+@app.route('/api/monitor_data', methods=['GET'])
+@login_required
+def get_monitor_data_api():
+    """API to get system health, service, and port statuses."""
+    
+    # 1. System Health
+    cpu_usage = get_cpu_usage()
+    mem_info = get_memory_usage()
+    disk_info = get_disk_usage()
+    
+    system_health = {
+        "cpu_usage": cpu_usage,
+        "mem_usage": mem_info["usage"],
+        "mem_total_mb": mem_info["total_mb"],
+        "mem_used_mb": mem_info["used_mb"],
+        "disk_usage": disk_info["usage"]
+    }
+    
+    # 2. Service Status
+    components = {
+        'wss': 'WSS Proxy', 
+        'stunnel4': 'Stunnel4', 
+        'udpgw': 'UDPGW',
+        'wss_panel': 'Web Panel', 
+    }
+    service_statuses = []
+    for service_id, service_name in components.items():
+        state, label, color = get_service_status_detail(service_id)
+        service_statuses.append({
+            'id': service_id,
+            'name': service_name,
+            'state': state,
+            'label': label,
+            'color': color
+        })
+
+    # 3. Port Status
+    ports = [
+        {'name': 'WSS (HTTP Payload)', 'port': WSS_HTTP_PORT, 'protocol': 'TCP'},
+        {'name': 'WSS (TLS)', 'port': WSS_TLS_PORT, 'protocol': 'TCP'},
+        {'name': 'Stunnel (TLS Tunnel)', 'port': STUNNEL_PORT, 'protocol': 'TCP'},
+        {'name': 'UDPGW (UDP Forward)', 'port': UDPGW_PORT, 'protocol': 'UDP'},
+        {'name': 'Web Panel (Flask)', 'port': PANEL_PORT, 'protocol': 'TCP'},
+        # SSH Internal is mainly for checking if SSH is listening on the internal port
+        {'name': 'SSH Internal Forward', 'port': INTERNAL_FORWARD_PORT, 'protocol': 'TCP'} 
+    ]
+    port_statuses = []
+    for p in ports:
+        status, color = get_port_status_detail(p['port'])
+        port_statuses.append({
+            'name': p['name'],
+            'port': p['port'],
+            'protocol': p['protocol'],
+            'status': status,
+            'color': color
+        })
+        
+    return jsonify({
+        "system_health": system_health,
+        "services": service_statuses,
+        "ports": port_statuses
+    })
+
+@app.route('/api/restart', methods=['POST'])
+@login_required
+def restart_service_api():
+    """API to restart a specific service."""
+    service_name = request.json.get('service')
+    if service_name not in ['wss', 'stunnel4', 'wss_panel', 'udpgw']:
+        return jsonify({"success": False, "message": "无效的服务名称。"}), 400
+        
+    # Run the restart command
+    success, output = safe_run_command(['systemctl', 'restart', service_name])
+    
+    # Give the system a brief moment to update status
+    time.sleep(1) 
+    
+    if success:
+        return jsonify({"success": True, "message": f"服务 {service_name} 重启命令已发送。"})
+    else:
+        state, _, _ = get_service_status_detail(service_name)
+        if state == 'active':
+             return jsonify({"success": True, "message": f"服务 {service_name} 重启流程已启动。"})
+        return jsonify({"success": False, "message": f"重启 {service_name} 失败: {output}"}), 500
+
+
+@app.route('/api/logs', methods=['GET'])
+@login_required
+def get_logs_api():
+    """API to get component logs."""
+    logs = {}
+    logs['WSS Proxy (wss)'] = get_logs_data('wss')
+    logs['Stunnel4 (stunnel4)'] = get_logs_data('stunnel4')
+    logs['Web Panel (wss_panel)'] = get_logs_data('wss_panel')
+    logs['UDPGW (udpgw)'] = get_logs_data('udpgw')
+    return jsonify({"logs": logs})
+
+# --- HTML 模板和渲染 (更新) ---
 
 # 仪表盘 HTML (内嵌)
 _DASHBOARD_HTML = """
@@ -433,33 +636,53 @@ _DASHBOARD_HTML = """
         .header button:hover { background-color: #c0392b; }
         .container { padding: 20px; max-width: 1200px; margin: 20px auto; }
         .card { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05); margin-bottom: 20px; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
-        .stat-box { background-color: #ecf0f1; padding: 15px; border-radius: 8px; text-align: center; }
-        .stat-box h3 { margin: 0 0 5px 0; color: #34495e; font-size: 14px; }
-        .stat-box p { margin: 0; font-size: 20px; font-weight: bold; color: #2980b9; }
         
+        /* Status Grid */
+        .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .status-box { background: #ecf0f1; padding: 15px; border-radius: 8px; text-align: center; }
+        .status-box h4 { margin: 0; font-size: 14px; color: #34495e; font-weight: 500;}
+        .status-box p { margin: 5px 0 0; font-size: 18px; font-weight: bold; }
+        .status-indicator { display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 5px; }
+
+        /* User & Ports Table */
+        .user-table { width: 100%; border-collapse: collapse; margin-top: 15px; }
+        .user-table th, .user-table td { border: 1px solid #ddd; padding: 12px; text-align: left; }
+        .user-table th { background-color: #f7f7f7; color: #333; }
+        .user-table tr:nth-child(even) { background-color: #f9f9f9; }
+        .delete-btn { background-color: #e74c3c; color: white; border: none; padding: 6px 10px; border-radius: 5px; cursor: pointer; font-size: 12px; }
+        .delete-btn:hover { background-color: #c0392b; }
+        .action-btn { background-color: #3498db; color: white; border: none; padding: 6px 10px; border-radius: 5px; cursor: pointer; font-size: 12px; }
+        .action-btn:hover { background-color: #2980b9; }
+
+        /* Logs */
+        .log-container-wrapper { 
+            background-color: #333; 
+            padding: 10px; 
+            border-radius: 6px; 
+            overflow: hidden; 
+        }
+        .log-pre { 
+            background-color: #333; 
+            color: #ecf0f1; 
+            margin: 0;
+            padding: 5px; 
+            overflow-y: scroll; 
+            font-size: 12px; 
+            max-height: 250px; /* Limit height for scrollable view */
+            white-space: pre-wrap;
+            scrollbar-width: thin;
+        }
+
         /* Form */
         .user-form input[type=text], .user-form input[type=password] { padding: 10px; margin-right: 10px; border: 1px solid #ccc; border-radius: 6px; }
         .user-form button { background-color: #2ecc71; color: white; border: none; padding: 10px 15px; border-radius: 6px; cursor: pointer; transition: background-color 0.3s; }
         .user-form button:hover { background-color: #27ae60; }
 
-        /* Table */
-        .user-table { width: 100%; border-collapse: collapse; margin-top: 15px; }
-        .user-table th, .user-table td { border: 1px solid #ddd; padding: 12px; text-align: left; }
-        .user-table th { background-color: #f7f7f7; color: #333; }
-        .user-table tr:nth-child(even) { background-color: #f9f9f9; }
-        .user-table .delete-btn { background-color: #e74c3c; color: white; border: none; padding: 6px 10px; border-radius: 5px; cursor: pointer; font-size: 12px; }
-        .user-table .delete-btn:hover { background-color: #c0392b; }
-
-        /* Status & Alert */
+        /* Alerts */
         .alert { padding: 15px; border-radius: 8px; margin-bottom: 20px; font-weight: bold; }
         .alert-success { background-color: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
         .alert-error { background-color: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
 
-        /* Connection Info */
-        .connection-info h3 { margin-top: 0; color: #2c3e50; }
-        .connection-info pre { background-color: #ecf0f1; padding: 10px; border-radius: 6px; overflow-x: auto; font-size: 14px; }
-        .note { color: #888; font-size: 14px; margin-top: 15px; border-left: 3px solid #f39c12; padding-left: 10px; }
     </style>
 </head>
 <body>
@@ -471,48 +694,79 @@ _DASHBOARD_HTML = """
     <div class="container">
         <div id="status-message" class="alert" style="display:none;"></div>
         
-        <div class="grid">
-            <div class="stat-box">
-                <h3>已创建用户数</h3>
-                <p id="user-count">{{ users|length }}</p>
+        <!-- 实时系统状态 -->
+        <div class="card">
+            <h3>实时系统状态</h3>
+            <div class="status-grid">
+                <div class="status-box">
+                    <h4>已创建用户数</h4>
+                    <p id="user-count">{{ users|length }}</p>
+                </div>
+                <div class="status-box">
+                    <h4>CPU 使用率</h4>
+                    <p id="cpu-usage">--</p>
+                </div>
+                <div class="status-box">
+                    <h4>内存使用率</h4>
+                    <p id="mem-usage">--</p>
+                </div>
+                <div class="status-box">
+                    <h4>磁盘使用率 (根目录)</h4>
+                    <p id="disk-usage">--</p>
+                </div>
+                <!-- Core Service Status (Inline) -->
+                <div class="status-box">
+                    <h4>WSS Proxy 状态</h4>
+                    <p><span id="wss-status-indicator" class="status-indicator"></span><span id="wss-status-label">--</span></p>
+                </div>
+                <div class="status-box">
+                    <h4>Stunnel4 状态</h4>
+                    <p><span id="stunnel4-status-indicator" class="status-indicator"></span><span id="stunnel4-status-label">--</span></p>
+                </div>
+                <div class="status-box">
+                    <h4>UDPGW 状态</h4>
+                    <p><span id="udpgw-status-indicator" class="status-indicator"></span><span id="udpgw-status-label">--</span></p>
+                </div>
+                <div class="status-box">
+                    <h4>Web Panel 状态</h4>
+                    <p><span id="wss_panel-status-indicator" class="status-indicator"></span><span id="wss_panel-status-label">--</span></p>
+                </div>
             </div>
-            <div class="stat-box">
-                <h3>Web 面板端口</h3>
-                <p>{{ panel_port }}</p>
-            </div>
-            <div class="stat-box">
-                <h3>WSS (HTTP) 端口</h3>
-                <p>{{ wss_http_port }}</p>
-            </div>
-            <div class="stat-box">
-                <h3>WSS (TLS) / Stunnel 端口</h3>
-                <p>{{ wss_tls_port }} / {{ stunnel_port }}</p>
-            </div>
-            <div class="stat-box">
-                <h3>内部转发端口</h3>
-                <p>{{ internal_forward_port }}</p>
+        </div>
+        
+        <!-- 服务控制与端口状态 -->
+        <div class="card">
+            <h3>服务控制与端口状态</h3>
+            <table class="user-table" id="service-control-table">
+                <thead>
+                    <tr>
+                        <th style="width: 30%;">组件名称</th>
+                        <th style="width: 25%;">端口</th>
+                        <th style="width: 20%;">监听状态</th>
+                        <th>操作</th>
+                    </tr>
+                </thead>
+                <tbody id="service-port-tbody">
+                    <!-- Dynamically populated by JS -->
+                </tbody>
+            </table>
+        </div>
+
+        <!-- 实时日志 -->
+        <div class="card">
+            <h3>实时组件日志 (最新50条)</h3>
+            <div class="log-container-wrapper">
+                <p style="color:#aaa; font-size:12px; margin-bottom: 5px;">日志自动刷新中 (每10秒)</p>
+                <pre id="log-pre-content" class="log-pre">正在加载日志...</pre>
             </div>
         </div>
 
-        <div class="card connection-info">
-            <h3>连接信息 (请替换 [Your Server IP])</h3>
-            <p>使用以下信息配置你的客户端 (如 v2ray/Shadowsocks-Rust/Tunnelier等)：</p>
-            
-            <h4>WSS (WebSocket) 或 Stunnel (TLS) 连接</h4>
-            <pre>
-服务器地址: {{ host_ip }}
-WSS HTTP 端口: {{ wss_http_port }}
-WSS TLS 端口: {{ wss_tls_port }}
-Stunnel 端口: {{ stunnel_port }}
-内部转发端口: {{ internal_forward_port }} (WSS/Stunnel 连接到 SSH 的端口，无需客户端填写)
-</pre>
-            <p class="note">注意：所有连接方式的底层认证都是 **SSH 账户/密码**。用户只能使用面板创建的账户密码进行登录。UDPGW端口 {{ udpgw_port }} 仅供本机 WSS 代理内部转发 UDP 流量使用。</p>
-        </div>
 
+        <!-- 用户管理 -->
         <div class="card">
             <h3>新增 WSS 用户</h3>
             <form id="add-user-form" class="user-form">
-                <input type="text" id="new-username" placeholder="用户名" pattern="[a-z0-9_]{3,16}" title="用户名只能包含小写字母、数字和下划线，长度3-16位" required>
+                <input type="text" id="new-username" placeholder="用户名 (小写字母/数字/下划线)" pattern="[a-z0-9_]{3,16}" title="用户名只能包含小写字母、数字和下划线，长度3-16位" required>
                 <input type="password" id="new-password" placeholder="密码" required>
                 <button type="submit">创建用户</button>
             </form>
@@ -544,6 +798,8 @@ Stunnel 端口: {{ stunnel_port }}
     </div>
     
     <script>
+        // --- Utility Functions ---
+
         function showStatus(message, isSuccess) {
             const statusDiv = document.getElementById('status-message');
             statusDiv.textContent = message;
@@ -551,6 +807,158 @@ Stunnel 端口: {{ stunnel_port }}
             statusDiv.style.display = 'block';
             setTimeout(() => { statusDiv.style.display = 'none'; }, 5000);
         }
+        
+        // --- Real-time Monitoring Functions ---
+
+        async function refreshMonitorData() {
+            try {
+                const response = await fetch('/api/monitor_data');
+                const data = await response.json();
+                
+                if (response.ok) {
+                    renderSystemHealth(data.system_health);
+                    renderServiceAndPortStatus(data.services, data.ports);
+                } else {
+                    showStatus('获取状态失败: ' + (data.message || '未知错误'), false);
+                }
+            } catch (error) {
+                console.error("Monitor data fetch error:", error);
+                // showStatus('请求状态 API 失败，请检查面板运行状态。', false); // Silence error for continuous polling
+            }
+        }
+        
+        function renderSystemHealth(health) {
+            document.getElementById('cpu-usage').textContent = health.cpu_usage !== "N/A" ? \`\${health.cpu_usage}%\` : '--';
+            
+            let memText = health.mem_usage !== "N/A" ? \`\${health.mem_usage}% (\${health.mem_used_mb}/\${health.mem_total_mb}MB)\` : '--';
+            document.getElementById('mem-usage').textContent = memText;
+            
+            document.getElementById('disk-usage').textContent = health.disk_usage !== "N/A" ? \`\${health.disk_usage}%\` : '--';
+
+            // Update core service status indicators
+            health.services.forEach(service => {
+                const indicator = document.getElementById(\`\${service.id}-status-indicator\`);
+                const label = document.getElementById(\`\${service.id}-status-label\`);
+                
+                if (indicator && label) {
+                    indicator.style.backgroundColor = service.color;
+                    label.textContent = service.label;
+                }
+            });
+        }
+        
+        function renderServiceAndPortStatus(services, ports) {
+            const tableBody = document.getElementById('service-port-tbody');
+            tableBody.innerHTML = '';
+            
+            // Map service names to easily find port info
+            const portMap = {};
+            ports.forEach(p => {
+                let key = p.name.split(' ')[0].toLowerCase();
+                if (key === 'wss') key = p.name.includes('TLS') ? 'wss_tls' : 'wss_http';
+                if (key === 'web') key = 'wss_panel';
+
+                portMap[key] = p;
+            });
+            
+            const servicePortData = [
+                { id: 'wss_http', name: 'WSS Proxy (HTTP)', port: '{{ wss_http_port }}', protocol: 'TCP' },
+                { id: 'wss_tls', name: 'WSS Proxy (TLS)', port: '{{ wss_tls_port }}', protocol: 'TCP' },
+                { id: 'stunnel4', name: 'Stunnel4 (TLS)', port: '{{ stunnel_port }}', protocol: 'TCP' },
+                { id: 'udpgw', name: 'UDPGW (UDP)', port: '{{ udpgw_port }}', protocol: 'UDP' },
+                { id: 'wss_panel', name: 'Web Panel (Flask)', port: '{{ panel_port }}', protocol: 'TCP' },
+                { id: 'ssh_internal', name: 'SSH (Internal Forward)', port: '{{ internal_forward_port }}', protocol: 'TCP' },
+            ];
+
+            const serviceComponentMap = {
+                'wss_http': 'wss', 'wss_tls': 'wss', 
+                'stunnel4': 'stunnel4', 'udpgw': 'udpgw', 'wss_panel': 'wss_panel', 
+                'ssh_internal': null // No restart action for SSH daemon via panel
+            };
+
+            servicePortData.forEach(item => {
+                const portInfo = ports.find(p => p.port == item.port);
+                const status = portInfo ? portInfo.status : 'N/A';
+                const color = portInfo ? portInfo.color : '#888';
+                const serviceId = serviceComponentMap[item.id];
+                
+                const row = document.createElement('tr');
+                row.innerHTML = \`
+                    <td>\${item.name}</td>
+                    <td>\${item.port} (\${item.protocol})</td>
+                    <td><span style="color:\${color}; font-weight: bold;">\${status}</span></td>
+                    <td>
+                        \${serviceId ? \`<button class="action-btn" onclick="restartService('\${serviceId}')">重启</button>\` : 'N/A'}
+                    </td>
+                \`;
+                tableBody.appendChild(row);
+            });
+        }
+
+        async function restartService(serviceId) {
+            if (window.prompt(\`确定要重启 \${serviceId} 服务吗? (输入 YES 确认)\`) !== 'YES') {
+                return;
+            }
+            
+            showStatus(\`正在重启 \${serviceId}...\`, true);
+            
+            try {
+                const response = await fetch('/api/restart', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ service: serviceId })
+                });
+
+                const result = await response.json();
+                
+                if (response.ok && result.success) {
+                    showStatus(result.message, true);
+                    // Give services time to restart before refreshing status
+                    setTimeout(refreshMonitorData, 3000); 
+                } else {
+                    showStatus('重启失败: ' + (result.message || '未知错误'), false);
+                    setTimeout(refreshMonitorData, 3000);
+                }
+            } catch (error) {
+                showStatus('请求重启 API 失败，请检查面板运行状态。', false);
+            }
+        }
+        
+        async function fetchLogs() {
+            try {
+                const response = await fetch('/api/logs');
+                const data = await response.json();
+                
+                if (response.ok) {
+                    const logContent = document.getElementById('log-pre-content');
+                    logContent.textContent = ''; // Clear previous content
+                    
+                    // Combine all logs into one scrollable view
+                    const logKeys = Object.keys(data.logs);
+                    let combinedLog = '';
+                    
+                    logKeys.forEach(key => {
+                        // Prepend a separator for clarity
+                        combinedLog += \`\n================= \${key} =================\n\`;
+                        // Use slice to ensure last 50 lines focus (already filtered on server side)
+                        combinedLog += data.logs[key];
+                    });
+                    
+                    logContent.textContent = combinedLog.trim();
+                    logContent.scrollTop = logContent.scrollHeight; // Auto scroll to bottom
+                    
+                    // showStatus('最新系统日志已加载。', true); // Silence frequent success message
+                } else {
+                    showStatus('获取日志失败: ' + (data.message || '未知错误'), false);
+                }
+            } catch (error) {
+                console.error("Log fetch error:", error);
+                // showStatus('请求日志 API 失败，请检查面板运行状态。', false); // Silence error for continuous polling
+            }
+        }
+
+
+        // --- Existing User Management Logic (Kept for completeness) ---
 
         document.getElementById('add-user-form').addEventListener('submit', async function(e) {
             e.preventDefault();
@@ -575,7 +983,7 @@ Stunnel 端口: {{ stunnel_port }}
                     showStatus(result.message, true);
                     document.getElementById('new-username').value = '';
                     document.getElementById('new-password').value = '';
-                    location.reload(); // 简单粗暴地刷新以更新列表
+                    location.reload(); 
                 } else {
                     showStatus('创建失败: ' + result.message, false);
                 }
@@ -585,8 +993,8 @@ Stunnel 端口: {{ stunnel_port }}
         });
 
         async function deleteUser(username) {
-            // 使用简化的 prompt 替代 confirm，提高 iframe 兼容性
-            if (window.prompt(\`确定要删除用户 \$\{username\} 吗? (输入 YES 确认)\`) !== 'YES') {
+            // 修正: 确保模板字面量在 bash heredoc 中正确转义 \` 和 \$\{
+            if (window.prompt(\`确定要删除用户 \$\{username\} 吗? (输入 YES 确认)\`) !== 'YES') { 
                 return;
             }
             
@@ -618,6 +1026,18 @@ Stunnel 端口: {{ stunnel_port }}
             window.location.href = '/logout';
         }
         
+        // --- Polling Setup ---
+        // Refresh status every 5 seconds (CPU/Memory/Service Status)
+        setInterval(refreshMonitorData, 5000);
+        // Refresh logs every 10 seconds
+        setInterval(fetchLogs, 10000);
+        
+        // Initial load
+        window.onload = () => {
+            refreshMonitorData();
+            fetchLogs();
+        };
+        
     </script>
 </body>
 </html>
@@ -629,11 +1049,6 @@ def render_dashboard(users):
     template_env = jinja2.Environment(loader=jinja2.BaseLoader)
     template = template_env.from_string(_DASHBOARD_HTML)
     
-    # 获取服务器IP (这里只能从请求头推测，不能保证准确，需要用户手动替换)
-    host_ip = request.host.split(':')[0]
-    if host_ip in ('127.0.0.1', 'localhost'):
-          host_ip = '[Your Server IP]'
-
     context = {
         'users': users,
         'panel_port': PANEL_PORT,
@@ -641,13 +1056,12 @@ def render_dashboard(users):
         'wss_tls_port': WSS_TLS_PORT,
         'stunnel_port': STUNNEL_PORT,
         'udpgw_port': UDPGW_PORT,
-        'internal_forward_port': INTERNAL_FORWARD_PORT, # 传递新增的内部转发端口
-        'host_ip': host_ip
+        'internal_forward_port': INTERNAL_FORWARD_PORT,
     }
     return template.render(**context)
 
 
-# --- Web 路由 ---
+# --- Web 路由 (保持不变) ---
 
 @app.route('/', methods=['GET'])
 @login_required
@@ -717,6 +1131,9 @@ def login():
 def logout():
     session.pop('logged_in', None)
     return redirect(url_for('login'))
+
+
+# --- Existing API Routes (Kept for completeness) ---
 
 @app.route('/api/users/add', methods=['POST'])
 @login_required
