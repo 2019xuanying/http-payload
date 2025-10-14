@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
+
 set -eu
 
 # ==========================================================
 # WSS 隧道与用户管理面板一键部署脚本
 # ----------------------------------------------------------
 # 包含 WSS 代理、Stunnel4、UDPGW 以及基于 Flask 的用户管理面板。
-# Panel 默认端口: 8080 (可修改)
+# Panel 默认端口: 54321 (可修改)
 # WSS 默认端口: HTTP 80, TLS 443
 # Stunnel 默认端口: 444
 # UDPGW 默认端口: 7300
+# 内部转发端口: 48303 (可修改)
 # ==========================================================
 
 # =============================
@@ -16,6 +18,7 @@ set -eu
 # =============================
 echo "----------------------------------"
 echo "==== WSS 基础设施端口配置 ===="
+
 read -p "请输入 WSS HTTP 监听端口 (默认80): " WSS_HTTP_PORT
 WSS_HTTP_PORT=${WSS_HTTP_PORT:-80}
 
@@ -28,10 +31,15 @@ STUNNEL_PORT=${STUNNEL_PORT:-444}
 read -p "请输入 UDPGW 端口 (默认7300): " UDPGW_PORT
 UDPGW_PORT=${UDPGW_PORT:-7300}
 
+read -p "请输入 WSS/Stunnel 内部 SSH 转发端口 (默认22, 此为 WSS/Stunnel 连接到 SSH 的端口): " INTERNAL_FORWARD_PORT
+INTERNAL_FORWARD_PORT=${INTERNAL_FORWARD_PORT:-22}
+# ==============================
+
 echo "----------------------------------"
 echo "==== 管理面板配置 ===="
-read -p "请输入 Web 管理面板监听端口 (默认8080): " PANEL_PORT
-PANEL_PORT=${PANEL_PORT:-8080}
+
+read -p "请输入 Web 管理面板监听端口 (默认54321): " PANEL_PORT
+PANEL_PORT=${PANEL_PORT:-54321}
 
 # 交互式安全输入并确认 ROOT 密码
 echo "请为 Web 面板的 'root' 用户设置密码（输入时隐藏）。"
@@ -63,10 +71,10 @@ echo "----------------------------------"
 
 
 # =============================
-# WSS 核心代理脚本
+# WSS 核心代理脚本 (使用 <<EOF 允许变量替换)
 # =============================
 echo "==== 安装 WSS 核心代理脚本 (/usr/local/bin/wss) ===="
-tee /usr/local/bin/wss > /dev/null <<'EOF'
+tee /usr/local/bin/wss > /dev/null <<EOF
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
@@ -83,7 +91,8 @@ try:
 except (IndexError, ValueError):
     TLS_PORT = 443
 
-DEFAULT_TARGET = ('127.0.0.1', 48303)
+# 使用用户指定的内部转发端口
+DEFAULT_TARGET = ('127.0.0.1', $INTERNAL_FORWARD_PORT)
 BUFFER_SIZE = 65536
 TIMEOUT = 3600
 CERT_FILE = '/etc/stunnel/certs/stunnel.pem'
@@ -186,7 +195,7 @@ async def main():
     except FileNotFoundError:
         print(f"WARNING: TLS certificate not found at {CERT_FILE}. TLS server disabled.")
         tls_task = asyncio.sleep(86400) # Keep task running but effectively disabled
-    
+        
     http_server = await asyncio.start_server(
         lambda r, w: handle_client(r, w, tls=False), LISTEN_ADDR, HTTP_PORT)
     
@@ -229,6 +238,7 @@ systemctl start wss
 echo "WSS 已启动，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
 echo "----------------------------------"
 
+
 # =============================
 # 安装 Stunnel4 并生成证书
 # =============================
@@ -257,13 +267,14 @@ socket = r:TCP_NODELAY=1
 accept = 0.0.0.0:$STUNNEL_PORT
 cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.pem
-connect = 127.0.0.1:48303
+connect = 127.0.0.1:$INTERNAL_FORWARD_PORT
 EOF
 
 systemctl enable stunnel4
 systemctl restart stunnel4
 echo "Stunnel4 安装完成，端口 $STUNNEL_PORT"
 echo "----------------------------------"
+
 
 # =============================
 # 安装 UDPGW
@@ -313,7 +324,7 @@ if [ ! -f "$USER_DB" ]; then
     echo "[]" > "$USER_DB"
 fi
 
-# 嵌入 Python 面板代码 (修复了模板渲染问题)
+# 嵌入 Python 面板代码
 tee /usr/local/bin/wss_panel.py > /dev/null <<EOF
 # -*- coding: utf-8 -*-
 from flask import Flask, request, jsonify, redirect, url_for, session, make_response
@@ -337,6 +348,7 @@ WSS_HTTP_PORT = "$WSS_HTTP_PORT"
 WSS_TLS_PORT = "$WSS_TLS_PORT"
 STUNNEL_PORT = "$STUNNEL_PORT"
 UDPGW_PORT = "$UDPGW_PORT"
+INTERNAL_FORWARD_PORT = "$INTERNAL_FORWARD_PORT" # 新增内部转发端口
 
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET_KEY
@@ -417,10 +429,10 @@ _DASHBOARD_HTML = """
         .header button:hover { background-color: #c0392b; }
         .container { padding: 20px; max-width: 1200px; margin: 20px auto; }
         .card { background: white; padding: 25px; border-radius: 10px; box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05); margin-bottom: 20px; }
-        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; margin-bottom: 30px; }
+        .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 20px; margin-bottom: 30px; }
         .stat-box { background-color: #ecf0f1; padding: 15px; border-radius: 8px; text-align: center; }
-        .stat-box h3 { margin: 0 0 5px 0; color: #34495e; font-size: 16px; }
-        .stat-box p { margin: 0; font-size: 24px; font-weight: bold; color: #2980b9; }
+        .stat-box h3 { margin: 0 0 5px 0; color: #34495e; font-size: 14px; }
+        .stat-box p { margin: 0; font-size: 20px; font-weight: bold; color: #2980b9; }
         
         /* Form */
         .user-form input[type=text], .user-form input[type=password] { padding: 10px; margin-right: 10px; border: 1px solid #ccc; border-radius: 6px; }
@@ -472,6 +484,10 @@ _DASHBOARD_HTML = """
                 <h3>WSS (TLS) / Stunnel 端口</h3>
                 <p>{{ wss_tls_port }} / {{ stunnel_port }}</p>
             </div>
+            <div class="stat-box">
+                <h3>内部转发端口</h3>
+                <p>{{ internal_forward_port }}</p>
+            </div>
         </div>
 
         <div class="card connection-info">
@@ -484,6 +500,7 @@ _DASHBOARD_HTML = """
 WSS HTTP 端口: {{ wss_http_port }}
 WSS TLS 端口: {{ wss_tls_port }}
 Stunnel 端口: {{ stunnel_port }}
+内部转发端口: {{ internal_forward_port }} (WSS/Stunnel 连接到 SSH 的端口，无需客户端填写)
 </pre>
             <p class="note">注意：所有连接方式的底层认证都是 **SSH 账户/密码**。用户只能使用面板创建的账户密码进行登录。UDPGW端口 {{ udpgw_port }} 仅供本机 WSS 代理内部转发 UDP 流量使用。</p>
         </div>
@@ -565,7 +582,7 @@ Stunnel 端口: {{ stunnel_port }}
 
         async function deleteUser(username) {
             // 使用简化的 prompt 替代 confirm，提高 iframe 兼容性
-            if (window.prompt(\`确定要删除用户 \${username} 吗? (输入 YES 确认)\`) !== 'YES') {
+            if (window.prompt(`确定要删除用户 \${username} 吗? (输入 YES 确认)`) !== 'YES') {
                 return;
             }
             
@@ -580,7 +597,7 @@ Stunnel 端口: {{ stunnel_port }}
 
                 if (response.ok && result.success) {
                     showStatus(result.message, true);
-                    const row = document.getElementById(\`row-\${username}\`);
+                    const row = document.getElementById(`row-\${username}`);
                     if (row) row.remove();
                     
                     const countEl = document.getElementById('user-count');
@@ -611,7 +628,7 @@ def render_dashboard(users):
     # 获取服务器IP (这里只能从请求头推测，不能保证准确，需要用户手动替换)
     host_ip = request.host.split(':')[0]
     if host_ip in ('127.0.0.1', 'localhost'):
-         host_ip = '[Your Server IP]'
+          host_ip = '[Your Server IP]'
 
     context = {
         'users': users,
@@ -620,6 +637,7 @@ def render_dashboard(users):
         'wss_tls_port': WSS_TLS_PORT,
         'stunnel_port': STUNNEL_PORT,
         'udpgw_port': UDPGW_PORT,
+        'internal_forward_port': INTERNAL_FORWARD_PORT, # 传递新增的内部转发端口
         'host_ip': host_ip
     }
     return template.render(**context)
@@ -854,7 +872,8 @@ echo "--- 端口信息 ---"
 echo "WSS (HTTP/WebSocket): $WSS_HTTP_PORT"
 echo "WSS (TLS/WebSocket): $WSS_TLS_PORT"
 echo "Stunnel (TLS 隧道): $STUNNEL_PORT"
-echo "内部转发端口 (SSH): 48303 (由 WSS/Stunnel 转发)"
+echo "UDPGW (内部 UDP 转发): $UDPGW_PORT"
+echo "内部 SSH 转发端口: $INTERNAL_FORWARD_PORT (WSS/Stunnel 代理连接到 SSH 的端口)"
 echo ""
 echo "--- 故障排查 ---"
 echo "WSS 代理状态: sudo systemctl status wss"
