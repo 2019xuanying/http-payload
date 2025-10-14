@@ -586,7 +586,7 @@ Stunnel 端口: {{ stunnel_port }}
 
         async function deleteUser(username) {
             // 使用简化的 prompt 替代 confirm，提高 iframe 兼容性
-            if (window.prompt(`确定要删除用户 \${username} 吗? (输入 YES 确认)`) !== 'YES') {
+            if (window.prompt(\`确定要删除用户 \$\{username\} 吗? (输入 YES 确认)\`) !== 'YES') {
                 return;
             }
             
@@ -601,7 +601,7 @@ Stunnel 端口: {{ stunnel_port }}
 
                 if (response.ok && result.success) {
                     showStatus(result.message, true);
-                    const row = document.getElementById(`row-\${username}`);
+                    const row = document.getElementById(\`row-\$\{username\}\`);
                     if (row) row.remove();
                     
                     const countEl = document.getElementById('user-count');
