@@ -1,54 +1,19 @@
 #!/usr/bin/env bash
+
 set -eu
 
-# =======================================================
-# WSS 隧道/Stunnel/管理面板部署脚本 V6.2 - 优化版 (集成 uvloop, SSH端口可配置)
-# 变更: 性能优化 (uvloop)，可配置 SSH 目标端口，代码精简。
-# FIX: 修复了面板中 "活跃 IP" 功能无法工作的问题，改为实时查询系统连接。
-# FIX2: 使用 shutil.which 和更健壮的 Popen 修复 ss/id 命令兼容性问题。
-# =======================================================
+# ==========================================================
+# WSS 隧道与用户管理面板一键部署脚本 (终极功能升级版 - Tailwind CSS)
+# ----------------------------------------------------------
+# Panel 核心功能: 实时监控、服务控制、日志刷新
+# 用户管控: 账户有效期 (chage), 带宽限制 (tc + iptables), 流量配额 (iptables)
+# ==========================================================
 
-# --- 全局变量和工具函数 ---
-check_port() {
-    local port="$1"
-    if command -v ss >/dev/null; then
-        if ss -tuln | grep -q ":$port "; then
-            echo -e " \033[32m[LISTEN]\033[0m"
-        else
-            echo -e " \033[31m[FAIL]\033[0m"
-        fi
-    elif command -v netstat >/dev/null; then
-        if netstat -tuln | grep -q ":$port "; then
-            echo -e " \033[32m[LISTEN]\033[0m"
-        else
-            echo -e " \033[31m[FAIL]\033[0m"
-        fi
-    else
-        echo " (Cannot check status, ss or netstat found)"
-    fi
-}
-export -f check_port
-
-get_server_ip() {
-    echo "尝试获取服务器公网 IP..."
-    SERVER_IP=$(curl -s --connect-timeout 2 ip.sb 2>/dev/null)
-    [ -z "$SERVER_IP" ] && SERVER_IP=$(curl -s --connect-timeout 2 ifconfig.me 2>/dev/null)
-    [ -z "$SERVER_IP" ] && SERVER_IP=$(/sbin/ip a | grep 'inet ' | grep -v '127.0.0.1' | head -n 1 | awk '{print $2}' | cut -d/ -f1)
-    [ -z "$SERVER_IP" ] && SERVER_IP='[SERVER_IP]'
-    echo "$SERVER_IP"
-}
-SERVER_IP=$(get_server_ip)
-echo "检测到的服务器 IP: $SERVER_IP"
-
-VENV_PATH="/opt/wss_venv"
-PYTHON_VENV_PATH="$VENV_PATH/bin/python3"
-
-# --- 1. 端口和面板密码配置 ---
+# =============================
+# 提示端口和面板密码
+# =============================
 echo "----------------------------------"
 echo "==== WSS 基础设施端口配置 ===="
-read -p "请输入 SSH 目标端口 (WSS/Stunnel 转发到此, 默认22): " SSH_TARGET_PORT
-SSH_TARGET_PORT=${SSH_TARGET_PORT:-22}
-echo "内部 SSH 目标端口: $SSH_TARGET_PORT"
 
 read -p "请输入 WSS HTTP 监听端口 (默认80): " WSS_HTTP_PORT
 WSS_HTTP_PORT=${WSS_HTTP_PORT:-80}
@@ -62,63 +27,61 @@ STUNNEL_PORT=${STUNNEL_PORT:-444}
 read -p "请输入 UDPGW 端口 (默认7300): " UDPGW_PORT
 UDPGW_PORT=${UDPGW_PORT:-7300}
 
+# === 内部转发端口提示 ===
+read -p "请输入 WSS/Stunnel 内部 SSH 转发端口 (默认48303, 此为 WSS/Stunnel 连接到 SSH 的端口): " INTERNAL_FORWARD_PORT
+INTERNAL_FORWARD_PORT=${INTERNAL_FORWARD_PORT:-48303}
+# ==============================
+
 echo "----------------------------------"
 echo "==== 管理面板配置 ===="
+
 read -p "请输入 Web 管理面板监听端口 (默认54321): " PANEL_PORT
 PANEL_PORT=${PANEL_PORT:-54321}
 
+# 交互式安全输入并确认 ROOT 密码
 echo "请为 Web 面板的 'root' 用户设置密码（输入时隐藏）。"
 while true; do
-    read -s -p "面板密码: " pw1 && echo
-    read -s -p "请再次确认密码: " pw2 && echo
-    if [ -z "$pw1" ]; then
-        echo "密码不能为空，请重新输入。"
-        continue
-    fi
-    if [ "$pw1" != "$pw2" ]; then
-        echo "两次输入不一致，请重试。"
-        continue
-    fi
-    PANEL_ROOT_PASS_RAW="$pw1"
-    PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | /usr/bin/sha256sum | awk '{print $1}')
-    break
+  read -s -p "面板密码: " pw1 && echo
+  read -s -p "请再次确认密码: " pw2 && echo
+  if [ -z "$pw1" ]; then
+    echo "密码不能为空，请重新输入。"
+    continue
+  fi
+  if [ "$pw1" != "$pw2" ]; then
+    echo "两次输入不一致，请重试。"
+    continue
+  fi
+  PANEL_ROOT_PASS_RAW="$pw1"
+  # 对密码进行简单的 HASH，防止明文存储
+  PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | sha256sum | awk '{print $1}')
+  break
 done
 
 echo "----------------------------------"
-echo "==== 系统更新与依赖安装 (VENV 隔离) ===="
-/usr/bin/apt update -y
-/usr/bin/apt install -y python3 python3-pip python3-venv wget curl git net-tools openssl stunnel4 iptables-persistent procps cmake build-essential
-
-echo "创建 Python 虚拟环境于 $VENV_PATH"
-/usr/bin/mkdir -p "$VENV_PATH"
-/usr/bin/python3 -m venv "$VENV_PATH"
-
-echo "在 VENV 中安装 Python 依赖..."
-"$PYTHON_VENV_PATH" -m pip install flask jinja2 requests httpx psutil uvloop
-
-echo "依赖安装完成，使用隔离环境路径: $VENV_PATH"
+echo "==== 系统更新与依赖安装 ===="
+# 确保安装了 `iproute2` 包 (tc) 和 `iptables`
+apt update -y
+apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4 iproute2 iptables
+# 额外安装 flask, jinja2, uvloop
+pip3 install flask jinja2 uvloop
+echo "依赖安装完成"
 echo "----------------------------------"
 
 
-# --- 2. WSS 核心代理脚本 (目标端口 $SSH_TARGET_PORT) ---
+# =============================
+# WSS 核心代理脚本
+# =============================
 echo "==== 安装 WSS 核心代理脚本 (/usr/local/bin/wss) ===="
-/usr/bin/tee /usr/local/bin/wss > /dev/null <<EOF
+# 使用 <<'EOF' 避免 Bash 预解析 $INTERNAL_FORWARD_PORT
+tee /usr/local/bin/wss > /dev/null <<EOF
 #!/usr/bin/python3
 # -*- coding: utf-8 -*-
 
-import asyncio
-import ssl
-import sys
-import os
-import httpx
-try:
-    import uvloop
-    UVLOOP_AVAILABLE = True
-except ImportError:
-    UVLOOP_AVAILABLE = False
+import asyncio, ssl, sys
+import uvloop # 导入 uvloop, 用于高性能 event loop
 
-# --- 配置 ---
 LISTEN_ADDR = '0.0.0.0'
+
 try:
     HTTP_PORT = int(sys.argv[1])
 except (IndexError, ValueError):
@@ -127,76 +90,49 @@ try:
     TLS_PORT = int(sys.argv[2])
 except (IndexError, ValueError):
     TLS_PORT = 443
-try:
-    SSH_TARGET_PORT = int(sys.argv[3])
-except (IndexError, ValueError):
-    SSH_TARGET_PORT = 22
 
-DEFAULT_TARGET = ('127.0.0.1', SSH_TARGET_PORT)
+# 使用用户指定的内部转发端口
+DEFAULT_TARGET = ('127.0.0.1', $INTERNAL_FORWARD_PORT)
 BUFFER_SIZE = 65536
 TIMEOUT = 3600
 CERT_FILE = '/etc/stunnel/certs/stunnel.pem'
 KEY_FILE = '/etc/stunnel/certs/stunnel.key'
-PANEL_PORT = os.environ.get('WSS_PANEL_PORT', '54321')
-API_URL_CHECK = f"http://127.0.0.1:{PANEL_PORT}/api/ips/check"
 
-FIRST_RESPONSE = b'HTTP/1.1 200 OK\\r\\nContent-Type: text/plain\\r\\nContent-Length: 2\\r\\n\\r\\nOK\\r\\n\\r\\n'
-SWITCH_RESPONSE = b'HTTP/1.1 101 Switching Protocols\\r\\nUpgrade: websocket\\r\\nConnection: Upgrade\\r\\n\\r\\n'
-FORBIDDEN_RESPONSE = b'HTTP/1.1 403 Forbidden\\r\\nContent-Length: 0\\r\\n\\r\\n'
-
-http_client = httpx.AsyncClient(timeout=3.0)
-
-async def check_ip_status(client_ip):
-    """检查 IP 是否被面板封禁."""
-    try:
-        response = await http_client.post(
-            API_URL_CHECK,
-            json={'ip': client_ip}
-        )
-        if response.status_code == 200:
-            result = response.json()
-            return not result.get('is_banned', False)
-        return True
-    except Exception:
-        return True
+FIRST_RESPONSE = b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK\r\n\r\n'
+SWITCH_RESPONSE = b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'
+FORBIDDEN_RESPONSE = b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'
 
 async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
     peer = writer.get_extra_info('peername')
-    client_ip = peer[0]
-
-    is_allowed = await check_ip_status(client_ip)
-    if not is_allowed:
-        writer.write(FORBIDDEN_RESPONSE)
-        await writer.drain()
-        writer.close()
-        return
-
+    print(f"Connection from {peer} {'(TLS)' if tls else ''}")
     forwarding_started = False
     full_request = b''
 
     try:
+        # --- 1. 握手循环 ---
         while not forwarding_started:
-            data = await asyncio.wait_for(reader.read(BUFFER_SIZE), timeout=5)
+            data = await asyncio.wait_for(reader.read(BUFFER_SIZE), timeout=TIMEOUT)
             if not data:
                 break
-
+            
             full_request += data
-
+            
             header_end_index = full_request.find(b'\r\n\r\n')
-
+            
             if header_end_index == -1:
                 writer.write(FIRST_RESPONSE)
                 await writer.drain()
                 full_request = b''
                 continue
 
+            # 2. 头部解析
             headers_raw = full_request[:header_end_index]
             data_to_forward = full_request[header_end_index + 4:]
-
             headers = headers_raw.decode(errors='ignore')
 
             is_websocket_request = 'Upgrade: websocket' in headers or 'Connection: Upgrade' in headers or 'GET-RAY' in headers
-
+            
+            # 3. 转发触发
             if is_websocket_request:
                 writer.write(SWITCH_RESPONSE)
                 await writer.drain()
@@ -206,28 +142,27 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
                 await writer.drain()
                 full_request = b''
                 continue
+        
+        # --- 退出握手循环 ---
 
-        if not forwarding_started:
-            raise Exception("Handshake failed or connection closed early")
-
+        # 4. 连接目标服务器 (默认到 Stunnel/SSH 的转发端口)
         target = DEFAULT_TARGET
         target_reader, target_writer = await asyncio.open_connection(*target)
 
+        # 5. 转发初始数据
         if data_to_forward:
             target_writer.write(data_to_forward)
             await target_writer.drain()
-
+            
+        # 6. 转发后续数据流
         async def pipe(src_reader, dst_writer):
-            pipe_timeout = TIMEOUT
             try:
                 while True:
-                    buf = await asyncio.wait_for(src_reader.read(BUFFER_SIZE), timeout=pipe_timeout)
+                    buf = await src_reader.read(BUFFER_SIZE)
                     if not buf:
                         break
                     dst_writer.write(buf)
                     await dst_writer.drain()
-            except asyncio.TimeoutError:
-                pass
             except Exception:
                 pass
             finally:
@@ -238,15 +173,18 @@ async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWrit
             pipe(target_reader, writer)
         )
 
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Connection error {peer}: {e}")
     finally:
         try:
             writer.close()
+            await writer.wait_closed()
         except Exception:
             pass
+        print(f"Closed {peer}")
 
 async def main():
+    # TLS server setup
     ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
     try:
         ssl_ctx.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
@@ -256,11 +194,11 @@ async def main():
         tls_task = tls_server.serve_forever()
     except FileNotFoundError:
         print(f"WARNING: TLS certificate not found at {CERT_FILE}. TLS server disabled.")
-        tls_task = asyncio.sleep(86400)
-
+        tls_task = asyncio.sleep(86400) # Keep task running but effectively disabled
+        
     http_server = await asyncio.start_server(
         lambda r, w: handle_client(r, w, tls=False), LISTEN_ADDR, HTTP_PORT)
-
+    
     print(f"Listening on {LISTEN_ADDR}:{HTTP_PORT} (HTTP payload)")
 
     async with http_server:
@@ -270,34 +208,25 @@ async def main():
 
 if __name__ == '__main__':
     try:
-        os.environ['WSS_PANEL_PORT'] = "$PANEL_PORT"
-        
-        # --- 集成 uvloop 提升性能 ---
-        if UVLOOP_AVAILABLE:
-            uvloop.install()
-            print("INFO: uvloop event loop installed for high performance.")
-        # ------------------------------
-        
+        # 使用 uvloop 作为 event loop 实现，提供性能加速
+        uvloop.install() 
         asyncio.run(main())
     except KeyboardInterrupt:
         print("WSS Proxy Stopped.")
-    except Exception as e:
-        print(f"FATAL ERROR: {e}")
-
+        
 EOF
 
-/bin/chmod +x /usr/local/bin/wss
+chmod +x /usr/local/bin/wss
 
-# 创建 WSS systemd 服务 (新增 SSH_TARGET_PORT 参数)
-/usr/bin/tee /etc/systemd/system/wss.service > /dev/null <<EOF
+# 创建 WSS systemd 服务
+tee /etc/systemd/system/wss.service > /dev/null <<EOF
 [Unit]
-Description=WSS Python Proxy (V6.2 Optimized)
+Description=WSS Python Proxy
 After=network.target
 
 [Service]
 Type=simple
-Environment=WSS_PANEL_PORT=$PANEL_PORT
-ExecStart=$PYTHON_VENV_PATH /usr/local/bin/wss $WSS_HTTP_PORT $WSS_TLS_PORT $SSH_TARGET_PORT
+ExecStart=/usr/local/bin/wss $WSS_HTTP_PORT $WSS_TLS_PORT
 Restart=on-failure
 User=root
 
@@ -305,80 +234,64 @@ User=root
 WantedBy=multi-user.target
 EOF
 
-/bin/systemctl daemon-reload
-/bin/systemctl enable wss || true
-/bin/systemctl restart wss || true
-echo "WSS 核心代理 (V6.2 优化版) 已启动/重启，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
-echo "转发目标端口: $SSH_TARGET_PORT"
+systemctl daemon-reload
+systemctl enable wss
+systemctl start wss
+echo "WSS 已启动，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
 echo "----------------------------------"
 
 
-# --- 3. Stunnel4, UDPGW (统一目标端口 $SSH_TARGET_PORT) ---
-echo "==== 检查/安装 Stunnel4 ===="
-/usr/bin/mkdir -p /etc/stunnel/certs
-if [ ! -f "/etc/stunnel/certs/stunnel.pem" ]; then
-    echo "Stunnel 证书不存在，正在生成..."
-    /usr/bin/openssl req -x509 -nodes -newkey rsa:2048 \
-    -keyout /etc/stunnel/certs/stunnel.key \
-    -out /etc/stunnel/certs/stunnel.crt \
-    -days 1095 \
-    -subj "/CN=example.com"
-    /bin/sh -c '/bin/cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem'
-    /bin/chmod 644 /etc/stunnel/certs/*.crt
-    /bin/chmod 644 /etc/stunnel/certs/*.pem
-    echo "Stunnel 证书已生成。"
-fi
+# =============================
+# 安装 Stunnel4 并生成证书
+# =============================
+echo "==== 安装 Stunnel4 ===="
+mkdir -p /etc/stunnel/certs
+openssl req -x509 -nodes -newkey rsa:2048 \
+-keyout /etc/stunnel/certs/stunnel.key \
+-out /etc/stunnel/certs/stunnel.crt \
+-days 1095 \
+-subj "/CN=example.com" > /dev/null 2>&1
+sh -c 'cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem'
+chmod 644 /etc/stunnel/certs/*.crt
+chmod 644 /etc/stunnel/certs/*.pem
 
-/usr/bin/tee /etc/stunnel/ssh-tls.conf > /dev/null <<EOF
+tee /etc/stunnel/ssh-tls.conf > /dev/null <<EOF
 pid=/var/run/stunnel.pid
 setuid=root
 setgid=root
 client = no
-debug = 0
+debug = 5
 output = /var/log/stunnel4/stunnel.log
 socket = l:TCP_NODELAY=1
 socket = r:TCP_NODELAY=1
 
 [ssh-tls-gateway]
 accept = 0.0.0.0:$STUNNEL_PORT
-connect = 127.0.0.1:$SSH_TARGET_PORT 
 cert = /etc/stunnel/certs/stunnel.pem
 key = /etc/stunnel/certs/stunnel.pem
+connect = 127.0.0.1:$INTERNAL_FORWARD_PORT
 EOF
 
-/bin/systemctl enable stunnel4 || true
-/bin/systemctl restart stunnel4 || true
-echo "Stunnel4 配置已更新并重启，端口 $STUNNEL_PORT (转发至 $SSH_TARGET_PORT)"
+systemctl enable stunnel4
+systemctl start stunnel4 # 启动服务以便后续检查
+echo "Stunnel4 安装完成，端口 $STUNNEL_PORT"
 echo "----------------------------------"
 
-echo "==== 检查/安装 UDPGW ===="
-if [ ! -f "/root/badvpn/badvpn-build/udpgw/badvpn-udpgw" ]; then
-    echo "UDPGW 二进制文件不存在，开始编译..."
-    if [ ! -d "/root/badvpn" ]; then
-        echo "克隆 badvpn 仓库..."
-        /usr/bin/apt install -y cmake build-essential || true
-        /usr/bin/git clone https://github.com/ambrop72/badvpn.git /root/badvpn || { echo "ERROR: Git clone failed."; exit 1; }
-    fi
-    /usr/bin/mkdir -p /root/badvpn/badvpn-build
-    /usr/bin/cd /root/badvpn/badvpn-build
-    
-    if /usr/bin/cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 ; then
-        if /usr/bin/make -j$(/usr/bin/nproc); then
-            echo "UDPGW 编译成功。"
-        else
-            echo "ERROR: UDPGW make failed."
-            exit 1
-        fi
-    else
-        echo "ERROR: UDPGW cmake failed."
-        exit 1
-    fi
-    /usr/bin/cd - > /dev/null
-else
-    echo "UDPGW 二进制文件已存在，跳过编译。"
-fi
 
-/usr/bin/tee /etc/systemd/system/udpgw.service > /dev/null <<EOF
+# =============================
+# 安装 UDPGW
+# =============================
+echo "==== 安装 UDPGW ===="
+if [ ! -d "/root/badvpn" ]; then
+    git clone https://github.com/ambrop72/badvpn.git /root/badvpn
+fi
+mkdir -p /root/badvpn/badvpn-build
+cd /root/badvpn/badvpn-build
+cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 > /dev/null 2>&1
+make -j$(nproc) > /dev/null 2>&1
+cd - > /dev/null
+
+tee /etc/systemd/system/udpgw.service > /dev/null <<EOF
 [Unit]
 Description=UDP Gateway (Badvpn)
 After=network.target
@@ -393,64 +306,48 @@ User=root
 WantedBy=multi-user.target
 EOF
 
-/bin/systemctl daemon-reload
-/bin/systemctl enable udpgw || true
-/bin/systemctl restart udpgw || true
-echo "UDPGW 已启动/重启，端口: $UDPGW_PORT"
+systemctl daemon-reload
+systemctl enable udpgw
+systemctl start udpgw # 启动服务以便后续检查
+echo "UDPGW 已安装并启动，端口: $UDPGW_PORT"
+echo "----------------------------------"
+
+# =============================
+# Traffic Control 基础配置 (NEW)
+# =============================
+# 清除旧的 tc 规则，确保环境干净
+echo "==== 配置 Traffic Control (tc) 基础环境 ===="
+IP_DEV=$(ip route | grep default | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)
+
+if [ -z "$IP_DEV" ]; then
+    echo "警告: 无法找到主网络接口，带宽限制功能可能无效。"
+else
+    # 销毁所有现有的 qdisc
+    tc qdisc del dev "$IP_DEV" root || true
+    # 创建 HTB 根 qdisc
+    tc qdisc add dev "$IP_DEV" root handle 1: htb default 10
+    # 默认类别 (无限制)
+    tc class add dev "$IP_DEV" parent 1: classid 1:10 htb rate 1000mbit ceil 1000mbit
+    echo "Traffic Control (tc) 已在 $IP_DEV 上初始化。"
+fi
 echo "----------------------------------"
 
 
-# --- 4. 安装 WSS 用户管理面板 (V6.2 优化版) ---
-echo "==== 部署 WSS 用户管理面板 (Python/Flask) V6.2 优化版 ===="
+# =============================
+# 安装 WSS 用户管理面板 (基于 Flask)
+# =============================
+echo "==== 部署 WSS 用户管理面板 (Python/Flask) ===="
 PANEL_DIR="/etc/wss-panel"
 USER_DB="$PANEL_DIR/users.json"
-IP_BANS_DB="$PANEL_DIR/ip_bans.json"
-ROOT_HASH_FILE="$PANEL_DIR/root_hash.txt"
+mkdir -p "$PANEL_DIR"
 
-/usr/bin/mkdir -p "$PANEL_DIR"
-
-[ ! -f "$IP_BANS_DB" ] && echo "{}" > "$IP_BANS_DB"
-
-if [ ! -f "$ROOT_HASH_FILE" ]; then
-    echo "$PANEL_ROOT_PASS_HASH" > "$ROOT_HASH_FILE"
-fi
-
+# 创建或初始化用户数据库
 if [ ! -f "$USER_DB" ]; then
     echo "[]" > "$USER_DB"
-else
-    # 简化升级逻辑
-    /usr/bin/python3 -c "
-import json
-import time
-import os
-USER_DB_PATH = \"$USER_DB\"
-def upgrade_users():
-    try:
-        if not os.path.exists(USER_DB_PATH): return
-        with open(USER_DB_PATH, 'r') as f: users = json.load(f)
-    except Exception:
-        print('Error loading users, skipping upgrade.')
-        return
-    updated = False
-    for user in users:
-        if 'banned_ips' not in user: user['banned_ips'] = []; updated = True
-        if 'status' not in user: 
-            user['status'] = 'active'; user['expiry_date'] = ''
-            updated = True
-        for field in ['quota_gb', 'used_traffic_gb', 'last_check']:
-            if field in user: del user[field]; updated = True
-        if 'max_connections' not in user:
-            user['max_connections'] = 3
-            updated = True
-    if updated:
-        with open(USER_DB_PATH, 'w') as f: json.dump(users, f, indent=4)
-        print('User database structure upgraded.')
-upgrade_users()
-"
 fi
 
-# 嵌入 Python 面板代码
-/usr/bin/tee /usr/local/bin/wss_panel.py > /dev/null <<EOF
+# 嵌入 Python 面板代码 (关键：所有 $ 都被正确转义或在 Python 内部处理)
+tee /usr/local/bin/wss_panel.py > /dev/null <<EOF
 # -*- coding: utf-8 -*-
 from flask import Flask, request, jsonify, redirect, url_for, session, make_response
 import json
@@ -459,1085 +356,962 @@ import os
 import hashlib
 import time
 import jinja2
-from datetime import datetime
 import re
-from functools import wraps
-import psutil
-import shutil # 新增导入
+from datetime import date, timedelta, datetime
 
 # --- 配置 ---
-PANEL_DIR = "/etc/wss-panel"
-USER_DB_PATH = os.path.join(PANEL_DIR, "users.json")
-IP_BANS_DB_PATH = os.path.join(PANEL_DIR, "ip_bans.json")
-AUDIT_LOG_PATH = os.path.join(PANEL_DIR, "audit.log")
-ROOT_HASH_FILE = os.path.join(PANEL_DIR, "root_hash.txt")
-
+USER_DB_PATH = "$USER_DB"
 ROOT_USERNAME = "root"
-MAX_CONN_DEFAULT = 3
-SSH_TARGET_PORT = $SSH_TARGET_PORT
+ROOT_PASSWORD_HASH = "$PANEL_ROOT_PASS_HASH"
+FLASK_SECRET_KEY = os.urandom(24).hex()
+SSHD_CONFIG = "/etc/ssh/sshd_config"
+GIGA_BYTE = 1024 * 1024 * 1024 # 1 GB in bytes
 
+# 面板和端口配置 (用于模板)
 PANEL_PORT = "$PANEL_PORT"
 WSS_HTTP_PORT = "$WSS_HTTP_PORT"
 WSS_TLS_PORT = "$WSS_TLS_PORT"
 STUNNEL_PORT = "$STUNNEL_PORT"
 UDPGW_PORT = "$UDPGW_PORT"
-
-SERVER_IP = os.environ.get('SERVER_IP', '[Your Server IP]')
+INTERNAL_FORWARD_PORT = "$INTERNAL_FORWARD_PORT" 
 
 app = Flask(__name__)
-app.secret_key = os.urandom(24).hex()
+app.secret_key = FLASK_SECRET_KEY
 
-# --- 数据库操作 / 日志 / 认证 / 系统工具函数 ---
-def load_data(path, default_value):
-    if not os.path.exists(path): return default_value
+# --- 系统工具函数 ---
+
+def safe_run_command(command, input=None):
+    """安全执行系统命令并返回结果."""
     try:
-        with open(path, 'r') as f: return json.load(f)
+        result = subprocess.run(
+            command,
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            input=input, # 接受 bytes 输入
+            timeout=5 # 增加超时保护
+        )
+        return True, result.stdout.decode('utf-8', errors='ignore').strip()
+    except subprocess.CalledProcessError as e:
+        return False, e.stderr.decode('utf-8', errors='ignore').strip()
+    except FileNotFoundError:
+        return False, "Command not found."
+    except subprocess.TimeoutExpired:
+        return False, "Command timed out."
+        
+
+# ===============================================
+# TC (Bandwidth Limit) and Iptables (Quota/Usage) Helpers
+# ===============================================
+
+def apply_rate_limit(uid, rate_kbps):
+    """Applies or clears download rate limit (KB/s) for a given Linux user UID using tc and iptables."""
+    
+    # NEW: Robustly determine primary network device using pure Python/subprocess logic
+    success, output = safe_run_command(['ip', 'route', 'show', 'default'])
+    dev = ''
+    if success and output:
+        parts = output.split()
+        try:
+            # Find the interface name after the 'dev' keyword
+            dev_index = parts.index('dev') + 1
+            dev = parts[dev_index]
+        except (ValueError, IndexError):
+            pass
+    
+    if not dev:
+        print("Error: Could not determine primary network device for tc. Bandwidth limiting disabled.")
+        return False, "无法找到网络接口"
+    
+    dev = dev.strip()
+    tc_handle = f"1:{int(uid)}" # Use HTB class ID 1:UID
+    mark = int(uid) # Use UID as the firewall mark
+
+    # IPTables command parts to delete the specific rule
+    # Added --wait option for stability
+    ipt_del_cmd = ['iptables', '-t', 'mangle', '-D', 'POSTROUTING', 
+                   '-m', 'owner', '--uid-owner', str(uid), 
+                   '-j', 'MARK', '--set-mark', str(mark),
+                   '--wait']
+
+    try:
+        rate = int(rate_kbps)
+        
+        # --- 1. CLEANUP (Critical for reliability) ---
+        safe_run_command(ipt_del_cmd)
+        safe_run_command(['tc', 'filter', 'del', 'dev', dev, 'parent', '1:', 'protocol', 'ip', 'prio', '100', 'handle', str(mark)]) 
+        safe_run_command(['tc', 'class', 'del', 'dev', dev, 'parent', '1:', 'classid', tc_handle])
+
+
+        if rate > 0:
+            rate_mbps = (rate * 8) / 1024.0
+            rate_str = "{:.2f}mbit".format(rate_mbps)
+            
+            # --- 2. ADD TC CLASS (Bandwidth limit container) ---
+            tc_class_cmd = ['tc', 'class', 'add', 'dev', dev, 'parent', '1:', 'classid', tc_handle, 'htb', 'rate', rate_str, 'ceil', rate_str]
+            
+            success_class, output_class = safe_run_command(tc_class_cmd)
+            if not success_class:
+                return False, f"TC Class error: {output_class}"
+
+            # --- 3. ADD IPTABLES RULE (Mark packets from this UID) ---
+            # Added --wait option for stability
+            iptables_add_cmd = ['iptables', '-t', 'mangle', '-A', 'POSTROUTING', 
+                                '-m', 'owner', '--uid-owner', str(uid), 
+                                '-j', 'MARK', '--set-mark', str(mark),
+                                '--wait']
+
+            success_ipt, output_ipt = safe_run_command(iptables_add_cmd)
+            if not success_ipt:
+                safe_run_command(['tc', 'class', 'del', 'dev', dev, 'parent', '1:', 'classid', tc_handle])
+                return False, f"IPTables error: {output_ipt}"
+
+            # --- 4. ADD TC FILTER (Match firewall mark) ---
+            tc_filter_cmd = ['tc', 'filter', 'add', 'dev', dev, 'parent', '1:', 'protocol', 'ip', 
+                             'prio', '100', 'handle', str(mark), 'fw', 'flowid', tc_handle]
+            
+            success_filter, output_filter = safe_run_command(tc_filter_cmd)
+            if not success_filter:
+                safe_run_command(['tc', 'class', 'del', 'dev', dev, 'parent', '1:', 'classid', tc_handle])
+                safe_run_command(ipt_del_cmd)
+                return False, f"TC Filter error: {output_filter}"
+                
+            return True, f"已限制速度到 {rate_mbps:.2f} Mbit/s (~{rate_kbps} KB/s)"
+        
+        else:
+            return True, "已清除速度限制"
+            
     except Exception as e:
-        print(f"Error loading {path}: {e}")
-        return default_value
+        return False, f"TC command execution failed: {e}"
 
-def load_root_hash():
-    if not os.path.exists(ROOT_HASH_FILE):
-        return None
+def manage_quota_iptables_rule(username, uid, action='add'):
+    """Adds/Deletes the iptables rule used for counting traffic for a user."""
+    comment = f"WSS_QUOTA_{username}"
+    
+    # Rule to be matched/counted in the OUTPUT chain (filter table)
+    command = ['iptables', '-t', 'filter', f'-{action.upper()}', 'OUTPUT', 
+               '-m', 'owner', '--uid-owner', str(uid), 
+               '-m', 'comment', '--comment', comment, 
+               '-j', 'ACCEPT', '--wait']
+    
+    safe_run_command(command)
+
+def get_user_current_usage_bytes(username, uid):
+    """Reads the byte counter from the iptables rule associated with the user."""
+    comment = f"WSS_QUOTA_{username}"
+    
+    command = ['iptables', '-t', 'filter', '-nvxL', 'OUTPUT']
+    success, output = safe_run_command(command)
+    
+    if not success: return 0
+    
+    # Regex to find the line containing the comment and extract the byte count (2nd field)
+    pattern = re.compile(r'^\s*\d+\s+(\d+).*COMMENT\s+--\s+.*' + re.escape(comment))
+    
+    for line in output.split('\n'):
+        match = pattern.search(line)
+        if match:
+            try:
+                # The byte count is the second column in -nvxL output
+                return int(line.split()[1])
+            except (IndexError, ValueError):
+                return 0 # Malformed line
+    return 0
+
+def reset_iptables_counters(username):
+    """Resets the byte counter for a specific user's iptables rule."""
+    comment = f"WSS_QUOTA_{username}"
+    command = ['iptables', '-t', 'filter', '-Z', 'OUTPUT', '-m', 'comment', '--comment', comment, '--wait']
+    safe_run_command(command)
+
+# ===============================================
+
+# --- Status and User Management Functions ---
+
+def get_cpu_usage():
+    """Calculates CPU usage percentage using pure Python/proc/stat (avoids Bash errors)."""
     try:
-        with open(ROOT_HASH_FILE, 'r') as f:
-            return f.read().strip()
+        def get_cpu_times():
+            with open('/proc/stat', 'r') as f:
+                line = f.readline().split()
+                # user, nice, system, idle, iowait, irq, softirq, steal, guest, guest_nice
+                total = sum(int(x) for x in line[1:])
+                idle = int(line[4])
+                return total, idle
+
+        total1, idle1 = get_cpu_times()
+        time.sleep(0.1) # Wait briefly
+        total2, idle2 = get_cpu_times()
+
+        total_diff = total2 - total1
+        idle_diff = idle2 - idle1
+        
+        if total_diff == 0:
+            return 0.0
+            
+        cpu_usage = 100.0 * (total_diff - idle_diff) / total_diff
+        return round(cpu_usage, 1)
+
     except Exception:
-        return None
+        return "N/A"
 
-def save_root_hash(new_hash):
+def get_memory_usage():
+    """Calculates memory usage percentage and total/used."""
     try:
-        with open(ROOT_HASH_FILE, 'w') as f:
-            f.write(new_hash + '\n')
-        return True
-    except Exception as e:
-        print(f"Error saving root hash: {e}")
-        return False
+        success, output = safe_run_command(['free', '-m'])
+        if success:
+            lines = output.split('\n')
+            mem_line = lines[1].split()
+            total = int(mem_line[1])
+            used = int(mem_line[2])
+            
+            if total > 0:
+                usage = (used / total) * 100
+                return {
+                    "usage": round(usage, 1),
+                    "total_mb": total,
+                    "mem_used_mb": used
+                }
+        return {"usage": "N/A", "total_mb": "N/A", "mem_used_mb": "N/A"}
+    except Exception:
+        return {"usage": "N/A", "total_mb": "N/A", "mem_used_mb": "N/A"}
 
-def save_data(data, path):
+
+def get_disk_usage():
+    """Gets root filesystem disk usage."""
     try:
-        with open(path, 'w') as f: json.dump(data, f, indent=4)
-        return True
-    except Exception as e:
-        print(f"Error saving {path}: {e}")
-        return False
+        success, output = safe_run_command(['df', '-h', '/'])
+        if success:
+            lines = output.split('\n')
+            disk_line = lines[-1].split()
+            if len(disk_line) >= 5:
+                usage_str = disk_line[4].replace('%', '')
+                return {"usage": int(usage_str)}
+        return {"usage": "N/A"}
+    except Exception:
+        return {"usage": "N/A"}
 
-def load_users(): return load_data(USER_DB_PATH, [])
-def save_users(users): return save_data(users, USER_DB_PATH)
-def load_ip_bans(): return load_data(IP_BANS_DB_PATH, {})
-def save_ip_bans(ip_bans): return save_data(ip_bans, IP_BANS_DB_PATH)
+def get_service_status_detail(service_name):
+    """Returns service status and a descriptive label/color."""
+    success, output = safe_run_command(['systemctl', 'is-active', service_name])
+    status = output.strip()
+    
+    if status == 'active':
+        return "active", "运行中", "bg-green-500" # Tailwind class
+    elif status == 'inactive' or status == 'activating' or status == 'deactivating':
+        failed_check = safe_run_command(['systemctl', 'is-failed', service_name])
+        if failed_check[0] and failed_check[1] == 'failed':
+            return "failed", "失败", "bg-red-500" # Tailwind class
+        return "inactive", "已停止", "bg-yellow-500" # Tailwind class
+    else:
+        return status.capitalize() or "unknown", "未知", "bg-gray-500" # Tailwind class
+
+def get_port_status_detail(port):
+    """Checks if a port is listening using 'ss'."""
+    port_str = str(port)
+    success, output = safe_run_command(['ss', '-tuln'])
+    
+    if success and (f':{port_str}' in output or f' {port_str}' in output):
+        return "监听中", "text-green-500" # Tailwind class
+    return "未监听", "text-red-500" # Tailwind class
+
+def get_logs_data(lines=50):
+    """Retrieves generic system logs (latest on top)."""
+    # Use journalctl to get the last hour's logs for all services, newest first
+    success, output = safe_run_command(['journalctl', '-r', f'-n {lines}', '--since', '1 hour ago', '--no-pager', '--utc'])
+    return output if success else f"错误: 无法获取系统日志. {output}"
+
+
+def get_user_expiration_status(username):
+    """Checks account status based on Linux 'chage -l' and current date."""
+    try:
+        success, output = safe_run_command(['bash', '-c', f'LC_ALL=C chage -l {username}'])
+        if not success:
+            return "inactive", "N/A (系统用户不存在)"
+
+        lines = output.split('\n')
+        expiry_info = "N/A"
+        
+        for line in lines:
+            if "Account expires" in line:
+                expiry_info = line.split(':')[-1].strip()
+                break
+        
+        passwd_success, passwd_output = safe_run_command(['passwd', '-S', username])
+        is_locked = passwd_success and 'L' in passwd_output # 'L' indicates locked account
+
+        if expiry_info.lower() in ("never", "never expires"):
+            return "active", "永不"
+        
+        try:
+            expiry_date = datetime.strptime(expiry_info, '%b %d, %Y').date()
+            today = date.today()
+            expiry_date_str = expiry_date.strftime("%Y-%m-%d")
+
+            if expiry_date <= today:
+                if not is_locked:
+                    safe_run_command(['usermod', '-L', username]) # Lock account
+                return "expired", expiry_date_str
+            else:
+                return "active", expiry_date_str
+
+        except ValueError:
+            if is_locked:
+                return "expired", "N/A (已锁定)"
+            return "active", "N/A (日期格式错误)"
+
+    except Exception as e:
+        print(f"Error checking chage for {username}: {e}")
+        return "error", "N/A (检查失败)"
+
+
+def get_user_uid(username):
+    """Retrieves the numeric UID of a Linux user."""
+    success, output = safe_run_command(['id', '-u', username])
+    return int(output) if success and output.isdigit() else None
+
+
+def load_users():
+    """从 JSON 文件加载用户列表并更新状态和用量."""
+    if not os.path.exists(USER_DB_PATH):
+        return []
+    try:
+        with open(USER_DB_PATH, 'r') as f:
+            users = json.load(f)
+            
+        updated_users = []
+        for user in users:
+            username = user['username']
+            uid = get_user_uid(username)
+            user['uid'] = uid
+            
+            # --- 1. Refresh Status/Expiry ---
+            status, expiry_date_str = get_user_expiration_status(username)
+            user['status'] = status
+            user['expiration_date'] = expiry_date_str
+            
+            # --- 2. Refresh Quota/Usage/Rate ---
+            user['quota_gb'] = user.get('quota_gb', 0) # Default to 0 GB limit
+            user['rate_limit_kbps'] = user.get('rate_limit_kbps', '0')
+            user['created_at'] = user.get('created_at', time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()))
+            
+            current_bytes_used = get_user_current_usage_bytes(username, uid)
+            user['usage_bytes'] = current_bytes_used
+            user['usage_gb'] = round(current_bytes_used / GIGA_BYTE, 2)
+            
+            quota_limit_bytes = user['quota_gb'] * GIGA_BYTE
+            
+            if uid:
+                # Ensure iptables counting rule is present if user is active
+                if status == 'active':
+                    manage_quota_iptables_rule(username, uid, 'add')
+                else:
+                    manage_quota_iptables_rule(username, uid, 'delete')
+                    
+                # Enforcement: Check Quota
+                if user['quota_gb'] > 0 and current_bytes_used >= quota_limit_bytes and status == 'active':
+                    safe_run_command(['usermod', '-L', username]) # Lock account
+                    user['status'] = 'exceeded'
+                    print(f"User {username} locked due to quota ({user['usage_gb']} GB / {user['quota_gb']} GB).")
+                
+                # Ensure TC Rate Limit is applied if needed
+                if status == 'active' and int(user['rate_limit_kbps']) > 0:
+                    apply_rate_limit(uid, user['rate_limit_kbps'])
+                elif status != 'active' or int(user['rate_limit_kbps']) == 0:
+                    # Clean up rate limit if account is inactive or limit is 0
+                    apply_rate_limit(uid, 0)
+
+
+            updated_users.append(user)
+            
+        save_users(updated_users)
+        return updated_users
+        
+    except Exception as e:
+        print(f"Error loading users.json: {e}")
+        return []
+
+def save_users(users):
+    """保存用户列表到 JSON 文件."""
+    try:
+        with open(USER_DB_PATH, 'w') as f:
+            json.dump(users, f, indent=4)
+    except Exception as e:
+        print(f"Error saving users.json: {e}")
+
 def get_user(username):
+    """按用户名查找用户."""
     users = load_users()
-    for i, user in enumerate(users):
-        if user.get('username') == username: return user, i
-    return None, -1
+    for user in users:
+        if user['username'] == username:
+            return user
+    return None
 
-def log_action(action_type, username, details=""):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    operator_ip = request.remote_addr if request else "127.0.0.1 (System)"
-    log_entry = f"[{timestamp}] [USER:{username}] [IP:{operator_ip}] ACTION:{action_type} DETAILS: {details}\n"
-    try:
-        with open(AUDIT_LOG_PATH, 'a') as f: f.write(log_entry)
-    except Exception as e:
-        print(f"Error writing to audit log: {e}")
-
-def get_recent_logs(n=20):
-    try:
-        if not os.path.exists(AUDIT_LOG_PATH):
-            return ["日志文件不存在。"]
-        command = ['/usr/bin/tail', '-n', str(n), AUDIT_LOG_PATH]
-        result = subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2)
-        return result.stdout.decode('utf-8').strip().split('\n')
-    except Exception:
-        return ["读取日志失败或日志文件为空。"]
+# --- 认证装饰器 ---
 
 def login_required(f):
-    @wraps(f)
+    """检查用户是否已登录."""
     def decorated_function(*args, **kwargs):
         if 'logged_in' not in session or not session.get('logged_in'):
-            log_action("LOGIN_ATTEMPT", "N/A", f"Access denied to {request.path}")
             return redirect(url_for('login'))
         return f(*args, **kwargs)
-    decorated_function.__name__ = f.__name__ + "_decorated"
+    decorated_function.__name__ = f.__name__
     return decorated_function
 
-def safe_run_command(command, input_data=None):
-    """安全运行系统命令。"""
-    try:
-        # 使用 Popen 而不是 run，更好地控制错误捕获
-        process = subprocess.Popen(
-            command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            stdin=subprocess.PIPE if input_data else None,
-            text=True,
-            encoding='utf-8'
-        )
-        stdout, stderr = process.communicate(input=input_data, timeout=5)
-        
-        if process.returncode != 0:
-             # 打印非零返回码的错误信息
-             return False, stderr.strip() if stderr else f"Command failed with code {process.returncode}"
+# --- HTML 模板和渲染 ---
 
-        return True, stdout.strip()
-    except subprocess.TimeoutExpired:
-        process.kill()
-        process.wait()
-        return False, "Command timed out"
-    except FileNotFoundError as e:
-        return False, f"Command not found: {command[0]}"
-    except Exception as e:
-        return False, f"Execution error: {str(e)}"
-
-def toggle_iptables_ip_ban(ip, action):
-    """在 WSS_IP_BLOCK 链中添加或移除 IP 阻断规则，并保存规则。"""
-    chain = "WSS_IP_BLOCK"
-    if action == 'block':
-        safe_run_command(['/sbin/iptables', '-D', chain, '-s', ip, '-j', 'DROP'])
-        command = ['/sbin/iptables', '-I', chain, '1', '-s', ip, '-j', 'DROP']
-    elif action == 'unblock':
-        command = ['/sbin/iptables', '-D', chain, '-s', ip, '-j', 'DROP']
-    else: return False, "Invalid action"
-
-    success, output = safe_run_command(command)
-
-    if success or 'Bad rule' in output or 'No chain/target/match by that name' in output:
-        try:
-            with open('/etc/iptables/rules.v4', 'w') as f:
-                # 使用绝对路径确保 iptables-save 找到
-                subprocess.run(['/sbin/iptables-save'], stdout=f, check=True, timeout=3)
-            return True, "IPTables rule updated and saved."
-        except Exception:
-            return True, "IPTables rule updated but failed to save persistence file."
-
-    return success, output
-
-def kill_user_sessions(username):
-    """终止给定用户名的所有活跃 SSH 会话."""
-    safe_run_command([shutil.which('pkill') or '/usr/bin/pkill', '-u', username])
-
-# --- 核心用户状态管理函数 ---
-
-def sync_user_status(user):
-    """根据到期日和并发限制同步系统账户状态。"""
-    username = user['username']
-
-    is_expired_or_exceeded = False
-
-    # 检查到期日
-    if user['expiry_date']:
-        try:
-            expiry_dt = datetime.strptime(user['expiry_date'], '%Y-%m-%d')
-            if expiry_dt.date() < datetime.now().date(): is_expired_or_exceeded = True
-        except ValueError: print(f"Invalid expiry_date format for {username}: {user['expiry_date']}")
-
-    # 检查并发限制 (使用 ss 命令检查活跃连接数)
-    current_conn_count = 0
-    max_connections = user.get('max_connections', MAX_CONN_DEFAULT)
-    is_over_limit = False
-
-    try:
-        # 使用 shutil.which 查找系统命令路径
-        id_bin = shutil.which('id')
-        ss_bin = shutil.which('ss')
-        
-        if not id_bin or not ss_bin:
-             print(f"[DEBUG-CONN] ERROR: System commands 'id' or 'ss' not found via shutil.which.")
-             return user
-        
-        success, uid = safe_run_command([id_bin, '-u', username])
-        if success and uid.isdigit():
-            # 检查用户 uid 拥有的所有到 SSH_TARGET_PORT 的 established TCP 连接
-            command = [ss_bin, '-t', '-n', 'state', 'established', 'dport', str(SSH_TARGET_PORT), 'user', str(uid)]
-            result = subprocess.run(command, capture_output=True, text=True, timeout=2)
-            
-            # ss 命令输出的第一行是标题，所以要减去 1
-            current_conn_count = len(result.stdout.strip().split('\n')) - 1 if result.stdout.strip() and len(result.stdout.strip().split('\n')) > 1 else 0
-        else:
-             print(f"[DEBUG-CONN] ERROR: Failed to get UID for {username}. Output: {uid}")
-             return user
-    except Exception as e:
-        print(f"[DEBUG-CONN] ERROR in sync_user_status SS check: {e}")
-        current_conn_count = 0
-
-    if max_connections > 0 and current_conn_count > max_connections:
-        is_over_limit = True
-
-    should_be_paused = (user.get('status') == 'paused') or is_expired_or_exceeded or is_over_limit
-
-    system_locked = False
-    success_status, output_status = safe_run_command(['/usr/bin/passwd', '-S', username])
-    if success_status and output_status and ' L ' in output_status: system_locked = True
-
-    if not should_be_paused and system_locked:
-        safe_run_command(['/usr/sbin/usermod', '-U', username])
-        if user['expiry_date']: safe_run_command(['/usr/bin/chage', '-E', user['expiry_date'], username])
-        else: safe_run_command(['/usr/bin/chage', '-E', '', username])
-        user['status'] = 'active'
-
-    elif should_be_paused and not system_locked:
-        safe_run_command(['/usr/sbin/usermod', '-L', username])
-        safe_run_command(['/usr/bin/chage', '-E', '1970-01-01', username])
-        kill_user_sessions(username)
-        user['status'] = 'paused'
-
-    user['current_conn_count'] = current_conn_count
-    user['max_conn'] = max_connections
-    user['is_over_limit'] = is_over_limit
-
-    return user
-
-def refresh_all_user_status(users):
-    """更新所有用户状态并生成显示所需的字段."""
-    updated = False
-    for user in users:
-        user = sync_user_status(user)
-
-        user['status_text'] = "Active"
-        user['status_class'] = "bg-green-500"
-
-        if user.get('is_over_limit'):
-            user['status_text'] = f"Limit Exceeded ({user['current_conn_count']}/{user['max_conn']})"
-            user['status_class'] = "bg-red-500"
-        elif user['status'] == 'paused':
-            user['status_text'] = "Paused"
-            user['status_class'] = "bg-yellow-500"
-        elif user.get('expiry_date') and datetime.strptime(user['expiry_date'], '%Y-%m-%d').date() < datetime.now().date():
-            user['status_text'] = "Expired"
-            user['status_class'] = "bg-red-500"
-        else:
-             user['status_text'] = f"Active ({user['current_conn_count']}/{user['max_conn']})"
-
-        updated = True
-    if updated: save_users(users)
-    return users
-
-def get_service_status(service):
-    """检查 systemd 服务的状态."""
-    try:
-        success, output = safe_run_command([shutil.which('systemctl') or '/bin/systemctl', 'is-active', service])
-        return 'running' if success and output == 'active' else 'failed'
-    except Exception:
-        return 'failed'
-
-# --- 实时连接查询函数 (NEW) ---
-def get_live_connections_for_user(username, target_port):
-    """使用 ss 命令获取指定用户连接到目标端口的实时远程 IP和计数。"""
-    # 查找命令路径
-    id_bin = shutil.which('id')
-    ss_bin = shutil.which('ss')
-    
-    if not id_bin or not ss_bin:
-        print(f"[DEBUG-CONN] ERROR: System commands 'id' ({id_bin}) or 'ss' ({ss_bin}) not found via shutil.which.")
-        return {}
-    
-    try:
-        # 1. 获取 UID
-        success, uid = safe_run_command([id_bin, '-u', username])
-        if not success or not uid.isdigit():
-            print(f"[DEBUG-CONN] ERROR: Failed to get UID for {username}. safe_run_command output: {uid}")
-            return {}
-        
-        # 2. 运行 ss 命令
-        command = [ss_bin, '-t', '-n', 'state', 'established', 'dport', str(target_port), 'user', str(uid)]
-        
-        # 使用 subprocess.run 确保能捕获所有输出
-        result = subprocess.run(command, capture_output=True, text=True, timeout=3)
-        
-        output_ss = result.stdout
-        error_ss = result.stderr
-        
-        if result.returncode != 0:
-            print(f"[DEBUG-CONN] ERROR: SS command failed (Code {result.returncode}) for {username}. Command: {' '.join(command)}. Stderr: {error_ss.strip()}")
-            return {}
-
-        active_ips = {}
-        lines = output_ss.strip().split('\n')
-        
-        # 跳过标题行
-        if len(lines) > 0 and 'Netid' in lines[0]:
-            lines.pop(0)
-
-        for line in lines:
-            if not line.strip(): continue
-            # 使用正则表达式分割，以应对 ss 输出中的多空格/制表符
-            parts = re.split(r'\s+', line.strip()) 
-            
-            # Peer Address:Port (远程地址) 在标准 ss -t -n 输出中通常是第 5 列 (index 4)
-            if len(parts) >= 5:
-                remote_addr_port = parts[4] 
-                if ':' in remote_addr_port:
-                    # 剥离端口和 IPv6 的方括号
-                    client_ip = remote_addr_port.rsplit(':', 1)[0].strip().replace('[', '').replace(']', '')
-                    active_ips[client_ip] = active_ips.get(client_ip, 0) + 1
-            
-        if not active_ips:
-            # 调试信息，如果未找到任何连接
-            print(f"[DEBUG-CONN] No active IPs found for {username} (Target Port {target_port}). SS Command: {' '.join(command)}. Raw SS output:")
-            print(output_ss)
-
-        return {ip: {'count': count, 'last_seen': int(time.time())} for ip, count in active_ips.items()}
-        
-    except Exception as e:
-        print(f"Error checking live connections for {username}: {e}")
-        return {}
-
-
-# --- Web 路由所需的渲染函数 ---
-
+# 仪表盘 HTML (内嵌) - Tailwind CSS 风格 (匹配第二张图片)
 _DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WSS Panel - 仪表盘 V6.2 优化版</title>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WSS Panel - 仪表盘</title>
+    <script src="https://cdn.tailwindcss.com"></script>
     <style>
-        body { font-family: 'Inter', sans-serif; }
-        .card { transition: all 0.3s ease; }
-        .btn-action { transition: all 0.2s ease; }
-        .modal { background-color: rgba(0, 0, 0, 0.6); z-index: 999; }
-        .modal-content { transition: all 0.3s ease-out; transform: translateY(-50px); }
-        .modal.open .modal-content { transform: translateY(0); }
-        .service-status-icon { height: 10px; width: 10px; display: inline-block; border-radius: 50%; margin-right: 5px; }
-        .status-running { background-color: #10B981; }
-        .status-failed { background-color: #EF4444; }
-        .log-entry { font-family: monospace; font-size: 0.8rem; white-space: pre-wrap; word-break: break-all; }
+        /* Custom status colors for Jinja/JS use */
+        .active { color: #10b981; } /* green-600 */
+        .expired, .exceeded { color: #ef4444; } /* red-600 */
+        .modal { position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; overflow: auto; background-color: rgba(0,0,0,0.4); display: none; justify-content: center; align-items: center; }
+        /* Log display to reverse order for newest-on-top, relying on server-side reversed log data */
+        .log-pre { display: flex; flex-direction: column-reverse; max-height: 250px; overflow-y: scroll; white-space: pre-wrap; }
+        /* Smaller rounded indicator dots */
+        .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
+        .grid-custom { grid-template-columns: 1fr 1fr 1fr 1fr 1fr 1fr; }
+        @media (max-width: 1024px) {
+            .grid-custom { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
+        }
     </style>
 </head>
-<body class="bg-gray-50 min-h-screen">
-    <div class="bg-indigo-600 text-white shadow-lg">
-        <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-4 flex justify-between items-center">
-            <h1 class="text-3xl font-bold">WSS 隧道管理面板 V6.2 (优化版)</h1>
-            <div class="flex space-x-3">
-                <button onclick="openRootPasswordModal()" class="bg-indigo-700 hover:bg-indigo-800 px-4 py-2 rounded-lg font-semibold shadow-md btn-action">
-                    修改 Root 密码
-                </button>
-                <button onclick="logout()" class="bg-red-600 hover:bg-red-700 px-4 py-2 rounded-lg font-semibold shadow-md btn-action">
-                    退出登录 (root)
-                </button>
-            </div>
-        </div>
-    </div>
+<body class="bg-gray-100 min-h-screen">
+    <div class="bg-gray-800 text-white p-4 shadow-lg flex justify-between items-center sticky top-0 z-50">
+        <h1 class="text-2xl font-semibold">WSS Panel - 仪表盘</h1>
+        <button class="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-lg transition" onclick="logout()">退出登录 (root)</button>
+    </div>
 
-    <div class="max-w-7xl mx-auto p-4 sm:p-6 lg:p-8">
-        <!-- Status Message Box -->
-        <div id="status-message" class="hidden p-4 mb-4 rounded-xl font-semibold shadow-md" role="alert"></div>
-        
-        <!-- System Status Card -->
-        <div class="card bg-white p-6 rounded-xl shadow-lg mb-8">
-            <h3 class="text-xl font-semibold text-gray-800 mb-4 border-b pb-2">实时系统状态</h3>
-            <div id="system-status-data" class="grid grid-cols-2 md:grid-cols-4 gap-4 text-sm">
-                <p class="text-gray-500 col-span-4">正在加载系统状态...</p>
-            </div>
-        </div>
+    <div class="container mx-auto mt-6 px-4">
+        <div id="status-message" class="p-4 rounded-lg font-bold mb-6" style="display:none;"></div>
+        
+        <!-- 实时系统状态 (顶部卡片区) -->
+        <div class="mb-6">
+            <h3 class="text-xl font-semibold text-gray-700 mb-3">实时系统状态</h3>
+            <div class="grid grid-cols-2 md:grid-cols-6 gap-4">
+                
+                <!-- CPU -->
+                <div class="bg-white p-4 rounded-xl shadow-md border-b-4 border-blue-500 text-center">
+                    <h4 class="text-sm text-gray-500 font-medium">CPU 使用率</h4>
+                    <p id="cpu-usage" class="text-2xl font-extrabold text-blue-700 mt-1">--</p>
+                </div>
 
-        <!-- Stats Grid -->
-        <div class="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
-            <div class="card bg-white p-5 rounded-xl shadow-lg border-l-4 border-indigo-500">
-                <h3 class="text-sm font-medium text-gray-500">已管理用户组数</h3>
-                <p class="text-3xl font-bold text-gray-900 mt-1">{{ users|length }}</p>
-            </div>
-            <div class="card bg-white p-5 rounded-xl shadow-lg border-l-4 border-green-500">
-                <h3 class="text-sm font-medium text-gray-500">面板端口</h3>
-                <p class="text-3xl font-bold text-gray-900 mt-1">{{ panel_port }}</p>
-            </div>
-            <div class="card bg-white p-5 rounded-xl shadow-lg border-l-4 border-blue-500">
-                <h3 class="text-sm font-medium text-gray-500">WSS/TLS 端口</h3>
-                <p class="text-3xl font-bold text-gray-900 mt-1">{{ wss_tls_port }}</p>
-            </div>
-            <div class="card bg-white p-5 rounded-xl shadow-lg border-l-4 border-yellow-500">
-                <h3 class="text-sm font-medium text-gray-500">Stunnel/SSH 目标端口</h3>
-                <p class="text-3xl font-bold text-gray-900 mt-1">{{ stunnel_port }} / {{ ssh_target_port }}</p>
-            </div>
-        </div>
-        
-        <!-- 服务诊断与控制 -->
-        <div class="card bg-white p-6 rounded-xl shadow-lg mb-8">
-            <h3 class="text-xl font-semibold text-gray-800 mb-4 border-b pb-2">服务诊断与控制</h3>
-            <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
-                <div class="bg-gray-100 p-4 rounded-lg font-mono text-sm overflow-x-auto">
-                    <p><span class="font-bold">服务器 IP 地址:</span> <span class="text-indigo-600">{{ host_ip }}</span></p>
-                    <p class="mt-2 font-bold text-gray-700">关键端口监听状态:</p>
-                    <div id="port-status-data" class="mt-2 space-y-1">
-                        <p class="text-gray-500">正在检查端口...</p>
-                    </div>
-                </div>
-                <div class="bg-gray-100 p-4 rounded-lg">
-                    <p class="font-bold text-gray-700 mb-3">核心服务操作:</p>
-                    <div class="space-y-3">
-                        <button onclick="controlService('wss', 'restart')" class="w-full bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg font-semibold shadow-md btn-action">
-                            重启 WSS Proxy ({{ wss_tls_port }}/{{ wss_http_port }})
-                        </button>
-                        <button onclick="controlService('stunnel4', 'restart')" class="w-full bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg font-semibold shadow-md btn-action">
-                            重启 Stunnel4 ({{ stunnel_port }})
-                        </button>
-                        <button onclick="controlService('udpgw', 'restart')" class="w-full bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg font-semibold shadow-md btn-action">
-                            重启 UDPGW ({{ udpgw_port }})
-                        </button>
-                        <button onclick="controlService('wss_panel', 'restart')" class="w-full bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg font-semibold shadow-md btn-action">
-                            重启 Web 面板 (谨慎操作)
-                        </button>
-                    </div>
-                </div>
-            </div>
-        </div>
+                <!-- 内存 -->
+                <div class="bg-white p-4 rounded-xl shadow-md border-b-4 border-blue-500 text-center">
+                    <h4 class="text-sm text-gray-500 font-medium">内存 (用量/总量)</h4>
+                    <p id="mem-usage" class="text-xl font-extrabold text-blue-700 mt-1">--</p>
+                </div>
+                
+                <!-- 硬盘 -->
+                <div class="bg-white p-4 rounded-xl shadow-md border-b-4 border-blue-500 text-center">
+                    <h4 class="text-sm text-gray-500 font-medium">磁盘使用率</h4>
+                    <p id="disk-usage" class="text-2xl font-extrabold text-blue-700 mt-1">--</p>
+                </div>
 
-        <!-- 近期管理活动 -->
-        <div class="card bg-white p-6 rounded-xl shadow-lg mb-8">
-            <h3 class="text-xl font-semibold text-gray-800 mb-4 border-b pb-2">近期管理活动 (最新 20 条)</h3>
-            <div class="bg-gray-100 p-4 rounded-lg max-h-96 overflow-y-auto">
-                <div id="audit-log-content">
-                    <p class="text-gray-500">正在加载日志...</p>
-                </div>
-            </div>
-        </div>
+                <!-- WSS Proxy 状态 -->
+                <div class="bg-white p-4 rounded-xl shadow-md border-b-4 border-gray-400 text-center">
+                    <h4 class="text-sm text-gray-500 font-medium">WSS Proxy 状态</h4>
+                    <p class="text-base font-bold text-gray-800 mt-1 flex items-center justify-center">
+                        <span id="wss-status-indicator" class="status-dot"></span><span id="wss-status-label">--</span>
+                    </p>
+                </div>
 
-        <!-- Add User Card / User List Card -->
-        <div class="card bg-white p-6 rounded-xl shadow-lg mb-8">
-            <h3 class="text-xl font-semibold text-gray-800 mb-4">新增 WSS 用户组 (SSH 账户)</h3>
-            <form id="add-user-form" class="flex flex-wrap items-center gap-4">
-                <input type="text" id="new-username" placeholder="用户名 (小写字母/数字/下划线)" 
-                        class="flex-1 min-w-[200px] p-2.5 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500"
-                        pattern="[a-z0-9_]{3,16}" title="用户名只能包含小写字母、数字和下划线，长度3-16位" required>
-                <input type="password" id="new-password" placeholder="密码" 
-                        class="flex-1 min-w-[200px] p-2.5 border border-gray-300 rounded-lg focus:ring-indigo-500 focus:border-indigo-500" required>
-                <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2.5 rounded-lg font-semibold shadow-md btn-action">
-                    创建用户组
-                </button>
-            </form>
-        </div>
-        
-        <div class="card bg-white p-6 rounded-xl shadow-lg">
-            <h3 class="text-xl font-semibold text-gray-800 mb-4">用户组列表</h3>
-            <div class="overflow-x-auto">
-                <table class="min-w-full divide-y divide-gray-200 user-table">
-                    <thead class="bg-gray-50">
-                        <tr>
-                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">用户组 (SSH 账户)</th>
-                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">状态 (并发/限制)</th>
-                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">到期日</th>
-                            <th class="px-6 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">操作</th>
-                        </tr>
-                    </thead>
-                    <tbody class="bg-white divide-y divide-gray-200" id="user-table-body">
-                        {% for user in users %}
-                        <tr id="row-{{ user.username }}" class="hover:bg-gray-50">
-                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium text-gray-900">{{ user.username }}</td>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm">
-                                <span class="px-2 inline-flex text-xs leading-5 font-semibold rounded-full text-white {{ user.status_class }}">
-                                    {{ user.status_text }}
-                                </span>
-                            </td>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                                {{ user.expiry_date if user.expiry_date else 'N/A' }}
-                            </td>
-                            <td class="px-6 py-4 whitespace-nowrap text-sm font-medium space-x-2 flex items-center">
-                                <button onclick="openActiveIPModal('{{ user.username }}')" 
-                                        class="text-xs px-3 py-1 rounded-full font-bold bg-purple-100 text-purple-800 hover:bg-purple-200 btn-action">
-                                    活跃 IP
-                                </button>
-                                <button onclick="openSettingsModal('{{ user.username }}', '{{ user.expiry_date }}', '{{ user.max_conn }}')" 
-                                        class="text-xs px-3 py-1 rounded-full font-bold bg-blue-100 text-blue-800 hover:bg-blue-200 btn-action">
-                                    设置
-                                </button>
-                                <button onclick="openConfirmationModal('{{ user.username }}', '{{ 'pause' if user.status == 'active' else 'active' }}', 'toggleStatus', '{{ '暂停' if user.status == 'active' else '启用' }}')" 
-                                        class="text-xs px-3 py-1 rounded-full font-bold {{ 'bg-yellow-100 text-yellow-800 hover:bg-yellow-200' if user.status == 'active' else 'bg-green-100 text-green-800 hover:bg-green-200' }} btn-action">
-                                    {{ '暂停' if user.status == 'active' else '启用' }}
-                                </button>
-                                <button onclick="openConfirmationModal('{{ user.username }}', null, 'deleteUser', '删除')" 
-                                        class="text-xs px-3 py-1 rounded-full font-bold bg-red-100 text-red-800 hover:bg-red-200 btn-action">
-                                    删除
-                                </button>
-                            </td>
-                        </tr>
-                        {% endfor %}
-                    </tbody>
-                </table>
-            </div>
-        </div>
+                <!-- Stunnel4 状态 -->
+                <div class="bg-white p-4 rounded-xl shadow-md border-b-4 border-gray-400 text-center">
+                    <h4 class="text-sm text-gray-500 font-medium">Stunnel4 状态</h4>
+                    <p class="text-base font-bold text-gray-800 mt-1 flex items-center justify-center">
+                        <span id="stunnel4-status-indicator" class="status-dot"></span><span id="stunnel4-status-label">--</span>
+                    </p>
+                </div>
+                
+                <!-- UDPGW 状态 -->
+                <div class="bg-white p-4 rounded-xl shadow-md border-b-4 border-gray-400 text-center">
+                    <h4 class="text-sm text-gray-500 font-medium">UDPGW 状态</h4>
+                    <p class="text-base font-bold text-gray-800 mt-1 flex items-center justify-center">
+                        <span id="udpgw-status-indicator" class="status-dot"></span><span id="udpgw-status-label">--</span>
+                    </p>
+                </div>
+            </div>
+        </div>
 
-    </div>
-    
-    <!-- Modal for Root Password Change -->
-    <div id="root-password-modal" class="modal fixed inset-0 flex items-center justify-center p-4 hidden">
-        <div class="modal-content bg-white rounded-xl shadow-2xl w-full max-w-lg transition-all">
-            <div class="p-6">
-                <h3 class="text-xl font-bold mb-4 text-gray-800 border-b pb-2">修改面板 Root 密码</h3>
-                <form id="root-password-form" onsubmit="event.preventDefault(); saveRootPassword();">
-                    <div class="mb-4">
-                        <label for="current-password-root" class="block text-sm font-medium text-gray-700">当前密码</label>
-                        <input type="password" id="current-password-root" class="mt-1 block w-full p-2 border border-gray-300 rounded-lg" required>
-                    </div>
-                    <div class="mb-4">
-                        <label for="new-password-root" class="block text-sm font-medium text-gray-700">新密码</label>
-                        <input type="password" id="new-password-root" class="mt-1 block w-full p-2 border border-gray-300 rounded-lg" required>
-                    </div>
-                    <div class="mb-6">
-                        <label for="confirm-password-root" class="block text-sm font-medium text-gray-700">确认新密码</label>
-                        <input type="password" id="confirm-password-root" class="mt-1 block w-full p-2 border border-gray-300 rounded-lg" required>
-                    </div>
-
-                    <div class="flex justify-end space-x-3">
-                        <button type="button" onclick="closeRootPasswordModal()" class="bg-gray-300 hover:bg-gray-400 text-gray-800 px-4 py-2 rounded-lg font-semibold btn-action">
-                            取消
-                        </button>
-                        <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg font-semibold btn-action">
-                            保存新密码
-                        </button>
-                    </div>
-                </form>
-            </div>
-        </div>
-    </div>
-    
-    <!-- Modal for User Settings -->
-    <div id="settings-modal" class="modal fixed inset-0 flex items-center justify-center p-4 hidden">
-        <div class="modal-content bg-white rounded-xl shadow-2xl w-full max-w-lg transition-all">
-            <div class="p-6">
-                <h3 class="text-xl font-bold mb-4 text-gray-800 border-b pb-2">设置 <span id="modal-username-title-settings"></span> 的参数</h3>
-                <form id="settings-form" onsubmit="event.preventDefault(); saveSettings();">
-                    <input type="hidden" id="modal-username-settings">
-                    
-                    <div class="mb-4">
-                        <label for="modal-max-conn" class="block text-sm font-medium text-gray-700">最大并发连接数 (0为无限)</label>
-                        <input type="number" step="1" min="0" id="modal-max-conn" class="mt-1 block w-full p-2 border border-gray-300 rounded-lg" required>
-                    </div>
-
-                    <div class="mb-6">
-                        <label for="modal-expiry" class="block text-sm font-medium text-gray-700">到期日 (YYYY-MM-DD, 留空为永不到期)</label>
-                        <input type="date" id="modal-expiry" class="mt-1 block w-full p-2 border border-gray-300 rounded-lg">
-                    </div>
-                    
-                    <h4 class="font-bold text-gray-800 mt-6 mb-3 border-t pt-3">修改 SSH 密码 (可选)</h4>
-                    <div class="mb-4">
-                        <label for="modal-new-password" class="block text-sm font-medium text-gray-700">新 SSH 密码 (留空则不修改)</label>
-                        <input type="password" id="modal-new-password" class="mt-1 block w-full p-2 border border-gray-300 rounded-lg">
-                    </div>
-
-                    <div class="flex justify-end space-x-3 mt-6">
-                        <button type="button" onclick="closeSettingsModal()" class="bg-gray-300 hover:bg-gray-400 text-gray-800 px-4 py-2 rounded-lg font-semibold btn-action">
-                            取消
-                        </button>
-                        <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white px-4 py-2 rounded-lg font-semibold btn-action">
-                            保存设置
-                        </button>
-                    </div>
-                </form>
-            </div>
-        </div>
-    </div>
-    
-    <!-- Active IP / Confirmation Modals -->
-    <div id="active-ip-modal" class="modal fixed inset-0 flex items-center justify-center p-4 hidden">
-        <div class="modal-content bg-white rounded-xl shadow-2xl w-full max-w-xl transition-all">
-            <div class="p-6">
-                <h3 class="text-xl font-bold mb-4 text-gray-800 border-b pb-2">用户组 <span id="active-ip-modal-title"></span> 的活跃 IP (IP 封禁)</h3>
-                <div id="active-ip-list" class="space-y-3 max-h-96 overflow-y-auto">
-                    <p class="text-gray-500">正在加载活跃 IP...</p>
-                </div>
-                <div class="flex justify-end space-x-3 mt-6">
-                    <button type="button" onclick="closeActiveIPModal()" class="bg-gray-300 hover:bg-gray-400 text-gray-800 px-4 py-2 rounded-lg font-semibold btn-action">
-                        关闭
-                    </button>
-                </div>
-            </div>
-        </div>
-    </div>
-
-    <div id="confirmation-modal" class="modal fixed inset-0 flex items-center justify-center p-4 hidden">
-        <div class="modal-content bg-white rounded-xl shadow-2xl w-full max-w-md transition-all">
-            <div class="p-6">
-                <h3 class="text-xl font-bold mb-4 text-gray-800 border-b pb-2" id="confirm-title">操作确认</h3>
-                <p id="confirm-message" class="mb-6 text-gray-700"></p>
+        <!-- 端口状态, 核心操作, 日志区 -->
+        <div class="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6">
+            <!-- Port Status and Core Ops (Left Column) -->
+            <div class="lg:col-span-1 bg-white p-6 rounded-xl shadow-md">
+                <h3 class="text-xl font-semibold text-gray-700 mb-4">服务端口与操作</h3>
                 
-                <input type="hidden" id="confirm-username">
-                <input type="hidden" id="confirm-action">
-                <input type="hidden" id="confirm-type">
-
-                <div class="flex justify-end space-x-3">
-                    <button type="button" onclick="closeConfirmationModal()" class="bg-gray-300 hover:bg-gray-400 text-gray-800 px-4 py-2 rounded-lg font-semibold btn-action">
-                        取消
-                    </button>
-                    <button type="button" onclick="executeConfirmation()" class="bg-red-600 hover:bg-red-700 text-white px-4 py-2 rounded-lg font-semibold btn-action" id="confirm-button">
-                        确认
-                    </button>
-                </div>
-            </div>
-        </div>
-    </div>
-
-
-    <script>
-        // --- Utility Functions ---
-        function showStatus(message, isSuccess) {
-            const statusDiv = document.getElementById('status-message');
-            statusDiv.textContent = message;
-            statusDiv.className = \`\${isSuccess ? 'bg-green-100 text-green-800 border-green-400' : 'bg-red-100 text-red-800 border-red-400'} p-4 mb-4 rounded-xl font-semibold shadow-md block border\`;
-            setTimeout(() => { statusDiv.classList.add('hidden'); }, 5000);
-        }
-        
-        function logout() {
-            window.location.href = '/logout';
-        }
-
-        // --- System Status & Port Check Logic ---
-        const PORT_SERVICES = {
-            '{{ wss_http_port }}': 'WSS HTTP/Payload',
-            '{{ wss_tls_port }}': 'WSS TLS',
-            '{{ stunnel_port }}': 'Stunnel4 TLS',
-            '{{ udpgw_port }}': 'UDPGW UDP',
-            '{{ panel_port }}': 'Web Panel (TCP)'
-        };
-
-        function updateSystemStatus(data) {
-            const container = document.getElementById('system-status-data');
-            
-            const formatService = (service, status) => {
-                const className = status === 'running' ? 'status-running' : 'status-failed';
-                const text = status === 'running' ? '运行中' : '失败';
-                return \`
-                    <div class="flex items-center p-2 bg-gray-100 rounded-lg shadow-sm">
-                        <span class="service-status-icon \${className}"></span>
-                        <span class="font-semibold">\${service}:</span>
-                        <span class="ml-auto font-medium \${className === 'status-failed' ? 'text-red-600' : 'text-green-600'}">\${text}</span>
+                <div class="flex flex-col space-y-4">
+                    <!-- Port List -->
+                    <div class="rounded-lg border border-gray-200 p-4">
+                        <h4 class="font-medium text-gray-600 mb-2 border-b pb-1">端口监听状态 (LISTEN)</h4>
+                        <table class="min-w-full text-sm">
+                            <tbody id="service-port-tbody">
+                                <!-- Dynamically populated by JS -->
+                            </tbody>
+                        </table>
                     </div>
-                \`;
-            };
 
-            const formatResource = (label, value) => \`
-                <div class="p-2 bg-gray-100 rounded-lg shadow-sm">
-                    <span class="font-semibold">\${label}:</span>
-                    <span class="ml-auto font-medium text-gray-700">\${value}</span>
-                </div>
-            \`;
-
-            let html = formatResource("CPU 使用率", \`\${data.cpu_percent.toFixed(1)}%\`);
-            html += formatResource("内存 (用/总)", \`\${data.memory_used_gb.toFixed(2)} / \${data.memory_total_gb.toFixed(2)} GB\`);
-            html += formatResource("磁盘使用率", \`\${data.disk_used_percent.toFixed(1)}%\`);
-            html += formatResource("面板 API", '<span class="text-green-600 font-semibold">正常</span>');
-
-            html += formatService("WSS Proxy", data.services.wss);
-            html += formatService("Panel Service", data.services.wss_panel);
-            html += formatService("Stunnel4", data.services.stunnel4);
-            html += formatService("UDPGW", data.services.udpgw);
-
-            container.innerHTML = html;
-            updatePortStatus(data.ports);
-        }
-        
-        function updatePortStatus(ports) {
-            const container = document.getElementById('port-status-data');
-            let html = '';
-            
-            for (const port in ports) {
-                const status = ports[port];
-                const serviceName = PORT_SERVICES[port] || '未知服务';
-                const className = status === 'LISTEN' ? 'text-green-600' : 'text-red-600';
-                const iconClass = status === 'LISTEN' ? 'status-running' : 'status-failed';
-                
-                html += \`
-                    <div class="flex justify-between items-center text-gray-700">
-                        <span class="font-medium">\${port} (\${serviceName}):</span>
-                        <span class="font-bold \${className}">
-                            <span class="service-status-icon \${iconClass}"></span>
-                            \${status}
-                        </span>
+                    <!-- Core Operations -->
+                    <div class="rounded-lg bg-red-50 p-4 shadow-inner">
+                        <h4 class="font-medium text-red-600 mb-3 border-b border-red-200 pb-1">核心服务操作</h4>
+                        <div class="space-y-2">
+                            <button class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 rounded-lg transition" onclick="openRestartModal('wss', 'WSS Proxy (HTTP/TLS)')">重启 WSS Proxy ({{ wss_http_port }}/{{ wss_tls_port }})</button>
+                            <button class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 rounded-lg transition" onclick="openRestartModal('stunnel4', 'Stunnel4 (TLS Tunnel)')">重启 Stunnel4 ({{ stunnel_port }})</button>
+                            <button class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 rounded-lg transition" onclick="openRestartModal('udpgw', 'UDPGW')">重启 UDPGW ({{ udpgw_port }})</button>
+                            <button class="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-2 rounded-lg transition" onclick="openRestartModal('wss_panel', 'Web Panel')">重启 Web Panel (慎重操作)</button>
+                        </div>
                     </div>
-                \`;
-            }
-            container.innerHTML = html;
-        }
-
-        async function fetchSystemStatus() {
-            const API_URL = '/api/system/status';
+                </div>
+            </div>
             
-            try {
-                const response = await fetch(API_URL, { method: 'GET' });
+            <!-- 实时日志区 (Right Column) -->
+            <div class="lg:col-span-1 xl:col-span-2 bg-white p-6 rounded-xl shadow-md">
+                <h3 class="text-xl font-semibold text-gray-700 mb-4">实时系统日志 (最新50条, 每10s刷新)</h3>
+                <div class="bg-gray-800 p-3 rounded-lg overflow-hidden">
+                    <pre id="log-pre-content" class="text-gray-200 text-xs p-1 log-pre">正在加载日志...</pre>
+                </div>
+            </div>
+        </div>
 
-                if (response.status === 403) {
-                    document.getElementById('system-status-data').innerHTML = '<p class="text-red-500 col-span-4">权限不足，请确保已登录。</p>';
-                    return;
-                }
-                
-                const data = await response.json();
 
-                if (data.success) {
-                    updateSystemStatus(data);
-                } else {
-                    document.getElementById('system-status-data').innerHTML = \`<p class="text-red-500 col-span-4">无法获取系统状态: \${data.message}</p>\`;
-                }
-            } catch (error) {
-                document.getElementById('system-status-data').innerHTML = '<p class="text-red-500 col-span-4">连接错误，请检查防火墙和面板服务。</p>';
-            }
-        }
-        
-        async function fetchAuditLogs() {
-            const API_URL = '/api/logs';
-            try {
-                const response = await fetch(API_URL, { method: 'GET' });
-                const data = await response.json();
-                const logContainer = document.getElementById('audit-log-content');
-                
-                if (response.ok && data.success) {
-                    if (data.logs.length === 0) {
-                        logContainer.innerHTML = '<p class="text-gray-500">目前没有管理活动日志。</p>';
-                        return;
-                    }
-                    
-                    logContainer.innerHTML = data.logs.map(log => {
-                        const formattedLog = log.replace(/\[USER:([^\]]+)\]/, (match, p1) => 
-                            p1 !== 'N/A' ? \`[USER:<strong>\${p1}</strong>]\` : match
-                        );
-                        return \`<div class="log-entry p-1 rounded hover:bg-gray-200">\${formattedLog}</div>\`;
-                    }).join('');
-                } else {
-                    logContainer.innerHTML = \`<p class="text-red-500">无法加载日志: \${data.message || '未知错误'}</p>\`;
-                }
-            } catch (error) {
-                document.getElementById('audit-log-content').innerHTML = '<p class="text-red-500">连接错误，无法获取日志。</p>';
-            }
-        }
-        
-        async function controlService(service, action) {
-            showStatus(\`正在执行操作: \${action} \${service}...\`, true);
-            
-            try {
-                const response = await fetch('/api/system/control', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ service, action })
-                });
+        <!-- 用户管理 - 新增用户 -->
+        <div class="bg-white p-6 rounded-xl shadow-md mb-6 mt-6">
+            <h3 class="text-xl font-semibold text-gray-700 mb-4">新增 WSS 用户 (SSH 账户)</h3>
+            <form id="add-user-form" class="grid grid-cols-2 md:grid-cols-6 gap-4 items-end">
+                <input type="text" id="new-username" placeholder="用户名" pattern="[a-z0-9_]{3,16}" title="用户名只能包含小写字母、数字和下划线，长度3-16位" required class="col-span-1 p-2 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500" value="">
+                <input type="password" id="new-password" placeholder="密码" required class="col-span-1 p-2 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500" value="">
+                <input type="number" id="expiration-days" value="365" min="1" placeholder="有效期 (天)" required class="col-span-1 p-2 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500">
+                <input type="number" id="quota-gb" value="0" min="0" placeholder="流量配额 (GB, 0=不限制)" required class="col-span-1 p-2 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500">
+                <input type="number" id="rate-kbps" value="0" min="0" placeholder="最大带宽 (KB/s, 0=不限制)" required class="col-span-1 p-2 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500">
+                <button type="submit" class="col-span-2 md:col-span-1 bg-green-500 text-white font-bold py-2 rounded-lg hover:bg-green-600 transition">创建用户</button>
+            </form>
+        </div>
 
-                const result = await response.json();
+        <!-- 用户管理 - 列表 -->
+        <div class="bg-white p-6 rounded-xl shadow-md mb-6">
+            <h3 class="text-xl font-semibold text-gray-700 mb-4">用户列表</h3>
+            <div class="overflow-x-auto">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">用户名</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">状态</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">到期日期</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">用量/配额 (GB)</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">带宽 (KB/s)</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="user-list-tbody" class="bg-white divide-y divide-gray-200">
+                        {% for user in users %}
+                        <tr id="row-{{ user.username }}" class="hover:bg-gray-50">
+                            <td class="px-3 py-3 whitespace-nowrap text-sm text-gray-900">{{ user.username }}</td>
+                            <td class="px-3 py-3 whitespace-nowrap text-sm font-bold"><span class="{{ user.status }}">{{ user.status.upper() }}</span></td>
+                            <td class="px-3 py-3 whitespace-nowrap text-sm text-gray-500">{{ user.expiration_date }}</td>
+                            <td class="px-3 py-3 whitespace-nowrap text-sm text-gray-500">{{ user.usage_gb }} / {{ user.quota_gb }} GB</td>
+                            <td class="px-3 py-3 whitespace-nowrap text-sm text-gray-500">{{ user.rate_limit_kbps }} KB/s</td>
+                            <td class="px-3 py-3 whitespace-nowrap text-sm font-medium space-x-1">
+                                <button class="bg-blue-500 hover:bg-blue-600 text-white py-1 px-2 rounded-lg text-xs transition" onclick="openQuotaModal('{{ user.username }}', {{ user.quota_gb }}, '{{ user.rate_limit_kbps }}')">设置</button>
+                                <button class="bg-yellow-500 hover:bg-yellow-600 text-white py-1 px-2 rounded-lg text-xs transition" onclick="openResetModal('{{ user.username }}')">重置用量</button>
+                                <button class="bg-red-500 hover:bg-red-600 text-white py-1 px-2 rounded-lg text-xs transition" onclick="openDeleteModal('{{ user.username }}')">删除</button>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                        </tbody>
+                        </table>
+                    </div>
+                </div>
+        </div>
+    </div>
 
-                if (response.ok && result.success) {
-                    showStatus(result.message, true);
-                    setTimeout(() => { fetchSystemStatus(); }, 5000);
-                } else {
-                    showStatus(\`服务操作失败: \${result.message}\`, false);
-                }
-            } catch (error) {
-                showStatus('请求失败，无法控制服务。', false);
-            }
-        }
+    <!-- Modal for Delete Confirmation -->
+    <div id="deleteModal" class="modal">
+        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-md">
+            <h3 class="text-xl font-semibold text-gray-800 mb-4">确认删除用户</h3>
+            <p class="text-gray-600">您确定要永久删除用户 <strong id="delete-username-placeholder" class="text-red-500"></strong> 吗？此操作不可逆，将删除系统账户和所有配置。</p>
+            <div class="mt-6 text-right">
+                <button class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-bold py-2 px-4 rounded-lg mr-2" onclick="closeModal('deleteModal')">取消</button>
+                <button class="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-lg" id="confirm-delete-btn">确认删除</button>
+            </div>
+        </div>
+    </div>
 
-        window.onload = function() {
-            fetchSystemStatus();
-            fetchAuditLogs();
-            setInterval(fetchSystemStatus, 15000);
-            setInterval(fetchAuditLogs, 30000);
-        };
+    <!-- Modal for Service Restart -->
+    <div id="restartModal" class="modal">
+        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-md">
+            <h3 class="text-xl font-semibold text-gray-800 mb-4">确认重启服务</h3>
+            <p class="text-gray-600">您确定要重启 <strong id="restart-service-placeholder" class="text-blue-500"></strong> 吗？这可能会短暂中断隧道服务。</p>
+            <div class="mt-6 text-right">
+                <button class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-bold py-2 px-4 rounded-lg mr-2" onclick="closeModal('restartModal')">取消</button>
+                <button class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg" id="confirm-restart-btn">确认重启</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Modal for Reset Usage -->
+    <div id="resetModal" class="modal">
+        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-md">
+            <h3 class="text-xl font-semibold text-gray-800 mb-4">确认重置用量</h3>
+            <p class="text-gray-600">您确定要重置用户 <strong id="reset-username-placeholder" class="text-blue-500"></strong> 的流量用量吗？账户将同时解除配额锁定状态（如果已锁定）。</p>
+            <div class="mt-6 text-right">
+                <button class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-bold py-2 px-4 rounded-lg mr-2" onclick="closeModal('resetModal')">取消</button>
+                <button class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg" id="confirm-reset-btn">确认重置</button>
+            </div>
+        </div>
+    </div>
 
-        // --- Settings Modal Logic ---
-        
-        function openSettingsModal(username, expiry, maxConn) {
-            document.getElementById('modal-username-title-settings').textContent = username;
-            document.getElementById('modal-username-settings').value = username;
-            
-            document.getElementById('modal-expiry').value = expiry || '';
-            document.getElementById('modal-max-conn').value = parseInt(maxConn) || {{ MAX_CONN_DEFAULT }};
-            document.getElementById('modal-new-password').value = '';
-            
-            document.getElementById('settings-modal').classList.remove('hidden');
-        }
+    <!-- Modal for Set Quota/Rate Limit -->
+    <div id="quotaModal" class="modal">
+        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-md">
+            <h3 class="text-xl font-semibold text-gray-800 mb-4">设置 <strong id="quota-username-placeholder" class="text-blue-500"></strong> 的配额与带宽</h3>
+            <form id="set-quota-form">
+                <label for="modal-quota-gb" class="block text-sm font-medium text-gray-700 mb-1">流量配额 (GB, 0=不限制)</label>
+                <input type="number" id="modal-quota-gb" class="w-full p-2 border border-gray-300 rounded-lg mb-4" min="0" required>
+                <label for="modal-rate-kbps" class="block text-sm font-medium text-gray-700 mb-1">最大带宽 (KB/s, 0=不限制)</label>
+                <input type="number" id="modal-rate-kbps" class="w-full p-2 border border-gray-300 rounded-lg mb-4" min="0" required>
+                <div class="mt-6 text-right">
+                    <button type="button" class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-bold py-2 px-4 rounded-lg mr-2" onclick="closeModal('quotaModal')">取消</button>
+                    <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg">保存设置</button>
+                </div>
+            </form>
+        </div>
+    </div>
 
-        function closeSettingsModal() {
-            document.getElementById('settings-modal').classList.add('hidden');
-        }
+    <script>
+        // --- Utility Functions ---
 
-        async function saveSettings() {
-            const username = document.getElementById('modal-username-settings').value;
-            const expiry_date = document.getElementById('modal-expiry').value;
-            const max_connections = parseInt(document.getElementById('modal-max-conn').value);
-            const new_ssh_password = document.getElementById('modal-new-password').value;
+        function showStatus(message, isSuccess) {
+            const statusDiv = document.getElementById('status-message');
+            statusDiv.textContent = message;
+            statusDiv.className = isSuccess ? 'bg-green-100 text-green-800 border border-green-400 p-3 rounded-lg font-bold' : 'bg-red-100 text-red-800 border border-red-400 p-3 rounded-lg font-bold';
+            statusDiv.style.display = 'block';
+            setTimeout(() => { statusDiv.style.display = 'none'; }, 5000);
+        }
+        
+        // --- Modal Logic ---
 
-            if (max_connections < 0) {
-                   showStatus('最大并发连接数不能为负数。', false);
-                   return;
-            }
+        function openModal(id) {
+            document.getElementById(id).style.display = 'flex';
+        }
 
-            try {
-                const response = await fetch('/api/users/settings', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username, expiry_date, max_connections, new_ssh_password })
-                });
+        function closeModal(id) {
+            document.getElementById(id).style.display = 'none';
+        }
+        
+        // --- Real-time Monitoring Functions ---
 
-                const result = await response.json();
+        async function refreshMonitorData() {
+            try {
+                const response = await fetch('/api/monitor_data');
+                const data = await response.json();
+                
+                if (response.ok) {
+                    renderSystemHealth(data.system_health, data.services);
+                    renderServiceAndPortStatus(data.services, data.ports);
+                } else {
+                    console.error('获取状态失败:', data.message || '未知错误');
+                }
+            } catch (error) {
+                console.error("Monitor data fetch error:", error);
+            }
+        }
+        
+        function renderSystemHealth(health, services) {
+            document.getElementById('cpu-usage').textContent = health.cpu_usage !== "N/A" ? \`\${health.cpu_usage}%\` : '--';
+            
+            let memText = health.mem_usage !== "N/A" ? \`\${health.mem_usage}% (\${health.mem_used_mb}/\${health.mem_total_mb}MB)\` : '--';
+            document.getElementById('mem-usage').textContent = memText;
+            
+            document.getElementById('disk-usage').textContent = health.disk_usage !== "N/A" ? \`\${health.disk_usage}%\` : '--';
 
-                if (response.ok && result.success) {
-                    showStatus(result.message, true);
-                    closeSettingsModal();
-                    location.reload();
-                } else {
-                    showStatus('保存设置失败: ' + result.message, false);
-                }
-            } catch (error) {
-                showStatus('请求失败，请检查面板运行状态。', false);
-            }
-        }
-        
-        // --- Root Password Modal Logic ---
-        
-        function openRootPasswordModal() {
-            document.getElementById('current-password-root').value = '';
-            document.getElementById('new-password-root').value = '';
-            document.getElementById('confirm-password-root').value = '';
-            document.getElementById('root-password-modal').classList.remove('hidden');
-        }
-        
-        function closeRootPasswordModal() {
-            document.getElementById('root-password-modal').classList.add('hidden');
-        }
-        
-        async function saveRootPassword() {
-            const currentPass = document.getElementById('current-password-root').value;
-            const newPass = document.getElementById('new-password-root').value;
-            const confirmPass = document.getElementById('confirm-password-root').value;
-            
-            if (newPass !== confirmPass) {
-                showStatus('两次输入的新密码不一致。', false);
-                return;
-            }
-            if (newPass.length < 6) {
-                showStatus('新密码长度至少需要 6 位。', false);
-                return;
-            }
-            
-            try {
-                const response = await fetch('/api/root/change_password', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ current_password: currentPass, new_password: newPass })
-                });
+            // Update core service status indicators
+            const serviceMapping = {
+                'WSS Proxy': 'wss', 'Stunnel4': 'stunnel4', 'UDPGW': 'udpgw', 'Web Panel': 'wss_panel'
+            };
+            
+            services.forEach(service => {
+                const id = serviceMapping[service.name];
+                if (!id) return;
+                
+                const indicator = document.getElementById(\`\${id}-status-indicator\`);
+                const label = document.getElementById(\`\${id}-status-label\`);
+                
+                if (indicator && label) {
+                    // Update dot color based on service.color (bg-*)
+                    indicator.className = \`status-dot \${service.color}\`;
+                    label.textContent = service.label;
+                }
+            });
+        }
+        
+        function renderServiceAndPortStatus(services, ports) {
+            const tableBody = document.getElementById('service-port-tbody');
+            tableBody.innerHTML = '';
+            
+            const servicePortData = [
+                { id: 'wss_http', name: 'WSS Proxy (HTTP)', port: '{{ wss_http_port }}', protocol: 'TCP', service: 'wss' },
+                { id: 'wss_tls', name: 'WSS Proxy (TLS)', port: '{{ wss_tls_port }}', protocol: 'TCP', service: 'wss' },
+                { id: 'stunnel4', name: 'Stunnel4 (TLS)', port: '{{ stunnel_port }}', protocol: 'TCP', service: 'stunnel4' },
+                { id: 'udpgw', name: 'UDPGW (UDP)', port: '{{ udpgw_port }}', protocol: 'UDP', service: 'udpgw' },
+                { id: 'wss_panel', name: 'Web Panel (Flask)', port: '{{ panel_port }}', protocol: 'TCP', service: 'wss_panel' },
+                { id: 'ssh_internal', name: 'SSH (Internal Forward)', port: '{{ internal_forward_port }}', protocol: 'TCP', service: null },
+            ];
 
-                const result = await response.json();
+            servicePortData.forEach(item => {
+                const portInfo = ports.find(p => p.port == item.port);
+                const status = portInfo ? portInfo.status : 'N/A';
+                const color = portInfo ? portInfo.color : 'text-gray-500'; // Tailwind text color class
+                
+                const row = document.createElement('tr');
+                row.className = 'hover:bg-gray-50';
+                row.innerHTML = \`
+                    <td class="px-3 py-1 text-sm text-gray-900">\${item.name}</td>
+                    <td class="px-3 py-1 text-sm text-gray-500">\${item.port} (\${item.protocol})</td>
+                    <td class="px-3 py-1 text-sm font-bold \${color}">\${status}</td>
+                    <td class="px-3 py-1 text-sm font-medium">
+                        \${item.service ? \`<button class="bg-blue-500 hover:bg-blue-600 text-white py-1 px-3 rounded-lg text-xs transition" onclick="openRestartModal('\${item.service}', '\${item.name}')">重启</button>\` : 'N/A'}
+                    </td>
+                \`;
+                tableBody.appendChild(row);
+            });
+        }
 
-                if (response.ok && result.success) {
-                    showStatus(result.message, true);
-                    closeRootPasswordModal();
-                    setTimeout(() => { logout(); }, 1500);
-                } else {
-                    showStatus('修改密码失败: ' + result.message, false);
-                }
-            } catch (error) {
-                showStatus('请求失败，请检查面板运行状态。', false);
-            }
-        }
+        async function fetchLogs() {
+            try {
+                const response = await fetch('/api/logs');
+                const data = await response.json();
+                
+                if (response.ok) {
+                    const logContent = document.getElementById('log-pre-content');
+                    logContent.textContent = data.logs.trim();
+                    // Scroll to bottom to view newest logs first (due to flex-direction: column-reverse in CSS)
+                    logContent.scrollTop = 0; 
+                } else {
+                    console.error('获取日志失败:', data.message || '未知错误');
+                }
+            } catch (error) {
+                console.error("Log fetch error:", error);
+            }
+        }
 
-        // --- Existing User/IP Management Functions ---
+        // --- User Actions ---
 
-        async function openActiveIPModal(username) {
-            document.getElementById('active-ip-modal-title').textContent = username;
-            const listDiv = document.getElementById('active-ip-list');
-            listDiv.innerHTML = '<p class="text-gray-500">正在加载活跃 IP...</p>';
-            document.getElementById('active-ip-modal').classList.remove('hidden');
+        document.getElementById('add-user-form').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            const username = document.getElementById('new-username').value.trim();
+            const password = document.getElementById('new-password').value;
+            const expirationDays = document.getElementById('expiration-days').value;
+            const quotaGb = document.getElementById('quota-gb').value;
+            const rateKbps = document.getElementById('rate-kbps').value;
 
-            try {
-                const response = await fetch(\`/api/ips/active?username=\${username}\`);
-                const result = await response.json();
+            if (!username || !password) {
+                showStatus('用户名和密码不能为空。', false);
+                return;
+            }
 
-                if (response.ok && result.success) {
-                    const activeIps = result.active_ips;
-                    if (activeIps.length === 0) {
-                        listDiv.innerHTML = '<p class="text-green-600 font-semibold">当前没有活跃的连接和封禁记录。</p>';
-                        return;
-                    }
+            try {
+                const response = await fetch('/api/users/add', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ 
+                        username, 
+                        password,
+                        expiration_days: expirationDays, // New Field
+                        quota_gb: quotaGb, // New Field
+                        rate_kbps: rateKbps // New Field
+                    })
+                });
 
-                    listDiv.innerHTML = activeIps.map(ipInfo => {
-                        const isBanned = ipInfo.is_banned;
-                        const actionText = isBanned ? '解除封禁' : '封禁';
-                        const actionClass = isBanned ? 'bg-green-500 hover:bg-green-600' : 'bg-red-500 hover:bg-red-600';
-                        // 根据 count 判断是否实时活跃，is_banned 优先
-                        const statusText = isBanned ? '已封禁' : (ipInfo.count > 0 ? '活跃' : '已记录 (无连接)');
-                        const statusClass = isBanned ? 'bg-red-100 text-red-800' : (ipInfo.count > 0 ? 'bg-green-100 text-green-800' : 'bg-gray-200 text-gray-800');
-                        
-                        const lastSeen = ipInfo.count > 0 ? 'LIVE' : 'N/A'; // 仅显示 LIVE 或 N/A
+                const result = await response.json();
+                
+                if (response.ok && result.success) {
+                    showStatus(result.message, true);
+                    location.reload(); 
+                } else {
+                    showStatus('创建失败: ' + result.message, false);
+                }
+            } catch (error) {
+                showStatus('请求失败，请检查面板运行状态。', false);
+            }
+        });
 
-                        return \`
-                            <div class="flex flex-col sm:flex-row items-start sm:items-center justify-between p-3 bg-gray-50 rounded-lg shadow-sm border border-gray-200">
-                                <div class="font-mono text-sm text-gray-800 mb-2 sm:mb-0">
-                                    <strong>\${ipInfo.ip}</strong> 
-                                    <span class="ml-2 px-2 text-xs leading-5 font-semibold rounded-full \${statusClass}">\${statusText}</span>
-                                    <span class="text-xs text-gray-500 block sm:inline"> | 连接数: \${ipInfo.count} | 状态: \${lastSeen}</span>
-                                </div>
-                                <button onclick="toggleIPBan('\${username}', '\${ipInfo.ip}', \${isBanned})"
-                                        class="text-xs text-white px-3 py-1 rounded-full font-semibold btn-action \${actionClass}">
-                                    \${actionText}
-                                </button>
-                            </div>
-                        \`;
-                    }).join('');
+        // --- Delete Modal Logic ---
+        function openDeleteModal(username) {
+            document.getElementById('delete-username-placeholder').textContent = username;
+            const confirmBtn = document.getElementById('confirm-delete-btn');
+            confirmBtn.onclick = () => deleteUser(username);
+            openModal('deleteModal');
+        }
 
-                } else {
-                    listDiv.innerHTML = \`<p class="text-red-500">获取 IP 失败: \${result.message || '未知错误'}</p>\`;
-                }
+        async function deleteUser(username) {
+            closeModal('deleteModal');
+            showStatus(\`正在删除用户 \${username}...\`, true);
+            
+            try {
+                const response = await fetch('/api/users/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username })
+                });
 
-            } catch (error) {
-                document.getElementById('active-ip-modal').classList.add('hidden');
-                showStatus('请求失败，请检查面板运行状态。', false);
-            }
-        }
-        
-        function closeActiveIPModal() {
-            document.getElementById('active-ip-modal').classList.add('hidden');
-        }
+                const result = await response.json();
 
-        async function toggleIPBan(username, ip, isBanned) {
-            const action = isBanned ? 'unblock' : 'block';
-            const actionText = isBanned ? '解除封禁' : '封禁';
+                if (response.ok && result.success) {
+                    showStatus(result.message, true);
+                    location.reload();
+                } else {
+                    showStatus('删除失败: ' + result.message, false);
+                }
+            } catch (error) {
+                showStatus('请求失败，请检查面板运行状态。', false);
+            }
+        }
 
-            try {
-                const response = await fetch(\`/api/ips/\${action}\`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username, ip })
-                });
+        // --- Quota/Rate Limit Modal Logic ---
+        function openQuotaModal(username, quota, rate) {
+            document.getElementById('quota-username-placeholder').textContent = username;
+            document.getElementById('modal-quota-gb').value = quota;
+            document.getElementById('modal-rate-kbps').value = rate;
+            openModal('quotaModal');
+            
+            const form = document.getElementById('set-quota-form');
+            // Remove old listener before adding new one
+            form.onsubmit = (e) => setQuotaAndRate(e, username); 
+        }
 
-                const result = await response.json();
+        async function setQuotaAndRate(e, username) {
+            e.preventDefault();
+            closeModal('quotaModal');
+            
+            const quotaGb = document.getElementById('modal-quota-gb').value;
+            const rateKbps = document.getElementById('modal-rate-kbps').value;
 
-                if (response.ok && result.success) {
-                    showStatus(result.message, true);
-                    openActiveIPModal(username);
-                } else {
-                    showStatus(\`\${actionText}失败: \` + result.message, false);
-                }
-            } catch (error) {
-                showStatus('请求失败，请检查面板运行状态。', false);
-            }
-        }
-        
-        function openConfirmationModal(username, action, type, typeText) {
-            let message = '';
-            let confirmButtonText = '确认';
+            showStatus(\`正在为 \${username} 设置配额和带宽...\`, true);
+            
+            try {
+                const response = await fetch('/api/users/set_rate_limit', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ 
+                        username, 
+                        quota_gb: quotaGb, 
+                        rate_kbps: rateKbps 
+                    })
+                });
 
-            if (type === 'toggleStatus') {
-                const statusText = action === 'active' ? '启用' : '暂停';
-                message = \`确定要 \${statusText} 用户组 \${username} 吗? (\${statusText} 操作将立即终止所有活跃连接)\`;
-                confirmButtonText = statusText;
-            } else if (type === 'deleteUser') {
-                message = \`确定要永久删除用户组 \${username} 吗? (此操作将终止所有连接并删除系统账户!)\`;
-                confirmButtonText = typeText;
-            }
+                const result = await response.json();
 
-            document.getElementById('confirm-title').textContent = \`\${typeText} - \${username}\`;
-            document.getElementById('confirm-message').textContent = message;
-            document.getElementById('confirm-username').value = username;
-            document.getElementById('confirm-action').value = action || '';
-            document.getElementById('confirm-type').value = type;
-            document.getElementById('confirm-button').textContent = confirmButtonText;
+                if (response.ok && result.success) {
+                    showStatus(result.message, true);
+                    location.reload();
+                } else {
+                    showStatus('设置失败: ' + result.message, false);
+                }
+            } catch (error) {
+                showStatus('请求失败，请检查面板运行状态。', false);
+            }
+        }
 
-            document.getElementById('confirmation-modal').classList.remove('hidden');
-        }
+        // --- Reset Usage Modal Logic ---
+        function openResetModal(username) {
+            document.getElementById('reset-username-placeholder').textContent = username;
+            const confirmBtn = document.getElementById('confirm-reset-btn');
+            confirmBtn.onclick = () => resetUsage(username);
+            openModal('resetModal');
+        }
 
-        function closeConfirmationModal() {
-            document.getElementById('confirmation-modal').classList.add('hidden');
-        }
+        async function resetUsage(username) {
+            closeModal('resetModal');
+            showStatus(\`正在重置 \${username} 的用量...\`, true);
+            
+            try {
+                const response = await fetch('/api/users/reset_usage', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username })
+                });
 
-        function executeConfirmation() {
-            const username = document.getElementById('confirm-username').value;
-            const action = document.getElementById('confirm-action').value;
-            const type = document.getElementById('confirm-type').value;
+                const result = await response.json();
 
-            closeConfirmationModal(); 
+                if (response.ok && result.success) {
+                    showStatus(result.message, true);
+                    location.reload();
+                } else {
+                    showStatus('重置失败: ' + result.message, false);
+                }
+            } catch (error) {
+                showStatus('请求失败，请检查面板运行状态。', false);
+            }
+        }
 
-            if (type === 'toggleStatus') {
-                toggleUserStatus(username, action);
-            } else if (type === 'deleteUser') {
-                deleteUser(username);
-            }
-        }
-        
-        document.getElementById('add-user-form').addEventListener('submit', async function(e) {
-            e.preventDefault();
-            const username = document.getElementById('new-username').value.trim();
-            const password = document.getElementById('new-password').value;
+        // --- Restart Modal Logic ---
+        function openRestartModal(serviceId, serviceName) {
+            document.getElementById('restart-service-placeholder').textContent = serviceName;
+            const confirmBtn = document.getElementById('confirm-restart-btn');
+            confirmBtn.onclick = () => restartService(serviceId);
+            openModal('restartModal');
+        }
 
-            if (!/^[a-z0-9_]{3,16}$/.test(username)) {
-                showStatus('用户名格式不正确 (3-16位小写字母/数字/下划线)', false);
-                return;
-            }
+        async function restartService(serviceId) {
+            closeModal('restartModal');
+            showStatus(\`正在重启 \${serviceId}...\`, true);
+            
+            try {
+                const response = await fetch('/api/restart', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ service: serviceId })
+                });
 
-            try {
-                const response = await fetch('/api/users/add', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username, password })
-                });
-
-                const result = await response.json();
-                
-                if (response.ok && result.success) {
-                    showStatus(result.message, true);
-                    document.getElementById('new-username').value = '';
-                    document.getElementById('new-password').value = '';
-                    location.reload();
-                } else {
-                    showStatus('创建失败: ' + result.message, false);
-                }
-            } catch (error) {
-                showStatus('请求失败，请检查面板运行状态。', false);
-            }
-        });
-
-        async function toggleUserStatus(username, action) {
-            const actionText = action === 'active' ? '启用' : '暂停';
-            
-            try {
-                const response = await fetch('/api/users/status', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username, action })
-                });
-
-                const result = await response.json();
-
-                if (response.ok && result.success) {
-                    showStatus(result.message, true);
-                    location.reload();
-                } else {
-                    showStatus(\`\${actionText}失败: \` + result.message, false);
-                }
-            } catch (error) {
-                showStatus('请求失败，请检查面板运行状态。', false);
-            }
-        }
-
-        async function deleteUser(username) {
-            try {
-                const response = await fetch('/api/users/delete', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username })
-                });
-
-                const result = await response.json();
-
-                if (response.ok && result.success) {
-                    showStatus(result.message, true);
-                    location.reload();
-                } else {
-                    showStatus('删除失败: ' + result.message, false);
-                }
-            } catch (error) {
-                showStatus('请求失败，请检查面板运行状态。', false);
-            }
-        }
-        
-    </script>
+                const result = await response.json();
+                
+                if (response.ok && result.success) {
+                    showStatus(result.message, true);
+                    setTimeout(refreshMonitorData, 3000); 
+                } else {
+                    showStatus('重启失败: ' + (result.message || '未知错误'), false);
+                    setTimeout(refreshMonitorData, 3000);
+                }
+            } catch (error) {
+                showStatus('请求重启 API 失败，请检查面板运行状态。', false);
+            }
+        }
+        
+        function logout() {
+            window.location.href = '/logout';
+        }
+        
+        // --- Polling Setup ---
+        // Refresh status every 5 seconds (CPU/Memory/Service Status)
+        setInterval(refreshMonitorData, 5000);
+        // Refresh logs every 10 seconds
+        setInterval(fetchLogs, 10000);
+        
+        // Initial load
+        window.onload = () => {
+            refreshMonitorData();
+            fetchLogs();
+        };
+        
+    </script>
 </body>
 </html>
 """
 
+# 修复后的渲染函数
 def render_dashboard(users):
     """手动渲染 Jinja2 模板字符串."""
     template_env = jinja2.Environment(loader=jinja2.BaseLoader)
     template = template_env.from_string(_DASHBOARD_HTML)
     
-    host_ip = request.host.split(':')[0]
-    if host_ip in ('127.0.0.1', 'localhost', '0.0.0.0', '::1'):
-        host_ip = SERVER_IP
-        
     context = {
         'users': users,
         'panel_port': PANEL_PORT,
@@ -1545,9 +1319,7 @@ def render_dashboard(users):
         'wss_tls_port': WSS_TLS_PORT,
         'stunnel_port': STUNNEL_PORT,
         'udpgw_port': UDPGW_PORT,
-        'ssh_target_port': SSH_TARGET_PORT,
-        'host_ip': host_ip,
-        'MAX_CONN_DEFAULT': MAX_CONN_DEFAULT
+        'internal_forward_port': INTERNAL_FORWARD_PORT,
     }
     return template.render(**context)
 
@@ -1558,9 +1330,9 @@ def render_dashboard(users):
 @login_required
 def dashboard():
     users = load_users()
-    users = refresh_all_user_status(users)
     html_content = render_dashboard(users=users)
     return make_response(html_content)
+
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -1568,24 +1340,20 @@ def login():
     if request.method == 'POST':
         username = request.form.get('username')
         password_raw = request.form.get('password')
-        root_hash = load_root_hash()
         
-        if not root_hash: 
-            error = '面板配置错误，Root Hash丢失。'
-        elif username == ROOT_USERNAME and password_raw:
+        # 验证 ROOT 账户
+        if username == ROOT_USERNAME and password_raw:
             password_hash = hashlib.sha256(password_raw.encode('utf-8')).hexdigest()
-            if password_hash == root_hash:
+            if password_hash == ROOT_PASSWORD_HASH:
                 session['logged_in'] = True
                 session['username'] = ROOT_USERNAME
-                log_action("LOGIN_SUCCESS", ROOT_USERNAME, "Web UI Login")
-                return redirect(url_for('dashboard_decorated'))
+                return redirect(url_for('dashboard'))
             else:
                 error = '用户名或密码错误。'
-                log_action("LOGIN_FAILED", username, "Wrong credentials")
         else:
             error = '用户名或密码错误。'
-            log_action("LOGIN_FAILED", username, "Invalid username attempt")
 
+    # Tailwind CSS Login Page
     html = f"""
 <!DOCTYPE html>
 <html lang="zh-CN">
@@ -1594,30 +1362,23 @@ def login():
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>WSS Panel - 登录</title>
     <script src="https://cdn.tailwindcss.com"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
-    <style>
-        body {{ font-family: 'Inter', sans-serif; background-color: #f4f7f6; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0; }}
-        .container {{ background: white; padding: 30px; border-radius: 12px; box-shadow: 0 10px 25px rgba(0, 0, 0, 0.1); width: 100%; max-width: 400px; }}
-        h1 {{ text-align: center; color: #1f2937; margin-bottom: 30px; font-weight: 700; }}
-        input[type=text], input[type=password] {{ width: 100%; padding: 12px; margin: 10px 0; display: inline-block; border: 1px solid #d1d5db; border-radius: 8px; box-sizing: border-box; transition: all 0.3s; }}
-        input[type=text]:focus, input[type=password]:focus {{ border-color: #4f46e5; outline: 2px solid #a5b4fc; }}
-        button {{ background-color: #4f46e5; color: white; padding: 14px 20px; margin: 15px 0 5px 0; border: none; border-radius: 8px; cursor: pointer; width: 100%; font-size: 16px; font-weight: 600; transition: background-color 0.3s; }}
-        button:hover {{ background-color: #4338ca; }}
-        .error {{ color: #ef4444; background-color: #fee2e2; padding: 10px; border-radius: 6px; text-align: center; margin-bottom: 15px; font-weight: 500; border: 1px solid #fca5a5; }}
-    </style>
 </head>
-<body>
-    <div class="container">
-        <h1 class="text-2xl">WSS 管理面板 V6.2</h1>
-        {f'<div class="error">{error}</div>' if error else ''}
-        <form method="POST">
-            <label for="username" class="block text-sm font-medium text-gray-700">用户名</label>
-            <input type="text" placeholder="输入 {ROOT_USERNAME}" name="username" value="{ROOT_USERNAME}" required>
+<body class="bg-gray-100 flex justify-center items-center h-screen m-0">
+    <div class="bg-white p-8 rounded-xl shadow-2xl w-full max-w-md">
+        <h1 class="text-3xl font-bold text-center text-gray-800 mb-6">WSS 管理面板</h1>
+        {f'<div class="bg-red-100 text-red-700 p-3 rounded-lg text-center mb-4 font-medium">{error}</div>' if error else ''}
+        <form method="POST" class="space-y-4">
+            <div>
+                <label for="username" class="block text-sm font-medium text-gray-700 mb-1">用户名</label>
+                <input type="text" placeholder="输入 {ROOT_USERNAME}" name="username" value="{ROOT_USERNAME}" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-green-500 focus:border-green-500 transition">
+            </div>
 
-            <label for="password" class="block text-sm font-medium text-gray-700 mt-4">密码</label>
-            <input type="password" placeholder="输入密码" name="password" required>
+            <div>
+                <label for="password" class="block text-sm font-medium text-gray-700 mb-1">密码</label>
+                <input type="password" placeholder="输入密码" name="password" required class="w-full p-3 border border-gray-300 rounded-lg focus:ring-green-500 focus:border-green-500 transition">
+            </div>
 
-            <button type="submit">登录</button>
+            <button type="submit" class="w-full bg-green-600 text-white font-bold py-3 rounded-lg text-lg hover:bg-green-700 transition">登录</button>
         </form>
     </div>
 </body>
@@ -1627,513 +1388,388 @@ def login():
 
 @app.route('/logout')
 def logout():
-    log_action("LOGOUT_SUCCESS", session.get('username', 'root'), "Web UI Logout")
     session.pop('logged_in', None)
     return redirect(url_for('login'))
-
-# --- Root 密码修改 API ---
-@app.route('/api/root/change_password', methods=['POST'])
-@login_required
-def change_root_password_api():
-    data = request.json
-    current_password = data.get('current_password')
-    new_password = data.get('new_password')
-    
-    if not current_password or not new_password:
-        return jsonify({"success": False, "message": "缺少当前密码或新密码"}), 400
-        
-    root_hash = load_root_hash()
-    current_hash = hashlib.sha256(current_password.encode('utf-8')).hexdigest()
-    
-    if current_hash != root_hash:
-        log_action("ROOT_PASS_FAIL", session.get('username', 'root'), "Incorrect current password for root change")
-        return jsonify({"success": False, "message": "当前密码不正确"}), 403
-        
-    new_hash = hashlib.sha256(new_password.encode('utf-8')).hexdigest()
-    if not save_root_hash(new_hash):
-        log_action("ROOT_PASS_FAIL", session.get('username', 'root'), "Failed to save new root hash to file")
-        return jsonify({"success": False, "message": "保存新密码失败，请检查文件权限"}), 500
-        
-    log_action("ROOT_PASS_SUCCESS", session.get('username', 'root'), "Root panel password successfully changed")
-    return jsonify({"success": True, "message": "Root 面板密码修改成功"})
-
 
 @app.route('/api/users/add', methods=['POST'])
 @login_required
 def add_user_api():
+    """添加用户 (API)"""
     data = request.json
     username = data.get('username')
     password_raw = data.get('password')
+    # New fields
+    expiration_days = data.get('expiration_days')
+    quota_gb = data.get('quota_gb')
+    rate_kbps = data.get('rate_kbps')
     
-    if not username or not password_raw: return jsonify({"success": False, "message": "缺少用户名或密码"}), 400
-    if not re.match(r'^[a-z0-9_]{3,16}$', username): return jsonify({"success": False, "message": "用户名格式不正确 (3-16位小写字母/数字/下划线)"}), 400
+    if not username or not password_raw or expiration_days is None or quota_gb is None or rate_kbps is None:
+        return jsonify({"success": False, "message": "缺少用户名、密码或配额/有效期/带宽设置"}), 400
 
     users = load_users()
-    if get_user(username)[0]: return jsonify({"success": False, "message": f"用户组 {username} 已存在于面板"}), 409
+    if get_user(username):
+        return jsonify({"success": False, "message": f"用户 {username} 已存在于面板"}), 409
 
-    user_exists_on_system = False
-    
-    success, output = safe_run_command(['/usr/sbin/useradd', '-m', '-s', '/bin/false', username])
+    # 1. 创建系统用户 (使用 -s /bin/false 禁用远程 shell 登录，增加安全性)
+    success, output = safe_run_command(['useradd', '-m', '-s', '/bin/false', username])
     if not success:
-        if "already exists" in output:
-            user_exists_on_system = True
-            success_check, _ = safe_run_command(['/usr/bin/id', username])
-            if not success_check:
-                 log_action("USER_ADD_FAIL", session.get('username', 'root'), f"User {username} exists but ID failed: {output}")
-                 return jsonify({"success": False, "message": f"系统用户 {username} 已存在，但无法验证其身份。"}), 500
-            
-            log_action("USER_ADD_WARN", session.get('username', 'root'), f"System user {username} already exists, attempting to adopt.")
-        else:
-            log_action("USER_ADD_FAIL", session.get('username', 'root'), f"Failed to create system user {username}: {output}")
-            return jsonify({"success": False, "message": f"创建系统用户失败: {output}"}), 500
-    
+        return jsonify({"success": False, "message": f"创建系统用户失败: {output}"}), 500
+
+    # 2. 设置密码
     chpasswd_input = f"{username}:{password_raw}"
-    success, output = safe_run_command(['/usr/sbin/chpasswd'], input_data=chpasswd_input.encode('utf-8'))
+    success, output = safe_run_command(['/usr/sbin/chpasswd'], input=chpasswd_input.encode('utf-8'))
     if not success:
-        if not user_exists_on_system: safe_run_command(['/usr/sbin/userdel', '-r', username])
-        log_action("USER_ADD_FAIL", session.get('username', 'root'), f"Failed to set password for {username}: {output}")
+        safe_run_command(['userdel', '-r', username])
         return jsonify({"success": False, "message": f"设置密码失败: {output}"}), 500
         
+    # 3. 设置有效期 (chage)
+    try:
+        expiry_date = (date.today() + timedelta(days=int(expiration_days))).strftime('%Y-%m-%d')
+        safe_run_command(['chage', '-E', expiry_date, username])
+    except ValueError:
+        safe_run_command(['userdel', '-r', username])
+        return jsonify({"success": False, "message": "有效期天数无效"}), 500
+        
+    # 4. 获取 UID
+    uid = get_user_uid(username)
+    if not uid:
+        safe_run_command(['userdel', '-r', username])
+        return jsonify({"success": False, "message": "无法获取用户UID"}), 500
+        
+    # 5. 记录到 JSON 数据库并应用初始配额/限速
     new_user = {
-        "username": username, "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
-        "status": "active", "expiry_date": "",
-        "banned_ips": [], "max_connections": MAX_CONN_DEFAULT
+        "username": username,
+        "created_at": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        "status": "active",
+        "expiration_date": expiry_date,
+        "quota_gb": int(quota_gb),
+        "usage_bytes": 0,
+        "rate_limit_kbps": str(int(rate_kbps))
     }
     users.append(new_user)
     save_users(users)
-    sync_user_status(new_user)
     
-    status_msg = "创建成功" if not user_exists_on_system else "已成功接管并配置密码"
-    log_action("USER_ADD_SUCCESS", session.get('username', 'root'), f"User {username} {status_msg}")
-    return jsonify({"success": True, "message": f"用户组 {username} {status_msg}"})
+    # 6. 应用带宽限制和配额规则
+    apply_rate_limit(uid, int(rate_kbps))
+    manage_quota_iptables_rule(username, uid, 'add')
+
+
+    return jsonify({"success": True, "message": f"用户 {username} 创建成功，有效期至 {expiry_date}"})
 
 @app.route('/api/users/delete', methods=['POST'])
 @login_required
 def delete_user_api():
+    """删除用户 (API)"""
     data = request.json
     username = data.get('username')
     
-    if not username: return jsonify({"success": False, "message": "缺少用户名"}), 400
+    if not username:
+        return jsonify({"success": False, "message": "缺少用户名"}), 400
 
     users = load_users()
-    user_to_delete, index = get_user(username)
-
-    if not user_to_delete: return jsonify({"success": False, "message": f"用户组 {username} 不存在"}), 404
-
-    kill_user_sessions(username)
+    user_to_delete = get_user(username)
     
-    ip_bans = load_ip_bans()
-    if username in ip_bans:
-        # 清除 IPTABLES 规则
-        for ip in ip_bans[username]: toggle_iptables_ip_ban(ip, 'unblock')
-        ip_bans.pop(username)
-        save_ip_bans(ip_bans)
+    if not user_to_delete:
+        return jsonify({"success": False, "message": f"面板中用户 {username} 不存在"}), 404
 
-    success, output = safe_run_command(['/usr/sbin/userdel', '-r', username])
+    # 1. 删除带宽限制 (确保清理)
+    uid = get_user_uid(username)
+    if uid:
+        apply_rate_limit(uid, 0) # Clears TC rules
+        manage_quota_iptables_rule(username, uid, 'delete') # Clears Quota rules
+
+    # 2. 删除系统用户及其主目录
+    success, output = safe_run_command(['userdel', '-r', username])
     if not success:
-        log_action("USER_DELETE_WARNING", session.get('username', 'root'), f"System user {username} deletion failed (non-fatal): {output}")
+        print(f"Warning: Failed to delete system user {username}: {output}")
 
-    users.pop(index)
+    # 3. 从 JSON 数据库中删除记录
+    users = [user for user in users if user['username'] != username]
     save_users(users)
-    
-    log_action("USER_DELETE_SUCCESS", session.get('username', 'root'), f"Deleted user {username}")
-    return jsonify({"success": True, "message": f"用户组 {username} 已删除，活动会话已终止"})
 
+    return jsonify({"success": True, "message": f"用户 {username} 已删除"})
 
-@app.route('/api/users/settings', methods=['POST'])
+@app.route('/api/users/set_rate_limit', methods=['POST'])
 @login_required
-def update_user_settings_api():
+def set_rate_limit_api():
+    """API to set user bandwidth rate limit and quota."""
     data = request.json
     username = data.get('username')
-    expiry_date = data.get('expiry_date', '')
-    max_connections = data.get('max_connections', MAX_CONN_DEFAULT)
-    new_ssh_password = data.get('new_ssh_password', '')
+    rate_kbps = data.get('rate_kbps')
+    quota_gb = data.get('quota_gb')
 
-    user, index = get_user(username)
-    if not user: return jsonify({"success": False, "message": f"用户组 {username} 不存在"}), 404
-        
+    if not username or rate_kbps is None or quota_gb is None:
+        return jsonify({"success": False, "message": "缺少用户名、速率限制值或配额值"}), 400
+
     users = load_users()
+    user = next((u for u in users if u['username'] == username), None)
     
+    if not user:
+        return jsonify({"success": False, "message": f"用户 {username} 不存在于面板"}), 404
+        
+    uid = user['uid']
+    if not uid:
+        return jsonify({"success": False, "message": f"无法获取用户 {username} 的 UID，无法设置带宽限制。"}), 500
+        
     try:
-        max_connections = int(max_connections)
-        if max_connections < 0: raise ValueError("Max connections cannot be negative")
-        if expiry_date: datetime.strptime(expiry_date, '%Y-%m-%d')
-    except ValueError: return jsonify({"success": False, "message": "日期或连接数格式不正确"}), 400
+        rate = int(rate_kbps)
+        quota = int(quota_gb)
 
-    old_expiry = users[index].get('expiry_date')
-    old_max_conn = users[index].get('max_connections')
-    
-    users[index]['expiry_date'] = expiry_date
-    users[index]['max_connections'] = max_connections
-    
-    password_log = ""
-    if new_ssh_password:
-        chpasswd_input = f"{username}:{new_ssh_password}"
-        success, output = safe_run_command(['/usr/sbin/chpasswd'], input_data=chpasswd_input.encode('utf-8'))
-        if success:
-            password_log = ", SSH password changed"
+        # 1. 应用 TC 限制
+        success, message = apply_rate_limit(uid, rate)
+        if not success:
+            return jsonify({"success": False, "message": f"带宽限制设置失败: {message}"}), 500
+
+        # 2. 应用 Iptables 配额规则
+        if quota > 0:
+            manage_quota_iptables_rule(username, uid, 'add') # Ensure rule is present
         else:
-            log_action("USER_PASS_FAIL", session.get('username', 'root'), f"Failed to set password for {username}: {output}")
-            return jsonify({"success": False, "message": f"设置 SSH 密码失败: {output}"}), 500
-    
-    users[index] = sync_user_status(users[index])
-    
-    save_users(users)
-    log_action("SETTINGS_UPDATE", session.get('username', 'root'), 
-               f"Updated {username}: Expiry {old_expiry}->{expiry_date}, MaxConn {old_max_conn}->{max_connections}{password_log}")
-    return jsonify({"success": True, "message": f"用户组 {username} 设置已更新{password_log}"})
-    
-@app.route('/api/users/status', methods=['POST'])
+            manage_quota_iptables_rule(username, uid, 'delete') # Remove rule if quota is 0
+
+        # 3. 更新面板数据库
+        user['rate_limit_kbps'] = str(rate)
+        user['quota_gb'] = quota
+        
+        # 4. 检查是否需要解锁账户 (如果配额被设为 0 / 无限制)
+        if quota == 0 and user['status'] in ('exceeded', 'expired'):
+            safe_run_command(['usermod', '-U', username])
+            # Re-run status check to update expiry date status
+            user['status'], user['expiration_date'] = get_user_expiration_status(username)
+            
+        save_users(users)
+
+        return jsonify({"success": True, "message": f"用户 {username} 设置更新成功。 配额: {quota} GB, 带宽: {message}"})
+            
+    except ValueError:
+        return jsonify({"success": False, "message": "速率/配额值必须是数字"}), 400
+
+@app.route('/api/users/reset_usage', methods=['POST'])
 @login_required
-def toggle_user_status_api():
+def reset_usage_api():
+    """API to reset a user's traffic usage counter."""
     data = request.json
     username = data.get('username')
-    action = data.get('action')
-
-    user, index = get_user(username)
-    if not user: return jsonify({"success": False, "message": f"用户组 {username} 不存在"}), 404
-        
-    users = load_users()
     
-    if action == 'active':
-        users[index]['status'] = 'active'
-        log_action("USER_TOGGLE", session.get('username', 'root'), f"Set user {username} to ACTIVE")
-    elif action == 'pause':
-        users[index]['status'] = 'paused'
-        log_action("USER_TOGGLE", session.get('username', 'root'), f"Set user {username} to PAUSED (Locked)")
-    else: return jsonify({"success": False, "message": "无效的操作"}), 400
+    if not username:
+        return jsonify({"success": False, "message": "缺少用户名"}), 400
+
+    users = load_users()
+    user = next((u for u in users if u['username'] == username), None)
+    
+    if not user:
+        return jsonify({"success": False, "message": f"用户 {username} 不存在于面板"}), 404
+    
+    # 1. Reset iptables counter
+    reset_iptables_counters(username)
+
+    # 2. Reset usage in database
+    user['usage_bytes'] = 0
+    user['usage_gb'] = 0
+    
+    # 3. Unlock account if currently locked due to quota
+    if user['status'] == 'exceeded':
+        safe_run_command(['usermod', '-U', username])
+        user['status'] = 'active'
         
-    users[index] = sync_user_status(users[index])
     save_users(users)
     
-    return jsonify({"success": True, "message": f"用户组 {username} 状态已更新为 {action}"})
+    return jsonify({"success": True, "message": f"用户 {username} 的流量用量已重置，账户已重新激活。"})
 
-# --- 实时系统状态 & 服务控制 API ---
-@app.route('/api/system/status', methods=['GET'])
-@login_required 
-def get_system_status():
-    """获取服务器 CPU/内存/服务状态."""
-    
-    def get_port_status(port):
-        """检查端口是否处于 LISTEN 状态 (使用 ss 命令)"""
-        try:
-            # 动态查找 ss 命令路径
-            ss_bin = shutil.which('ss') or '/bin/ss'
-            success, output = safe_run_command([ss_bin, '-tuln'], input_data=None)
-            if success and f":{port} " in output:
-                return 'LISTEN'
-            return 'FAIL'
-        except Exception:
-            return 'FAIL'
 
-    try:
-        cpu_percent = psutil.cpu_percent(interval=None)
-        mem = psutil.virtual_memory()
-        disk = psutil.disk_usage('/')
-        
-        services = {
-            'wss': get_service_status('wss'),
-            'wss_panel': get_service_status('wss_panel'),
-            'stunnel4': get_service_status('stunnel4'),
-            'udpgw': get_service_status('udpgw'),
-        }
-        
-        ports = {
-            WSS_HTTP_PORT: get_port_status(WSS_HTTP_PORT),
-            WSS_TLS_PORT: get_port_status(WSS_TLS_PORT),
-            STUNNEL_PORT: get_port_status(STUNNEL_PORT),
-            UDPGW_PORT: get_port_status(UDPGW_PORT),
-            PANEL_PORT: get_port_status(PANEL_PORT),
-        }
-
-        return jsonify({
-            "success": True,
-            "cpu_percent": cpu_percent,
-            "memory_used_gb": round(mem.used / (1024 ** 3), 2),
-            "memory_total_gb": round(mem.total / (1024 ** 3), 2),
-            "disk_used_percent": disk.percent,
-            "services": services,
-            "ports": ports
-        })
-    except Exception as e:
-        return jsonify({"success": False, "message": f"System status check failed: {str(e)}"}), 500
-
-@app.route('/api/system/control', methods=['POST'])
+@app.route('/api/monitor_data', methods=['GET'])
 @login_required
-def control_system_service():
-    """重启/停止核心服务."""
-    data = request.json
-    service = data.get('service')
-    action = data.get('action')
+def get_monitor_data_api():
+    """API to get system health, service, and port statuses."""
+    
+    cpu_usage = get_cpu_usage()
+    mem_info = get_memory_usage()
+    disk_info = get_disk_usage()
+    
+    system_health = {
+        "cpu_usage": cpu_usage,
+        "mem_usage": mem_info["usage"],
+        "mem_total_mb": mem_info["total_mb"],
+        "mem_used_mb": mem_info["mem_used_mb"],
+        "disk_usage": disk_info["usage"]
+    }
+    
+    components = {
+        'wss': 'WSS Proxy', 
+        'stunnel4': 'Stunnel4', 
+        'udpgw': 'UDPGW',
+        'wss_panel': 'Web Panel', 
+    }
+    service_statuses = []
+    for service_id, service_name in components.items():
+        state, label, color = get_service_status_detail(service_id)
+        service_statuses.append({
+            'id': service_id,
+            'name': service_name,
+            'state': state,
+            'label': label,
+            'color': color
+        })
 
-    allowed_services = ['wss', 'wss_panel', 'stunnel4', 'udpgw']
-    if service not in allowed_services or action != 'restart':
-        log_action("SERVICE_CONTROL_FAIL", session.get('username', 'root'), f"Attempted illegal action/service: {action}/{service}")
-        return jsonify({"success": False, "message": "无效的服务或操作"}), 400
+    ports = [
+        {'name': 'WSS (HTTP Payload)', 'port': WSS_HTTP_PORT, 'protocol': 'TCP'},
+        {'name': 'WSS (TLS)', 'port': WSS_TLS_PORT, 'protocol': 'TCP'},
+        {'name': 'Stunnel (TLS Tunnel)', 'port': STUNNEL_PORT, 'protocol': 'TCP'},
+        {'name': 'UDPGW (UDP Forward)', 'port': UDPGW_PORT, 'protocol': 'UDP'},
+        {'name': 'Web Panel (Flask)', 'port': PANEL_PORT, 'protocol': 'TCP'},
+        {'name': 'SSH Internal Forward', 'port': INTERNAL_FORWARD_PORT, 'protocol': 'TCP'} 
+    ]
+    port_statuses = []
+    for p in ports:
+        status, color = get_port_status_detail(p['port'])
+        port_statuses.append({
+            'name': p['name'],
+            'port': p['port'],
+            'protocol': p['protocol'],
+            'status': status,
+            'color': color
+        })
         
-    if service == 'wss_panel':
-        log_action("SERVICE_CONTROL_WARN", session.get('username', 'root'), "Panel restart requested. Connection may drop.")
+    return jsonify({
+        "system_health": system_health,
+        "services": service_statuses,
+        "ports": port_statuses
+    })
 
-    command = ['/bin/systemctl', action, service]
-    success, output = safe_run_command(command)
+@app.route('/api/restart', methods=['POST'])
+@login_required
+def restart_service_api():
+    """API to restart a specific service."""
+    service_name = request.json.get('service')
+    if service_name not in ['wss', 'stunnel4', 'wss_panel', 'udpgw']:
+        return jsonify({"success": False, "message": "无效的服务名称。"}), 400
+        
+    success, output = safe_run_command(['systemctl', 'restart', service_name])
+    time.sleep(1) 
     
     if success:
-        log_action("SERVICE_CONTROL_SUCCESS", session.get('username', 'root'), f"Successfully executed {action} on {service}")
-        return jsonify({"success": True, "message": f"服务 {service} 已成功执行 {action} 操作。请等待 5 秒后刷新状态。"}), 200
+        return jsonify({"success": True, "message": f"服务 {service_name} 重启命令已发送。"})
     else:
-        log_action("SERVICE_CONTROL_FAIL", session.get('username', 'root'), f"Failed to {action} {service}: {output}")
-        return jsonify({"success": False, "message": f"服务 {service} 操作失败: {output}"}), 500
+        state, _, _ = get_service_status_detail(service_name)
+        if state == 'active':
+             return jsonify({"success": True, "message": f"服务 {service_name} 重启流程已启动。"})
+        return jsonify({"success": False, "message": f"重启 {service_name} 失败: {output}"}), 500
+
 
 @app.route('/api/logs', methods=['GET'])
 @login_required
 def get_logs_api():
-    """获取最新的审计日志."""
-    logs = get_recent_logs(20)
-    return jsonify({"success": True, "logs": logs})
-
-@app.route('/api/ips/check', methods=['POST'])
-def check_ip_api():
-    if request.remote_addr != '127.0.0.1' and request.remote_addr != '::1': return jsonify({"success": False, "message": "Access denied"}), 403
-        
-    data = request.json
-    client_ip = data.get('ip')
-    
-    if not client_ip: return jsonify({"success": False, "message": "缺少 IP"}), 400
-
-    ip_bans = load_ip_bans()
-    
-    is_banned = False
-    for banned_ips in ip_bans.values():
-        if client_ip in banned_ips:
-            is_banned = True
-            break
-            
-    return jsonify({"success": True, "is_banned": is_banned})
-
-@app.route('/api/ips/block', methods=['POST'])
-@login_required
-def block_ip_api():
-    data = request.json
-    username = data.get('username')
-    ip = data.get('ip')
-
-    if not username or not ip: return jsonify({"success": False, "message": "缺少用户名或 IP"}), 400
-
-    ip_bans = load_ip_bans()
-    user, index = get_user(username)
-    
-    if not user: return jsonify({"success": False, "message": f"用户组 {username} 不存在"}), 404
-    
-    if username not in ip_bans: ip_bans[username] = []
-        
-    if ip not in ip_bans[username]:
-        ip_bans[username].append(ip)
-        save_ip_bans(ip_bans)
-        
-    success_iptables, iptables_output = toggle_iptables_ip_ban(ip, 'block')
-    
-    # 移除了清理 active_ips 的逻辑
-        
-    if success_iptables:
-        log_action("IP_BLOCK_SUCCESS", session.get('username', 'root'), f"Blocked IP {ip} for user {username}")
-        return jsonify({"success": True, "message": f"IP {ip} 已被封禁 (实时生效)。"})
-    else:
-        log_action("IP_BLOCK_WARNING", session.get('username', 'root'), 
-                   f"Blocked IP {ip} in DB for user {username}, but IPTables failed: {iptables_output}")
-        return jsonify({"success": True, "message": f"IP {ip} 已被封禁 (面板记录已更新)，但实时防火墙操作失败。"})
-
-@app.route('/api/ips/unblock', methods=['POST'])
-@login_required
-def unblock_ip_api():
-    data = request.json
-    username = data.get('username')
-    ip = data.get('ip')
-
-    if not username or not ip: return jsonify({"success": False, "message": "缺少用户名或 IP"}), 400
-
-    ip_bans = load_ip_bans()
-    
-    if username in ip_bans and ip in ip_bans[username]:
-        ip_bans[username].remove(ip)
-        save_ip_bans(ip_bans)
-    
-    success_iptables, iptables_output = toggle_iptables_ip_ban(ip, 'unblock')
-    
-    if success_iptables:
-        log_action("IP_UNBLOCK_SUCCESS", session.get('username', 'root'), f"Unblocked IP {ip} for user {username}")
-        return jsonify({"success": True, "message": f"IP {ip} 已解除封禁 (实时生效)。"})
-    else:
-        log_action("IP_UNBLOCK_WARNING", session.get('username', 'root'), 
-                   f"Unblocked IP {ip} in DB for user {username}, but IPTables failed: {iptables_output}")
-        return jsonify({"success": True, "message": f"IP {ip} 已解除封禁 (面板记录已更新)，但实时防火墙操作失败。"})
-
-@app.route('/api/ips/active', methods=['GET'])
-@login_required
-def get_active_ips_api():
-    username = request.args.get('username')
-    
-    if not username: return jsonify({"success": False, "message": "缺少用户名"}), 400
-
-    # 1. 获取实时连接信息
-    live_connections = get_live_connections_for_user(username, SSH_TARGET_PORT)
-    
-    # 2. 获取面板中的 IP 封禁列表
-    ip_bans = load_ip_bans()
-    banned_ips_for_user = ip_bans.get(username, [])
-    
-    # 3. 合并实时连接 IP 和被封禁 IP 列表
-    all_ips = set(live_connections.keys()) | set(banned_ips_for_user)
-
-    filtered_ips = []
-    
-    for ip in all_ips:
-        data = live_connections.get(ip, {'count': 0, 'last_seen': 0})
-        
-        is_banned = ip in banned_ips_for_user
-        
-        # 兼容前端格式，但 last_seen 仅用于指示活跃状态
-        last_seen_display = 'LIVE' if data['count'] > 0 else 'N/A' 
-        
-        filtered_ips.append({
-            'ip': ip, 'count': data['count'], 'last_seen_display': last_seen_display,
-            'is_banned': is_banned
-        })
-        
-    filtered_ips.sort(key=lambda x: (x['count'], x['is_banned']), reverse=True)
-    return jsonify({"success": True, "active_ips": filtered_ips})
+    """API to get generic system logs (all services, newest on top)."""
+    logs_output = get_logs_data()
+    return jsonify({"logs": logs_output})
 
 
 if __name__ == '__main__':
+    # 为了简化部署，将 debug 设置为 False
     print(f"WSS Panel running on port {PANEL_PORT}")
     app.run(host='0.0.0.0', port=int(PANEL_PORT), debug=False)
 EOF
 
-/bin/chmod +x /usr/local/bin/wss_panel.py
+chmod +x /usr/local/bin/wss_panel.py
 
-export SERVER_IP
-
-# --- 5. 创建 WSS 面板 systemd 服务 ---
-if [ ! -f "/etc/systemd/system/wss_panel.service" ]; then
-/usr/bin/tee /etc/systemd/system/wss_panel.service > /dev/null <<EOF
+# =============================
+# 创建 WSS 面板 systemd 服务
+# =============================
+tee /etc/systemd/system/wss_panel.service > /dev/null <<EOF
 [Unit]
-Description=WSS User Management Panel (Flask V6.2 Optimized)
+Description=WSS User Management Panel (Flask)
 After=network.target
 
 [Service]
 Type=simple
-Environment=SERVER_IP=$SERVER_IP
-ExecStart=$PYTHON_VENV_PATH /usr/local/bin/wss_panel.py
+ExecStart=/usr/bin/python3 /usr/local/bin/wss_panel.py
 Restart=on-failure
 User=root
 
 [Install]
 WantedBy=multi-user.target
 EOF
-fi
 
-/bin/systemctl daemon-reload
-# 更新服务描述的版本号
-/usr/bin/sudo /bin/sed -i "s|Description=WSS User Management Panel (Flask V6.1)|Description=WSS User Management Panel (Flask V6.2 Optimized)|" /etc/systemd/system/wss_panel.service
-/usr/bin/sudo /bin/sed -i "s|Description=WSS User Management Panel (Flask V6.2)|Description=WSS User Management Panel (Flask V6.2 Optimized)|" /etc/systemd/system/wss_panel.service
-/usr/bin/sudo /bin/sed -i "s|^ExecStart=.*|ExecStart=$PYTHON_VENV_PATH /usr/local/bin/wss_panel.py|" /etc/systemd/system/wss_panel.service
-
-/bin/systemctl daemon-reload
-/bin/systemctl enable wss || true
-/bin/systemctl restart wss_panel
-echo "WSS 管理面板 V6.2 优化版 已启动/重启，端口 $PANEL_PORT"
+systemctl daemon-reload
+systemctl enable wss_panel
+systemctl start wss_panel # 启动服务以便后续检查
+echo "WSS 管理面板已启动，端口 $PANEL_PORT"
 echo "----------------------------------"
 
-# --- 6. 部署 IPTABLES 阻断链设置 ---
-
-setup_iptables_chains() {
-    echo "==== 配置 IPTABLES 规则 (开放服务端口并设置 IP 阻断链) ===="
-    
-    BLOCK_CHAIN="WSS_IP_BLOCK"
-    
-    # 清理旧的 WSS 链和规则
-    /sbin/iptables -D INPUT -j $BLOCK_CHAIN 2>/dev/null || true
-    /sbin/iptables -F $BLOCK_CHAIN 2>/dev/null || true
-    /sbin/iptables -X $BLOCK_CHAIN 2>/dev/null || true
-    
-    # 允许 loopback 接口
-    /sbin/iptables -A INPUT -i lo -j ACCEPT
-    # 允许已建立的和相关的连接
-    /sbin/iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-
-    # 1. 创建并插入 IP 阻断链 (必须在端口开放规则之前，以实现实时封禁)
-    /sbin/iptables -N $BLOCK_CHAIN 2>/dev/null || true 
-    /sbin/iptables -I INPUT 1 -j $BLOCK_CHAIN # 插入到最前面
-
-    # 2. 开放 TCP 服务端口
-    echo "开放 TCP 端口: $WSS_HTTP_PORT(HTTP), $WSS_TLS_PORT(TLS), $STUNNEL_PORT(Stunnel), $PANEL_PORT(Panel)"
-    /sbin/iptables -A INPUT -p tcp --dport $WSS_HTTP_PORT -j ACCEPT
-    /sbin/iptables -A INPUT -p tcp --dport $WSS_TLS_PORT -j ACCEPT
-    /sbin/iptables -A INPUT -p tcp --dport $STUNNEL_PORT -j ACCEPT
-    /sbin/iptables -A INPUT -p tcp --dport $PANEL_PORT -j ACCEPT
-
-    # 3. 开放 UDPGW 端口
-    echo "开放 UDP 端口: $UDPGW_PORT(UDPGW)"
-    /sbin/iptables -A INPUT -p udp --dport $UDPGW_PORT -j ACCEPT
-    
-    # 4. 保存规则
-    if command -v /sbin/iptables-save >/dev/null; then
-        /sbin/iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-        echo "IPTABLES 规则已保存到 /etc/iptables/rules.v4。"
-    fi
-
-    echo "IPTABLES 规则更新完成，所有服务端口已开放。"
-}
-
-setup_iptables_chains
-
-
-# --- 7. 移除流量同步 Cron Job ---
-echo "==== 移除流量同步 Cron Job ===="
-/bin/rm -f /etc/cron.d/wss-traffic || true
-echo "流量同步 Cron Job 已移除。"
-echo "----------------------------------"
-
-# --- 8. SSHD 安全配置 ---
+# =============================
+# SSHD 安全配置 (统一策略)
+# =============================
 SSHD_CONFIG="/etc/ssh/sshd_config"
 BACKUP_SUFFIX=".bak.wss$(date +%s)"
-SSHD_SERVICE=$(/bin/systemctl list-units --full -all | /bin/grep -E "sshd\.service|ssh\.service" | /bin/grep -v "not-found" | /usr/bin/head -n 1 | /usr/bin/awk '{print $1}' | /usr/bin/cut -d'.' -f1 || echo "sshd")
+SSHD_SERVICE=$(systemctl list-units --full -all | grep -q "sshd.service" && echo "sshd" || echo "ssh")
 
-echo "==== 配置 SSHD 安全策略 (增强连接稳定性) ===="
-/bin/cp -a "$SSHD_CONFIG" "${SSHD_CONFIG}${BACKUP_SUFFIX}"
+echo "==== 配置 SSHD 安全策略 (允许本机密码认证) ===="
+# 备份 sshd_config
+cp -a "$SSHD_CONFIG" "${SSHD_CONFIG}${BACKUP_SUFFIX}"
 echo "SSHD 配置已备份到 ${SSHD_CONFIG}${BACKUP_SUFFIX}"
 
-/bin/sed -i '/# WSS_TUNNEL_BLOCK_START/,/# WSS_TUNNEL_BLOCK_END/d' "$SSHD_CONFIG"
+# 删除旧的 WSS 配置段
+sed -i '/# WSS_TUNNEL_BLOCK_START/,/# WSS_TUNNEL_BLOCK_END/d' "$SSHD_CONFIG"
 
-/bin/cat >> "$SSHD_CONFIG" <<EOF
+# 写入新的 WSS 隧道策略
+cat >> "$SSHD_CONFIG" <<EOF
 
-# WSS_TUNNEL_BLOCK_START -- managed by deploy_wss_panel.sh (V6.2 Optimized)
+# WSS_TUNNEL_BLOCK_START -- managed by deploy_wss_panel.sh
 # 统一策略: 允许所有用户通过本机 (127.0.0.1, ::1) 使用密码进行认证。
 Match Address 127.0.0.1,::1
+    # 允许密码认证，用于 WSS/Stunnel 隧道连接
     PasswordAuthentication yes
-    PermitTTY no
-    X11Forwarding no
+    # 允许 TTY 和转发
+    PermitTTY yes
     AllowTcpForwarding yes
-    ForceCommand /bin/false
-    ClientAliveInterval 30
-    ClientAliveCountMax 120
-# WSS_TUNNEL_BLOCK_END -- managed by deploy_wss_panel.sh (V6.2 Optimized)
+# WSS_TUNNEL_BLOCK_END -- managed by deploy_wss_panel.sh
 
 EOF
 
-/bin/chmod 600 "$SSHD_CONFIG"
+chmod 600 "$SSHD_CONFIG"
 
+# 重载 sshd
 echo "重新加载并重启 ssh 服务 ($SSHD_SERVICE)"
-/bin/systemctl daemon-reload
-/bin/systemctl restart "$SSHD_SERVICE"
-echo "SSHD 配置更新完成，连接稳定性已增强。"
+systemctl daemon-reload
+systemctl restart "$SSHD_SERVICE"
+echo "SSHD 配置更新完成。"
 echo "----------------------------------"
 
+
+# =============================
+# 最终重启所有关键服务 (NEW)
+# =============================
+echo "==== 最终重启所有关键服务，确保配置生效 ===="
+systemctl restart wss stunnel4 udpgw wss_panel
+echo "所有服务重启完成：WSS, Stunnel4, UDPGW, Web Panel。"
+echo "----------------------------------"
+
+
+# 清理敏感变量
 unset PANEL_ROOT_PASS_RAW
 
 echo "=================================================="
-echo "✅ WSS 管理面板部署完成！ (V6.2 优化版)"
+echo "✅ 部署完成！"
+
 echo "=================================================="
-echo "WSS 核心代理已集成 uvloop，性能提升显著。"
-echo "SSH 隧道目标端口已配置为: $SSH_TARGET_PORT"
-echo "面板访问端口: $PANEL_PORT (已在防火墙中开放)"
+echo ""
+echo "🔥 WSS & Stunnel 基础设施已启动。"
+echo "🌐 WSS 用户管理面板已在后台运行。"
+echo ""
+echo "--- 访问信息 ---"
+echo "Web 面板地址: http://[您的服务器IP]:$PANEL_PORT"
+echo "Web 面板用户名: root"
+echo "Web 面板密码: [您刚才设置的密码]"
+echo ""
+echo "--- 端口信息 ---"
+echo "WSS (HTTP/WebSocket): $WSS_HTTP_PORT"
+echo "WSS (TLS/WebSocket): $WSS_TLS_PORT"
+echo "Stunnel (TLS 隧道): $STUNNEL_PORT"
+echo "UDPGW (内部 UDP 转发): $UDPGW_PORT"
+echo "内部 SSH 转发端口: $INTERNAL_FORWARD_PORT (WSS/Stunnel 代理连接到 SSH 的端口)"
+echo ""
+echo "--- 故障排查 ---"
+echo "WSS 代理状态: sudo systemctl status wss"
+echo "Stunnel 状态: sudo systemctl status stunnel4"
+echo "Web 面板状态: sudo systemctl status wss_panel"
+echo "用户数据库路径: /etc/wss-panel/users.json (面板通过此文件进行用户查询和管理)"
 echo "=================================================="
