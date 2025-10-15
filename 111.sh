@@ -41,20 +41,21 @@ PANEL_PORT=${PANEL_PORT:-54321}
 # 交互式安全输入并确认 ROOT 密码
 echo "请为 Web 面板的 'root' 用户设置密码（输入时隐藏）。"
 while true; do
-  read -s -p "面板密码: " pw1 && echo
-  read -s -p "请再次确认密码: " pw2 && echo
-  if [ -z "$pw1" ]; then
-    echo "密码不能为空，请重新输入。"
-    continue
-  fi
-  if [ "$pw1" != "$pw2" ]; then
-    echo "两次输入不一致，请重试。"
-    continue
-  fi
-  PANEL_ROOT_PASS_RAW="$pw1"
-  # 对密码进行简单的 HASH，防止明文存储
-  PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | sha256sum | awk '{print $1}')
-  break
+    read -s -p "面板密码: " pw1 && echo
+    read -s -p "请再次确认密码: " pw2 && echo
+    # 修复：确保 if 语句使用标准空格
+    if [ -z "$pw1" ]; then
+        echo "密码不能为空，请重新输入。"
+        continue
+    fi
+    if [ "$pw1" != "$pw2" ]; then
+        echo "两次输入不一致，请重试。"
+        continue
+    fi
+    PANEL_ROOT_PASS_RAW="$pw1"
+    # 对密码进行简单的 HASH，防止明文存储
+    PANEL_ROOT_PASS_HASH=$(echo -n "$PANEL_ROOT_PASS_RAW" | sha256sum | awk '{print $1}')
+    break
 done
 
 echo "----------------------------------"
@@ -69,7 +70,7 @@ echo "----------------------------------"
 
 
 # =============================
-# WSS 核心代理脚本
+# WSS 核心代理脚本 (保持不变)
 # =============================
 echo "==== 安装 WSS 核心代理脚本 (/usr/local/bin/wss) ===="
 # 使用 <<'EOF' 避免 Bash 预解析 $INTERNAL_FORWARD_PORT
@@ -313,7 +314,7 @@ echo "UDPGW 已安装并启动，端口: $UDPGW_PORT"
 echo "----------------------------------"
 
 # =============================
-# Traffic Control 基础配置 (NEW)
+# Traffic Control 基础配置 (保持不变)
 # =============================
 # 清除旧的 tc 规则，确保环境干净
 echo "==== 配置 Traffic Control (tc) 基础环境 ===="
@@ -334,7 +335,7 @@ echo "----------------------------------"
 
 
 # =============================
-# 安装 WSS 用户管理面板 (基于 Flask)
+# 安装 WSS 用户管理面板 (基于 Flask) - HTML 优化部分
 # =============================
 echo "==== 部署 WSS 用户管理面板 (Python/Flask) ===="
 PANEL_DIR="/etc/wss-panel"
@@ -346,7 +347,7 @@ if [ ! -f "$USER_DB" ]; then
     echo "[]" > "$USER_DB"
 fi
 
-# 嵌入 Python 面板代码 (关键：所有 $ 都被正确转义或在 Python 内部处理)
+# 嵌入 Python 面板代码 (包含优化的 HTML 模板)
 tee /usr/local/bin/wss_panel.py > /dev/null <<EOF
 # -*- coding: utf-8 -*-
 from flask import Flask, request, jsonify, redirect, url_for, session, make_response
@@ -373,7 +374,7 @@ WSS_HTTP_PORT = "$WSS_HTTP_PORT"
 WSS_TLS_PORT = "$WSS_TLS_PORT"
 STUNNEL_PORT = "$STUNNEL_PORT"
 UDPGW_PORT = "$UDPGW_PORT"
-INTERNAL_FORWARD_PORT = "$INTERNAL_FORWARD_PORT" 
+INTERNAL_FORWARD_PORT = "$INTERNAL_FORWARD_PORT"
 
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET_KEY
@@ -383,6 +384,7 @@ app.secret_key = FLASK_SECRET_KEY
 def safe_run_command(command, input=None):
     """安全执行系统命令并返回结果."""
     try:
+        # 增加 Shell=False 以提高安全性
         result = subprocess.run(
             command,
             check=True,
@@ -439,13 +441,17 @@ def apply_rate_limit(uid, rate_kbps):
         
         # --- 1. CLEANUP (Critical for reliability) ---
         safe_run_command(ipt_del_cmd)
-        safe_run_command(['tc', 'filter', 'del', 'dev', dev, 'parent', '1:', 'protocol', 'ip', 'prio', '100', 'handle', str(mark)]) 
+        # Delete TC filter and class (order matters: filter before class)
+        safe_run_command(['tc', 'filter', 'del', 'dev', dev, 'parent', '1:', 'protocol', 'ip', 'prio', '100', 'handle', str(mark), 'fw']) # Added 'fw' to specify the filter type
         safe_run_command(['tc', 'class', 'del', 'dev', dev, 'parent', '1:', 'classid', tc_handle])
 
 
         if rate > 0:
-            rate_mbps = (rate * 8) / 1024.0
-            rate_str = "{:.2f}mbit".format(rate_mbps)
+            # Convert KB/s to Mbit/s (1 KB/s = 8 kbit/s = 0.008 Mbit/s)
+            rate_mbps = (rate * 8) / 1024.0 
+            # Use kbit/s for high precision in tc command to avoid floating point issues if rate is small
+            rate_kbit = rate * 8
+            rate_str = f"{rate_kbit}kbit" 
             
             # --- 2. ADD TC CLASS (Bandwidth limit container) ---
             tc_class_cmd = ['tc', 'class', 'add', 'dev', dev, 'parent', '1:', 'classid', tc_handle, 'htb', 'rate', rate_str, 'ceil', rate_str]
@@ -457,9 +463,9 @@ def apply_rate_limit(uid, rate_kbps):
             # --- 3. ADD IPTABLES RULE (Mark packets from this UID) ---
             # Added --wait option for stability
             iptables_add_cmd = ['iptables', '-t', 'mangle', '-A', 'POSTROUTING', 
-                                '-m', 'owner', '--uid-owner', str(uid), 
-                                '-j', 'MARK', '--set-mark', str(mark),
-                                '--wait']
+                                 '-m', 'owner', '--uid-owner', str(uid), 
+                                 '-j', 'MARK', '--set-mark', str(mark),
+                                 '--wait']
 
             success_ipt, output_ipt = safe_run_command(iptables_add_cmd)
             if not success_ipt:
@@ -477,7 +483,7 @@ def apply_rate_limit(uid, rate_kbps):
                 return False, f"TC Filter error: {output_filter}"
                 
             return True, f"已限制速度到 {rate_mbps:.2f} Mbit/s (~{rate_kbps} KB/s)"
-        
+            
         else:
             return True, "已清除速度限制"
             
@@ -488,13 +494,26 @@ def manage_quota_iptables_rule(username, uid, action='add'):
     """Adds/Deletes the iptables rule used for counting traffic for a user."""
     comment = f"WSS_QUOTA_{username}"
     
-    # Rule to be matched/counted in the OUTPUT chain (filter table)
-    command = ['iptables', '-t', 'filter', f'-{action.upper()}', 'OUTPUT', 
-               '-m', 'owner', '--uid-owner', str(uid), 
-               '-m', 'comment', '--comment', comment, 
-               '-j', 'ACCEPT', '--wait']
-    
-    safe_run_command(command)
+    # Rule definition for adding/deleting
+    rule = ['-t', 'filter', 'OUTPUT', 
+            '-m', 'owner', '--uid-owner', str(uid), 
+            '-m', 'comment', '--comment', comment, 
+            '-j', 'ACCEPT', '--wait']
+            
+    if action == 'add':
+        # Check if rule exists before adding
+        check_cmd = ['iptables', '-C'] + rule
+        success, _ = safe_run_command(check_cmd)
+        if not success: # Rule does not exist, so add it
+            command = ['iptables', '-A'] + rule
+            safe_run_command(command)
+    elif action == 'delete':
+        # Check if rule exists before deleting
+        check_cmd = ['iptables', '-C'] + rule
+        success, _ = safe_run_command(check_cmd)
+        if success: # Rule exists, so delete it
+            command = ['iptables', '-D'] + rule
+            safe_run_command(command)
 
 def get_user_current_usage_bytes(username, uid):
     """Reads the byte counter from the iptables rule associated with the user."""
@@ -512,8 +531,8 @@ def get_user_current_usage_bytes(username, uid):
         match = pattern.search(line)
         if match:
             try:
-                # The byte count is the second column in -nvxL output
-                return int(line.split()[1])
+                # The byte count is captured by group 1 in the regex
+                return int(match.group(1))
             except (IndexError, ValueError):
                 return 0 # Malformed line
     return 0
@@ -558,20 +577,31 @@ def get_cpu_usage():
 def get_memory_usage():
     """Calculates memory usage percentage and total/used."""
     try:
-        success, output = safe_run_command(['free', '-m'])
-        if success:
-            lines = output.split('\n')
-            mem_line = lines[1].split()
-            total = int(mem_line[1])
-            used = int(mem_line[2])
-            
-            if total > 0:
-                usage = (used / total) * 100
-                return {
-                    "usage": round(usage, 1),
-                    "total_mb": total,
-                    "mem_used_mb": used
-                }
+        # Get data from /proc/meminfo which is faster than parsing 'free' output
+        mem_total, mem_free, mem_buffers, mem_cached = 0, 0, 0, 0
+        with open('/proc/meminfo', 'r') as f:
+            for line in f:
+                if line.startswith('MemTotal'):
+                    mem_total = int(line.split()[1]) # in KB
+                elif line.startswith('MemFree'):
+                    mem_free = int(line.split()[1])
+                elif line.startswith('Buffers'):
+                    mem_buffers = int(line.split()[1])
+                elif line.startswith('Cached'):
+                    mem_cached = int(line.split()[1])
+
+        # Convert to MB
+        total_mb = mem_total // 1024
+        used_kb = mem_total - mem_free - mem_buffers - mem_cached
+        used_mb = used_kb // 1024
+
+        if total_mb > 0:
+            usage = (used_mb / total_mb) * 100
+            return {
+                "usage": round(usage, 1),
+                "total_mb": total_mb,
+                "mem_used_mb": used_mb
+            }
         return {"usage": "N/A", "total_mb": "N/A", "mem_used_mb": "N/A"}
     except Exception:
         return {"usage": "N/A", "total_mb": "N/A", "mem_used_mb": "N/A"}
@@ -580,25 +610,30 @@ def get_memory_usage():
 def get_disk_usage():
     """Gets root filesystem disk usage."""
     try:
-        success, output = safe_run_command(['df', '-h', '/'])
-        if success:
-            lines = output.split('\n')
-            disk_line = lines[-1].split()
-            if len(disk_line) >= 5:
-                usage_str = disk_line[4].replace('%', '')
-                return {"usage": int(usage_str)}
-        return {"usage": "N/A"}
+        # Use python's os module for cleaner disk stats
+        statvfs = os.statvfs('/')
+        total_bytes = statvfs.f_blocks * statvfs.f_bsize
+        free_bytes = statvfs.f_bfree * statvfs.f_bsize
+        used_bytes = total_bytes - free_bytes
+
+        if total_bytes == 0:
+            return {"usage": "N/A"}
+        
+        usage = (used_bytes / total_bytes) * 100
+        return {"usage": int(round(usage))}
     except Exception:
         return {"usage": "N/A"}
 
 def get_service_status_detail(service_name):
     """Returns service status and a descriptive label/color."""
+    # Note: is-active returns 'active'/'inactive'/'activating'/etc.
     success, output = safe_run_command(['systemctl', 'is-active', service_name])
     status = output.strip()
     
     if status == 'active':
         return "active", "运行中", "bg-green-500" # Tailwind class
-    elif status == 'inactive' or status == 'activating' or status == 'deactivating':
+    elif status in ('inactive', 'activating', 'deactivating', 'failed'):
+        # Check if it failed explicitly
         failed_check = safe_run_command(['systemctl', 'is-failed', service_name])
         if failed_check[0] and failed_check[1] == 'failed':
             return "failed", "失败", "bg-red-500" # Tailwind class
@@ -608,16 +643,23 @@ def get_service_status_detail(service_name):
 
 def get_port_status_detail(port):
     """Checks if a port is listening using 'ss'."""
+    # Use -lnt (listening, numeric, tcp/udp/raw) and grep for speed and accuracy
     port_str = str(port)
-    success, output = safe_run_command(['ss', '-tuln'])
+    # Check TCP first
+    success_tcp, output_tcp = safe_run_command(['ss', '-lnt'])
+    if success_tcp and f':{port_str}' in output_tcp:
+        return "监听中 (TCP)", "text-green-500" # Tailwind class
     
-    if success and (f':{port_str}' in output or f' {port_str}' in output):
-        return "监听中", "text-green-500" # Tailwind class
+    # Check UDP (only for UDPGW)
+    success_udp, output_udp = safe_run_command(['ss', '-lnu'])
+    if success_udp and f':{port_str}' in output_udp:
+        return "监听中 (UDP)", "text-green-500"
+        
     return "未监听", "text-red-500" # Tailwind class
 
 def get_logs_data(lines=50):
     """Retrieves generic system logs (latest on top)."""
-    # Use journalctl to get the last hour's logs for all services, newest first
+    # Use journalctl -r (reverse order: newest first)
     success, output = safe_run_command(['journalctl', '-r', f'-n {lines}', '--since', '1 hour ago', '--no-pager', '--utc'])
     return output if success else f"错误: 无法获取系统日志. {output}"
 
@@ -625,6 +667,7 @@ def get_logs_data(lines=50):
 def get_user_expiration_status(username):
     """Checks account status based on Linux 'chage -l' and current date."""
     try:
+        # Use LC_ALL=C for consistent date output regardless of system locale
         success, output = safe_run_command(['bash', '-c', f'LC_ALL=C chage -l {username}'])
         if not success:
             return "inactive", "N/A (系统用户不存在)"
@@ -637,13 +680,17 @@ def get_user_expiration_status(username):
                 expiry_info = line.split(':')[-1].strip()
                 break
         
+        # Check if account is locked using passwd -S
         passwd_success, passwd_output = safe_run_command(['passwd', '-S', username])
         is_locked = passwd_success and 'L' in passwd_output # 'L' indicates locked account
 
         if expiry_info.lower() in ("never", "never expires"):
+            if is_locked:
+                 return "locked", "永不 (已手动锁定)"
             return "active", "永不"
         
         try:
+            # Parse the date format used by chage (e.g., Aug 01, 2024)
             expiry_date = datetime.strptime(expiry_info, '%b %d, %Y').date()
             today = date.today()
             expiry_date_str = expiry_date.strftime("%Y-%m-%d")
@@ -657,7 +704,7 @@ def get_user_expiration_status(username):
 
         except ValueError:
             if is_locked:
-                return "expired", "N/A (已锁定)"
+                return "expired", "N/A (已锁定/日期格式错误)"
             return "active", "N/A (日期格式错误)"
 
     except Exception as e:
@@ -667,6 +714,7 @@ def get_user_expiration_status(username):
 
 def get_user_uid(username):
     """Retrieves the numeric UID of a Linux user."""
+    # Use id -u for cleaner UID retrieval
     success, output = safe_run_command(['id', '-u', username])
     return int(output) if success and output.isdigit() else None
 
@@ -683,6 +731,12 @@ def load_users():
         for user in users:
             username = user['username']
             uid = get_user_uid(username)
+            
+            # Skip if user is recorded in panel but no longer exists in system (likely deleted manually)
+            if uid is None:
+                print(f"Warning: Panel user {username} does not exist in system. Skipping status update.")
+                continue
+
             user['uid'] = uid
             
             # --- 1. Refresh Status/Expiry ---
@@ -758,550 +812,555 @@ def login_required(f):
     decorated_function.__name__ = f.__name__
     return decorated_function
 
-# --- HTML 模板和渲染 ---
+# --- HTML 模板和渲染 (已优化) ---
 
-# 仪表盘 HTML (内嵌) - Tailwind CSS 风格 (匹配第二张图片)
+# 仪表盘 HTML (内嵌) - Tailwind CSS 风格 (已优化布局)
 _DASHBOARD_HTML = """
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>WSS Panel - 仪表盘</title>
-    <script src="https://cdn.tailwindcss.com"></script>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WSS Panel - 仪表盘</title>
+    <script src="https://cdn.tailwindcss.com"></script>
     <style>
         /* Custom status colors for Jinja/JS use */
         .active { color: #10b981; } /* green-600 */
         .expired, .exceeded { color: #ef4444; } /* red-600 */
         .modal { position: fixed; z-index: 1000; left: 0; top: 0; width: 100%; height: 100%; overflow: auto; background-color: rgba(0,0,0,0.4); display: none; justify-content: center; align-items: center; }
-        /* Log display to reverse order for newest-on-top, relying on server-side reversed log data */
-        .log-pre { display: flex; flex-direction: column-reverse; max-height: 250px; overflow-y: scroll; white-space: pre-wrap; }
+        /* Log display container styling */
+        .log-pre { max-height: 250px; overflow-y: scroll; white-space: pre-wrap; font-family: monospace; }
         /* Smaller rounded indicator dots */
         .status-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 4px; }
-        .grid-custom { grid-template-columns: 1fr 1fr 1fr 1fr 1fr 1fr; }
-        @media (max-width: 1024px) {
-            .grid-custom { grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); }
-        }
     </style>
 </head>
-<body class="bg-gray-100 min-h-screen">
-    <div class="bg-gray-800 text-white p-4 shadow-lg flex justify-between items-center sticky top-0 z-50">
-        <h1 class="text-2xl font-semibold">WSS Panel - 仪表盘</h1>
-        <button class="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-lg transition" onclick="logout()">退出登录 (root)</button>
-    </div>
+<body class="bg-gray-100 min-h-screen font-sans">
+    <div class="bg-gray-800 text-white p-4 shadow-lg flex justify-between items-center sticky top-0 z-50">
+        <h1 class="text-2xl font-extrabold tracking-tight">WSS Panel - 仪表盘</h1>
+        <button class="bg-red-600 hover:bg-red-700 text-white font-bold py-1.5 px-4 rounded-lg shadow-md transition duration-200" onclick="logout()">退出登录 (root)</button>
+    </div>
 
-    <div class="container mx-auto mt-6 px-4">
-        <div id="status-message" class="p-4 rounded-lg font-bold mb-6" style="display:none;"></div>
-        
-        <!-- 实时系统状态 (顶部卡片区) -->
-        <div class="mb-6">
-            <h3 class="text-xl font-semibold text-gray-700 mb-3">实时系统状态</h3>
-            <div class="grid grid-cols-2 md:grid-cols-6 gap-4">
-                
-                <!-- CPU -->
-                <div class="bg-white p-4 rounded-xl shadow-md border-b-4 border-blue-500 text-center">
-                    <h4 class="text-sm text-gray-500 font-medium">CPU 使用率</h4>
-                    <p id="cpu-usage" class="text-2xl font-extrabold text-blue-700 mt-1">--</p>
-                </div>
+    <div class="container mx-auto mt-6 px-4">
+        <div id="status-message" class="p-4 rounded-xl font-bold mb-6 border-l-4" style="display:none;"></div>
+        
+        <!-- 实时系统状态 (顶部卡片区) -->
+        <div class="mb-6">
+            <h3 class="text-xl font-semibold text-gray-700 mb-3 border-b pb-1">实时系统状态</h3>
+            <!-- Optimized for responsive layout: 2 cols on mobile, 3 on tablet, 6 on large desktop -->
+            <div class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4">
+                
+                <!-- CPU -->
+                <div class="bg-white p-4 rounded-xl shadow-lg border-b-4 border-blue-500 text-center transform hover:scale-[1.02] transition duration-150">
+                    <h4 class="text-sm text-gray-500 font-medium">CPU 使用率</h4>
+                    <p id="cpu-usage" class="text-2xl font-extrabold text-blue-700 mt-1">--</p>
+                </div>
 
-                <!-- 内存 -->
-                <div class="bg-white p-4 rounded-xl shadow-md border-b-4 border-blue-500 text-center">
-                    <h4 class="text-sm text-gray-500 font-medium">内存 (用量/总量)</h4>
-                    <p id="mem-usage" class="text-xl font-extrabold text-blue-700 mt-1">--</p>
-                </div>
-                
-                <!-- 硬盘 -->
-                <div class="bg-white p-4 rounded-xl shadow-md border-b-4 border-blue-500 text-center">
-                    <h4 class="text-sm text-gray-500 font-medium">磁盘使用率</h4>
-                    <p id="disk-usage" class="text-2xl font-extrabold text-blue-700 mt-1">--</p>
-                </div>
+                <!-- 内存 -->
+                <div class="bg-white p-4 rounded-xl shadow-lg border-b-4 border-indigo-500 text-center transform hover:scale-[1.02] transition duration-150">
+                    <h4 class="text-sm text-gray-500 font-medium">内存 (用量/总量)</h4>
+                    <p id="mem-usage" class="text-lg sm:text-xl font-extrabold text-indigo-700 mt-1">--</p>
+                </div>
+                
+                <!-- 硬盘 -->
+                <div class="bg-white p-4 rounded-xl shadow-lg border-b-4 border-purple-500 text-center transform hover:scale-[1.02] transition duration-150">
+                    <h4 class="text-sm text-gray-500 font-medium">磁盘使用率</h4>
+                    <p id="disk-usage" class="text-2xl font-extrabold text-purple-700 mt-1">--</p>
+                </div>
 
-                <!-- WSS Proxy 状态 -->
-                <div class="bg-white p-4 rounded-xl shadow-md border-b-4 border-gray-400 text-center">
-                    <h4 class="text-sm text-gray-500 font-medium">WSS Proxy 状态</h4>
-                    <p class="text-base font-bold text-gray-800 mt-1 flex items-center justify-center">
+                <!-- WSS Proxy 状态 -->
+                <div class="bg-white p-4 rounded-xl shadow-lg border-b-4 border-gray-400 text-center transform hover:scale-[1.02] transition duration-150">
+                    <h4 class="text-sm text-gray-500 font-medium">WSS Proxy</h4>
+                    <p class="text-base font-bold text-gray-800 mt-1 flex items-center justify-center">
                         <span id="wss-status-indicator" class="status-dot"></span><span id="wss-status-label">--</span>
                     </p>
-                </div>
+                </div>
 
-                <!-- Stunnel4 状态 -->
-                <div class="bg-white p-4 rounded-xl shadow-md border-b-4 border-gray-400 text-center">
-                    <h4 class="text-sm text-gray-500 font-medium">Stunnel4 状态</h4>
-                    <p class="text-base font-bold text-gray-800 mt-1 flex items-center justify-center">
+                <!-- Stunnel4 状态 -->
+                <div class="bg-white p-4 rounded-xl shadow-lg border-b-4 border-gray-400 text-center transform hover:scale-[1.02] transition duration-150">
+                    <h4 class="text-sm text-gray-500 font-medium">Stunnel4</h4>
+                    <p class="text-base font-bold text-gray-800 mt-1 flex items-center justify-center">
                         <span id="stunnel4-status-indicator" class="status-dot"></span><span id="stunnel4-status-label">--</span>
                     </p>
-                </div>
-                
-                <!-- UDPGW 状态 -->
-                <div class="bg-white p-4 rounded-xl shadow-md border-b-4 border-gray-400 text-center">
-                    <h4 class="text-sm text-gray-500 font-medium">UDPGW 状态</h4>
-                    <p class="text-base font-bold text-gray-800 mt-1 flex items-center justify-center">
+                </div>
+                
+                <!-- UDPGW 状态 -->
+                <div class="bg-white p-4 rounded-xl shadow-lg border-b-4 border-gray-400 text-center transform hover:scale-[1.02] transition duration-150">
+                    <h4 class="text-sm text-gray-500 font-medium">UDPGW</h4>
+                    <p class="text-base font-bold text-gray-800 mt-1 flex items-center justify-center">
                         <span id="udpgw-status-indicator" class="status-dot"></span><span id="udpgw-status-label">--</span>
                     </p>
-                </div>
-            </div>
-        </div>
+                </div>
+            </div>
+        </div>
 
         <!-- 端口状态, 核心操作, 日志区 -->
-        <div class="grid grid-cols-1 lg:grid-cols-2 xl:grid-cols-3 gap-6">
-            <!-- Port Status and Core Ops (Left Column) -->
-            <div class="lg:col-span-1 bg-white p-6 rounded-xl shadow-md">
-                <h3 class="text-xl font-semibold text-gray-700 mb-4">服务端口与操作</h3>
+        <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+            <!-- Port Status and Core Ops (Left Column, now fixed to 1/3 width on large screen) -->
+            <div class="lg:col-span-1 bg-white p-6 rounded-xl shadow-md h-full">
+                <h3 class="text-xl font-semibold text-gray-700 mb-4 border-b pb-2">服务端口与操作</h3>
                 
                 <div class="flex flex-col space-y-4">
                     <!-- Port List -->
                     <div class="rounded-lg border border-gray-200 p-4">
-                        <h4 class="font-medium text-gray-600 mb-2 border-b pb-1">端口监听状态 (LISTEN)</h4>
-                        <table class="min-w-full text-sm">
-                            <tbody id="service-port-tbody">
-                                <!-- Dynamically populated by JS -->
-                            </tbody>
-                        </table>
+                        <h4 class="font-medium text-gray-600 mb-3">端口监听状态 (LISTEN)</h4>
+                        <div class="overflow-x-auto">
+                            <table class="min-w-full text-sm">
+                                <tbody id="service-port-tbody" class="divide-y divide-gray-100">
+                                    <!-- Dynamically populated by JS -->
+                                </tbody>
+                            </table>
+                        </div>
                     </div>
 
                     <!-- Core Operations -->
                     <div class="rounded-lg bg-red-50 p-4 shadow-inner">
-                        <h4 class="font-medium text-red-600 mb-3 border-b border-red-200 pb-1">核心服务操作</h4>
+                        <h4 class="font-medium text-red-600 mb-3 border-b border-red-200 pb-1">核心服务操作 (Systemd)</h4>
                         <div class="space-y-2">
-                            <button class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 rounded-lg transition" onclick="openRestartModal('wss', 'WSS Proxy (HTTP/TLS)')">重启 WSS Proxy ({{ wss_http_port }}/{{ wss_tls_port }})</button>
-                            <button class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 rounded-lg transition" onclick="openRestartModal('stunnel4', 'Stunnel4 (TLS Tunnel)')">重启 Stunnel4 ({{ stunnel_port }})</button>
-                            <button class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 rounded-lg transition" onclick="openRestartModal('udpgw', 'UDPGW')">重启 UDPGW ({{ udpgw_port }})</button>
-                            <button class="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-2 rounded-lg transition" onclick="openRestartModal('wss_panel', 'Web Panel')">重启 Web Panel (慎重操作)</button>
+                            <button class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 rounded-lg transition duration-150 shadow-md" onclick="openRestartModal('wss', 'WSS Proxy (HTTP/TLS)')">重启 WSS Proxy ({{ wss_http_port }}/{{ wss_tls_port }})</button>
+                            <button class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 rounded-lg transition duration-150 shadow-md" onclick="openRestartModal('stunnel4', 'Stunnel4 (TLS Tunnel)')">重启 Stunnel4 ({{ stunnel_port }})</button>
+                            <button class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 rounded-lg transition duration-150 shadow-md" onclick="openRestartModal('udpgw', 'UDPGW')">重启 UDPGW ({{ udpgw_port }})</button>
+                            <button class="w-full bg-red-600 hover:bg-red-700 text-white font-bold py-2 rounded-lg transition duration-150 shadow-md" onclick="openRestartModal('wss_panel', 'Web Panel')">重启 Web Panel (慎重操作)</button>
                         </div>
                     </div>
                 </div>
-            </div>
+            </div>
             
-            <!-- 实时日志区 (Right Column) -->
-            <div class="lg:col-span-1 xl:col-span-2 bg-white p-6 rounded-xl shadow-md">
-                <h3 class="text-xl font-semibold text-gray-700 mb-4">实时系统日志 (最新50条, 每10s刷新)</h3>
-                <div class="bg-gray-800 p-3 rounded-lg overflow-hidden">
-                    <pre id="log-pre-content" class="text-gray-200 text-xs p-1 log-pre">正在加载日志...</pre>
-                </div>
-            </div>
-        </div>
+            <!-- 实时日志区 (Right 2/3 width on large screen) -->
+            <div class="lg:col-span-2 bg-white p-6 rounded-xl shadow-md">
+                <h3 class="text-xl font-semibold text-gray-700 mb-4 border-b pb-2">实时系统日志 (最新50条, 每10s刷新)</h3>
+                <div class="bg-gray-800 p-3 rounded-lg overflow-hidden h-[300px]">
+                    <!-- Log display container - note the fixed height and overflow-y: scroll for aesthetics -->
+                    <pre id="log-pre-content" class="text-gray-200 text-xs p-1 log-pre h-full">正在加载日志...</pre>
+                </div>
+                <p class="text-gray-500 text-xs mt-2 italic">日志使用 journalctl -r (最新在顶) 获取，可能包含多个服务的记录。</p>
+            </div>
+        </div>
 
 
         <!-- 用户管理 - 新增用户 -->
-        <div class="bg-white p-6 rounded-xl shadow-md mb-6 mt-6">
-            <h3 class="text-xl font-semibold text-gray-700 mb-4">新增 WSS 用户 (SSH 账户)</h3>
-            <form id="add-user-form" class="grid grid-cols-2 md:grid-cols-6 gap-4 items-end">
-                <input type="text" id="new-username" placeholder="用户名" pattern="[a-z0-9_]{3,16}" title="用户名只能包含小写字母、数字和下划线，长度3-16位" required class="col-span-1 p-2 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500" value="">
-                <input type="password" id="new-password" placeholder="密码" required class="col-span-1 p-2 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500" value="">
-                <input type="number" id="expiration-days" value="365" min="1" placeholder="有效期 (天)" required class="col-span-1 p-2 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500">
-                <input type="number" id="quota-gb" value="0" min="0" placeholder="流量配额 (GB, 0=不限制)" required class="col-span-1 p-2 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500">
-                <input type="number" id="rate-kbps" value="0" min="0" placeholder="最大带宽 (KB/s, 0=不限制)" required class="col-span-1 p-2 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500">
-                <button type="submit" class="col-span-2 md:col-span-1 bg-green-500 text-white font-bold py-2 rounded-lg hover:bg-green-600 transition">创建用户</button>
-            </form>
-        </div>
+        <div class="bg-white p-6 rounded-xl shadow-md mb-6 mt-6">
+            <h3 class="text-xl font-semibold text-gray-700 mb-4 border-b pb-2">新增 WSS 用户 (SSH 账户)</h3>
+            <form id="add-user-form" class="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-4 items-end">
+                <input type="text" id="new-username" placeholder="用户名 (3-16位, a-z0-9_)" pattern="[a-z0-9_]{3,16}" title="用户名只能包含小写字母、数字和下划线，长度3-16位" required class="col-span-1 p-2 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500">
+                <input type="password" id="new-password" placeholder="密码" required class="col-span-1 p-2 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500">
+                <input type="number" id="expiration-days" value="365" min="1" placeholder="有效期 (天, ≥1)" required class="col-span-1 p-2 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500">
+                <input type="number" id="quota-gb" value="0" min="0" placeholder="流量配额 (GB, 0=无限制)" required class="col-span-1 p-2 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500">
+                <input type="number" id="rate-kbps" value="0" min="0" placeholder="最大带宽 (KB/s, 0=无限制)" required class="col-span-1 p-2 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500">
+                <button type="submit" class="col-span-2 sm:col-span-3 lg:col-span-1 bg-green-600 text-white font-bold py-2 rounded-lg hover:bg-green-700 transition duration-150 shadow-md">创建用户</button>
+            </form>
+        </div>
 
-        <!-- 用户管理 - 列表 -->
-        <div class="bg-white p-6 rounded-xl shadow-md mb-6">
-            <h3 class="text-xl font-semibold text-gray-700 mb-4">用户列表</h3>
-            <div class="overflow-x-auto">
-                <table class="min-w-full divide-y divide-gray-200">
-                    <thead class="bg-gray-50">
-                        <tr>
-                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">用户名</th>
-                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">状态</th>
-                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">到期日期</th>
-                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">用量/配额 (GB)</th>
-                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">带宽 (KB/s)</th>
-                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">操作</th>
-                        </tr>
-                    </thead>
-                    <tbody id="user-list-tbody" class="bg-white divide-y divide-gray-200">
-                        {% for user in users %}
-                        <tr id="row-{{ user.username }}" class="hover:bg-gray-50">
-                            <td class="px-3 py-3 whitespace-nowrap text-sm text-gray-900">{{ user.username }}</td>
-                            <td class="px-3 py-3 whitespace-nowrap text-sm font-bold"><span class="{{ user.status }}">{{ user.status.upper() }}</span></td>
-                            <td class="px-3 py-3 whitespace-nowrap text-sm text-gray-500">{{ user.expiration_date }}</td>
-                            <td class="px-3 py-3 whitespace-nowrap text-sm text-gray-500">{{ user.usage_gb }} / {{ user.quota_gb }} GB</td>
-                            <td class="px-3 py-3 whitespace-nowrap text-sm text-gray-500">{{ user.rate_limit_kbps }} KB/s</td>
-                            <td class="px-3 py-3 whitespace-nowrap text-sm font-medium space-x-1">
-                                <button class="bg-blue-500 hover:bg-blue-600 text-white py-1 px-2 rounded-lg text-xs transition" onclick="openQuotaModal('{{ user.username }}', {{ user.quota_gb }}, '{{ user.rate_limit_kbps }}')">设置</button>
-                                <button class="bg-yellow-500 hover:bg-yellow-600 text-white py-1 px-2 rounded-lg text-xs transition" onclick="openResetModal('{{ user.username }}')">重置用量</button>
-                                <button class="bg-red-500 hover:bg-red-600 text-white py-1 px-2 rounded-lg text-xs transition" onclick="openDeleteModal('{{ user.username }}')">删除</button>
-                            </td>
-                        </tr>
-                        {% endfor %}
-                        </tbody>
-                        </table>
-                    </div>
-                </div>
-        </div>
-    </div>
+        <!-- 用户管理 - 列表 -->
+        <div class="bg-white p-6 rounded-xl shadow-lg mb-10">
+            <h3 class="text-xl font-semibold text-gray-700 mb-4 border-b pb-2">用户列表</h3>
+            <div class="overflow-x-auto border border-gray-200 rounded-lg">
+                <table class="min-w-full divide-y divide-gray-200">
+                    <thead class="bg-gray-50">
+                        <tr>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">用户名</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">状态</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">到期日期</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">用量/配额 (GB)</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">带宽 (KB/s)</th>
+                            <th class="px-3 py-3 text-left text-xs font-medium text-gray-500 uppercase tracking-wider min-w-[180px]">操作</th>
+                        </tr>
+                    </thead>
+                    <tbody id="user-list-tbody" class="bg-white divide-y divide-gray-200">
+                        {% for user in users %}
+                        <tr id="row-{{ user.username }}" class="hover:bg-gray-50">
+                            <td class="px-3 py-3 whitespace-nowrap text-sm text-gray-900 font-mono">{{ user.username }}</td>
+                            <td class="px-3 py-3 whitespace-nowrap text-sm font-bold"><span class="px-2 py-0.5 text-xs rounded-full bg-opacity-10 
+                                {% if user.status == 'active' %}bg-green-100 text-green-700{% elif user.status == 'exceeded' %}bg-red-100 text-red-700{% elif user.status == 'expired' %}bg-red-100 text-red-700{% else %}bg-yellow-100 text-yellow-700{% endif %}">
+                                {{ user.status.upper() }}
+                            </span></td>
+                            <td class="px-3 py-3 whitespace-nowrap text-sm text-gray-500">{{ user.expiration_date }}</td>
+                            <td class="px-3 py-3 whitespace-nowrap text-sm text-gray-500 font-mono">{{ user.usage_gb }} / {{ user.quota_gb }} GB</td>
+                            <td class="px-3 py-3 whitespace-nowrap text-sm text-gray-500 font-mono">{{ user.rate_limit_kbps }} KB/s</td>
+                            <!-- Changed space-x-1 to flex wrap for mobile friendly buttons -->
+                            <td class="px-3 py-3 whitespace-nowrap text-sm font-medium flex flex-col space-y-1 sm:flex-row sm:space-y-0 sm:space-x-1">
+                                <button class="bg-blue-500 hover:bg-blue-600 text-white py-1 px-2 rounded-lg text-xs transition duration-150 shadow-sm w-full sm:w-auto" onclick="openQuotaModal('{{ user.username }}', {{ user.quota_gb }}, '{{ user.rate_limit_kbps }}')">配额</button>
+                                <button class="bg-yellow-500 hover:bg-yellow-600 text-white py-1 px-2 rounded-lg text-xs transition duration-150 shadow-sm w-full sm:w-auto" onclick="openResetModal('{{ user.username }}')">重置用量</button>
+                                <button class="bg-red-500 hover:bg-red-600 text-white py-1 px-2 rounded-lg text-xs transition duration-150 shadow-sm w-full sm:w-auto" onclick="openDeleteModal('{{ user.username }}')">删除</button>
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </div>
+        </div>
+    </div>
 
-    <!-- Modal for Delete Confirmation -->
-    <div id="deleteModal" class="modal">
-        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-md">
-            <h3 class="text-xl font-semibold text-gray-800 mb-4">确认删除用户</h3>
-            <p class="text-gray-600">您确定要永久删除用户 <strong id="delete-username-placeholder" class="text-red-500"></strong> 吗？此操作不可逆，将删除系统账户和所有配置。</p>
-            <div class="mt-6 text-right">
-                <button class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-bold py-2 px-4 rounded-lg mr-2" onclick="closeModal('deleteModal')">取消</button>
-                <button class="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-lg" id="confirm-delete-btn">确认删除</button>
-            </div>
-        </div>
-    </div>
+    <!-- Modals (kept modals for consistency) -->
+    <!-- Modal for Delete Confirmation -->
+    <div id="deleteModal" class="modal">
+        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-md">
+            <h3 class="text-xl font-semibold text-gray-800 mb-4">确认删除用户</h3>
+            <p class="text-gray-600">您确定要永久删除用户 <strong id="delete-username-placeholder" class="text-red-500"></strong> 吗？此操作不可逆，将删除系统账户和所有配置。</p>
+            <div class="mt-6 text-right">
+                <button class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-bold py-2 px-4 rounded-lg mr-2 transition duration-150" onclick="closeModal('deleteModal')">取消</button>
+                <button class="bg-red-600 hover:bg-red-700 text-white font-bold py-2 px-4 rounded-lg transition duration-150" id="confirm-delete-btn">确认删除</button>
+            </div>
+        </div>
+    </div>
 
-    <!-- Modal for Service Restart -->
-    <div id="restartModal" class="modal">
-        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-md">
-            <h3 class="text-xl font-semibold text-gray-800 mb-4">确认重启服务</h3>
-            <p class="text-gray-600">您确定要重启 <strong id="restart-service-placeholder" class="text-blue-500"></strong> 吗？这可能会短暂中断隧道服务。</p>
-            <div class="mt-6 text-right">
-                <button class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-bold py-2 px-4 rounded-lg mr-2" onclick="closeModal('restartModal')">取消</button>
-                <button class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg" id="confirm-restart-btn">确认重启</button>
-            </div>
-        </div>
-    </div>
-    
-    <!-- Modal for Reset Usage -->
-    <div id="resetModal" class="modal">
-        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-md">
-            <h3 class="text-xl font-semibold text-gray-800 mb-4">确认重置用量</h3>
-            <p class="text-gray-600">您确定要重置用户 <strong id="reset-username-placeholder" class="text-blue-500"></strong> 的流量用量吗？账户将同时解除配额锁定状态（如果已锁定）。</p>
-            <div class="mt-6 text-right">
-                <button class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-bold py-2 px-4 rounded-lg mr-2" onclick="closeModal('resetModal')">取消</button>
-                <button class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg" id="confirm-reset-btn">确认重置</button>
-            </div>
-        </div>
-    </div>
+    <!-- Modal for Service Restart -->
+    <div id="restartModal" class="modal">
+        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-md">
+            <h3 class="text-xl font-semibold text-gray-800 mb-4">确认重启服务</h3>
+            <p class="text-gray-600">您确定要重启 <strong id="restart-service-placeholder" class="text-blue-500"></strong> 吗？这可能会短暂中断隧道服务。</p>
+            <div class="mt-6 text-right">
+                <button class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-bold py-2 px-4 rounded-lg mr-2 transition duration-150" onclick="closeModal('restartModal')">取消</button>
+                <button class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg transition duration-150" id="confirm-restart-btn">确认重启</button>
+            </div>
+        </div>
+    </div>
+    
+    <!-- Modal for Reset Usage -->
+    <div id="resetModal" class="modal">
+        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-md">
+            <h3 class="text-xl font-semibold text-gray-800 mb-4">确认重置用量</h3>
+            <p class="text-gray-600">您确定要重置用户 <strong id="reset-username-placeholder" class="text-blue-500"></strong> 的流量用量吗？账户将同时解除配额锁定状态（如果已锁定）。</p>
+            <div class="mt-6 text-right">
+                <button class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-bold py-2 px-4 rounded-lg mr-2 transition duration-150" onclick="closeModal('resetModal')">取消</button>
+                <button class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg transition duration-150" id="confirm-reset-btn">确认重置</button>
+            </div>
+        </div>
+    </div>
 
-    <!-- Modal for Set Quota/Rate Limit -->
-    <div id="quotaModal" class="modal">
-        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-md">
-            <h3 class="text-xl font-semibold text-gray-800 mb-4">设置 <strong id="quota-username-placeholder" class="text-blue-500"></strong> 的配额与带宽</h3>
-            <form id="set-quota-form">
-                <label for="modal-quota-gb" class="block text-sm font-medium text-gray-700 mb-1">流量配额 (GB, 0=不限制)</label>
-                <input type="number" id="modal-quota-gb" class="w-full p-2 border border-gray-300 rounded-lg mb-4" min="0" required>
-                <label for="modal-rate-kbps" class="block text-sm font-medium text-gray-700 mb-1">最大带宽 (KB/s, 0=不限制)</label>
-                <input type="number" id="modal-rate-kbps" class="w-full p-2 border border-gray-300 rounded-lg mb-4" min="0" required>
-                <div class="mt-6 text-right">
-                    <button type="button" class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-bold py-2 px-4 rounded-lg mr-2" onclick="closeModal('quotaModal')">取消</button>
-                    <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg">保存设置</button>
-                </div>
-            </form>
-        </div>
-    </div>
+    <!-- Modal for Set Quota/Rate Limit -->
+    <div id="quotaModal" class="modal">
+        <div class="bg-white p-6 rounded-xl shadow-2xl w-full max-w-md">
+            <h3 class="text-xl font-semibold text-gray-800 mb-4">设置 <strong id="quota-username-placeholder" class="text-blue-500"></strong> 的配额与带宽</h3>
+            <form id="set-quota-form">
+                <label for="modal-quota-gb" class="block text-sm font-medium text-gray-700 mb-1">流量配额 (GB, 0=无限制)</label>
+                <input type="number" id="modal-quota-gb" class="w-full p-3 border border-gray-300 rounded-lg mb-4 focus:ring-blue-500 focus:border-blue-500" min="0" required>
+                <label for="modal-rate-kbps" class="block text-sm font-medium text-gray-700 mb-1">最大带宽 (KB/s, 0=无限制)</label>
+                <input type="number" id="modal-rate-kbps" class="w-full p-3 border border-gray-300 rounded-lg mb-4 focus:ring-blue-500 focus:border-blue-500" min="0" required>
+                <div class="mt-6 text-right">
+                    <button type="button" class="bg-gray-300 hover:bg-gray-400 text-gray-800 font-bold py-2 px-4 rounded-lg mr-2 transition duration-150" onclick="closeModal('quotaModal')">取消</button>
+                    <button type="submit" class="bg-blue-600 hover:bg-blue-700 text-white font-bold py-2 px-4 rounded-lg transition duration-150">保存设置</button>
+                </div>
+            </form>
+        </div>
+    </div>
 
-    <script>
-        // --- Utility Functions ---
+    <script>
+        // --- Utility Functions ---
 
-        function showStatus(message, isSuccess) {
-            const statusDiv = document.getElementById('status-message');
-            statusDiv.textContent = message;
-            statusDiv.className = isSuccess ? 'bg-green-100 text-green-800 border border-green-400 p-3 rounded-lg font-bold' : 'bg-red-100 text-red-800 border border-red-400 p-3 rounded-lg font-bold';
-            statusDiv.style.display = 'block';
-            setTimeout(() => { statusDiv.style.display = 'none'; }, 5000);
-        }
-        
-        // --- Modal Logic ---
+        function showStatus(message, isSuccess) {
+            const statusDiv = document.getElementById('status-message');
+            statusDiv.textContent = message;
+            statusDiv.className = isSuccess ? 'bg-green-100 text-green-800 border-green-400 p-3 rounded-xl font-bold border-l-4' : 'bg-red-100 text-red-800 border-red-400 p-3 rounded-xl font-bold border-l-4';
+            statusDiv.style.display = 'block';
+            setTimeout(() => { statusDiv.style.display = 'none'; }, 5000);
+        }
+        
+        // --- Modal Logic (Kept mostly the same) ---
 
-        function openModal(id) {
-            document.getElementById(id).style.display = 'flex';
-        }
+        function openModal(id) {
+            document.getElementById(id).style.display = 'flex';
+        }
 
-        function closeModal(id) {
-            document.getElementById(id).style.display = 'none';
-        }
-        
-        // --- Real-time Monitoring Functions ---
+        function closeModal(id) {
+            document.getElementById(id).style.display = 'none';
+        }
+        
+        // --- Real-time Monitoring Functions (Adjusted scrolling for better UX) ---
 
-        async function refreshMonitorData() {
-            try {
-                const response = await fetch('/api/monitor_data');
-                const data = await response.json();
-                
-                if (response.ok) {
-                    renderSystemHealth(data.system_health, data.services);
-                    renderServiceAndPortStatus(data.services, data.ports);
-                } else {
-                    console.error('获取状态失败:', data.message || '未知错误');
-                }
-            } catch (error) {
-                console.error("Monitor data fetch error:", error);
-            }
-        }
-        
-        function renderSystemHealth(health, services) {
-            document.getElementById('cpu-usage').textContent = health.cpu_usage !== "N/A" ? \`\${health.cpu_usage}%\` : '--';
-            
-            let memText = health.mem_usage !== "N/A" ? \`\${health.mem_usage}% (\${health.mem_used_mb}/\${health.mem_total_mb}MB)\` : '--';
-            document.getElementById('mem-usage').textContent = memText;
-            
-            document.getElementById('disk-usage').textContent = health.disk_usage !== "N/A" ? \`\${health.disk_usage}%\` : '--';
+        async function refreshMonitorData() {
+            try {
+                const response = await fetch('/api/monitor_data');
+                const data = await response.json();
+                
+                if (response.ok) {
+                    renderSystemHealth(data.system_health, data.services);
+                    renderServiceAndPortStatus(data.services, data.ports);
+                } else {
+                    console.error('获取状态失败:', data.message || '未知错误');
+                }
+            } catch (error) {
+                console.error("Monitor data fetch error:", error);
+            }
+        }
+        
+        function renderSystemHealth(health, services) {
+            document.getElementById('cpu-usage').textContent = health.cpu_usage !== "N/A" ? \`\${health.cpu_usage}%\` : '--';
+            
+            let memText = health.mem_usage !== "N/A" ? \`\${health.mem_usage}% (\${health.mem_used_mb}/\${health.mem_total_mb}MB)\` : '--';
+            document.getElementById('mem-usage').textContent = memText;
+            
+            document.getElementById('disk-usage').textContent = health.disk_usage !== "N/A" ? \`\${health.disk_usage}%\` : '--';
 
-            // Update core service status indicators
-            const serviceMapping = {
-                'WSS Proxy': 'wss', 'Stunnel4': 'stunnel4', 'UDPGW': 'udpgw', 'Web Panel': 'wss_panel'
-            };
-            
-            services.forEach(service => {
-                const id = serviceMapping[service.name];
-                if (!id) return;
-                
-                const indicator = document.getElementById(\`\${id}-status-indicator\`);
-                const label = document.getElementById(\`\${id}-status-label\`);
-                
-                if (indicator && label) {
+            // Update core service status indicators
+            const serviceMapping = {
+                'WSS Proxy': 'wss', 'Stunnel4': 'stunnel4', 'UDPGW': 'udpgw', 'Web Panel': 'wss_panel'
+            };
+            
+            services.forEach(service => {
+                const id = serviceMapping[service.name];
+                if (!id) return;
+                
+                const indicator = document.getElementById(\`\${id}-status-indicator\`);
+                const label = document.getElementById(\`\${id}-status-label\`);
+                
+                if (indicator && label) {
                     // Update dot color based on service.color (bg-*)
-                    indicator.className = \`status-dot \${service.color}\`;
-                    label.textContent = service.label;
-                }
-            });
-        }
-        
-        function renderServiceAndPortStatus(services, ports) {
-            const tableBody = document.getElementById('service-port-tbody');
-            tableBody.innerHTML = '';
-            
-            const servicePortData = [
-                { id: 'wss_http', name: 'WSS Proxy (HTTP)', port: '{{ wss_http_port }}', protocol: 'TCP', service: 'wss' },
-                { id: 'wss_tls', name: 'WSS Proxy (TLS)', port: '{{ wss_tls_port }}', protocol: 'TCP', service: 'wss' },
-                { id: 'stunnel4', name: 'Stunnel4 (TLS)', port: '{{ stunnel_port }}', protocol: 'TCP', service: 'stunnel4' },
-                { id: 'udpgw', name: 'UDPGW (UDP)', port: '{{ udpgw_port }}', protocol: 'UDP', service: 'udpgw' },
-                { id: 'wss_panel', name: 'Web Panel (Flask)', port: '{{ panel_port }}', protocol: 'TCP', service: 'wss_panel' },
-                { id: 'ssh_internal', name: 'SSH (Internal Forward)', port: '{{ internal_forward_port }}', protocol: 'TCP', service: null },
-            ];
+                    indicator.className = \`status-dot \${service.color}\`;
+                    label.textContent = service.label;
+                }
+            });
+        }
+        
+        function renderServiceAndPortStatus(services, ports) {
+            const tableBody = document.getElementById('service-port-tbody');
+            tableBody.innerHTML = '';
+            
+            const servicePortData = [
+                { id: 'wss_http', name: 'WSS Proxy (HTTP)', port: '{{ wss_http_port }}', protocol: 'TCP', service: 'wss' },
+                { id: 'wss_tls', name: 'WSS Proxy (TLS)', port: '{{ wss_tls_port }}', protocol: 'TCP', service: 'wss' },
+                { id: 'stunnel4', name: 'Stunnel4 (TLS)', port: '{{ stunnel_port }}', protocol: 'TCP', service: 'stunnel4' },
+                { id: 'udpgw', name: 'UDPGW (UDP)', port: '{{ udpgw_port }}', protocol: 'UDP', service: 'udpgw' },
+                { id: 'wss_panel', name: 'Web Panel (Flask)', port: '{{ panel_port }}', protocol: 'TCP', service: 'wss_panel' },
+                { id: 'ssh_internal', name: 'SSH (Internal Forward)', port: '{{ internal_forward_port }}', protocol: 'TCP', service: null },
+            ];
 
-            servicePortData.forEach(item => {
-                const portInfo = ports.find(p => p.port == item.port);
-                const status = portInfo ? portInfo.status : 'N/A';
-                const color = portInfo ? portInfo.color : 'text-gray-500'; // Tailwind text color class
-                
-                const row = document.createElement('tr');
-                row.className = 'hover:bg-gray-50';
-                row.innerHTML = \`
-                    <td class="px-3 py-1 text-sm text-gray-900">\${item.name}</td>
-                    <td class="px-3 py-1 text-sm text-gray-500">\${item.port} (\${item.protocol})</td>
-                    <td class="px-3 py-1 text-sm font-bold \${color}">\${status}</td>
-                    <td class="px-3 py-1 text-sm font-medium">
-                        \${item.service ? \`<button class="bg-blue-500 hover:bg-blue-600 text-white py-1 px-3 rounded-lg text-xs transition" onclick="openRestartModal('\${item.service}', '\${item.name}')">重启</button>\` : 'N/A'}
-                    </td>
-                \`;
-                tableBody.appendChild(row);
-            });
-        }
+            servicePortData.forEach(item => {
+                const portInfo = ports.find(p => p.port == item.port);
+                const status = portInfo ? portInfo.status : 'N/A';
+                const color = portInfo ? portInfo.color : 'text-gray-500'; // Tailwind text color class
+                
+                const row = document.createElement('tr');
+                row.className = 'hover:bg-gray-50';
+                row.innerHTML = \`
+                    <td class="px-3 py-1 text-sm text-gray-900">\${item.name}</td>
+                    <td class="px-3 py-1 text-sm text-gray-500">\${item.port} (\${item.protocol})</td>
+                    <td class="px-3 py-1 text-sm font-bold \${color}">\${status}</td>
+                    <td class="px-3 py-1 text-sm font-medium">
+                        \${item.service ? \`<button class="bg-blue-500 hover:bg-blue-600 text-white py-1 px-3 rounded-lg text-xs transition duration-150 shadow-sm" onclick="openRestartModal('\${item.service}', '\${item.name}')">重启</button>\` : 'N/A'}
+                    </td>
+                \`;
+                tableBody.appendChild(row);
+            });
+        }
 
-        async function fetchLogs() {
-            try {
-                const response = await fetch('/api/logs');
-                const data = await response.json();
-                
-                if (response.ok) {
-                    const logContent = document.getElementById('log-pre-content');
-                    logContent.textContent = data.logs.trim();
-                    // Scroll to bottom to view newest logs first (due to flex-direction: column-reverse in CSS)
-                    logContent.scrollTop = 0; 
-                } else {
-                    console.error('获取日志失败:', data.message || '未知错误');
-                }
-            } catch (error) {
-                console.error("Log fetch error:", error);
-            }
-        }
+        async function fetchLogs() {
+            try {
+                const response = await fetch('/api/logs');
+                const data = await response.json();
+                
+                if (response.ok) {
+                    const logContent = document.getElementById('log-pre-content');
+                    logContent.textContent = data.logs.trim();
+                    // Since journalctl -r returns newest first, and CSS uses standard column layout,
+                    // we scroll to top to see the newest logs (which appear at the beginning of the text area).
+                    logContent.parentElement.scrollTop = 0; 
+                } else {
+                    console.error('获取日志失败:', data.message || '未知错误');
+                }
+            } catch (error) {
+                console.error("Log fetch error:", error);
+            }
+        }
 
-        // --- User Actions ---
+        // --- User Actions (Kept the same) ---
 
-        document.getElementById('add-user-form').addEventListener('submit', async function(e) {
-            e.preventDefault();
-            const username = document.getElementById('new-username').value.trim();
-            const password = document.getElementById('new-password').value;
-            const expirationDays = document.getElementById('expiration-days').value;
-            const quotaGb = document.getElementById('quota-gb').value;
-            const rateKbps = document.getElementById('rate-kbps').value;
+        document.getElementById('add-user-form').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            const username = document.getElementById('new-username').value.trim();
+            const password = document.getElementById('new-password').value;
+            const expirationDays = document.getElementById('expiration-days').value;
+            const quotaGb = document.getElementById('quota-gb').value;
+            const rateKbps = document.getElementById('rate-kbps').value;
 
-            if (!username || !password) {
-                showStatus('用户名和密码不能为空。', false);
-                return;
-            }
+            if (!username || !password) {
+                showStatus('用户名和密码不能为空。', false);
+                return;
+            }
 
-            try {
-                const response = await fetch('/api/users/add', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ 
-                        username, 
-                        password,
-                        expiration_days: expirationDays, // New Field
-                        quota_gb: quotaGb, // New Field
-                        rate_kbps: rateKbps // New Field
-                    })
-                });
+            try {
+                const response = await fetch('/api/users/add', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ 
+                        username, 
+                        password,
+                        expiration_days: expirationDays, // New Field
+                        quota_gb: quotaGb, // New Field
+                        rate_kbps: rateKbps // New Field
+                    })
+                });
 
-                const result = await response.json();
-                
-                if (response.ok && result.success) {
-                    showStatus(result.message, true);
-                    location.reload(); 
-                } else {
-                    showStatus('创建失败: ' + result.message, false);
-                }
-            } catch (error) {
-                showStatus('请求失败，请检查面板运行状态。', false);
-            }
-        });
+                const result = await response.json();
+                
+                if (response.ok && result.success) {
+                    showStatus(result.message, true);
+                    location.reload(); 
+                } else {
+                    showStatus('创建失败: ' + result.message, false);
+                }
+            } catch (error) {
+                showStatus('请求失败，请检查面板运行状态。', false);
+            }
+        });
 
-        // --- Delete Modal Logic ---
-        function openDeleteModal(username) {
-            document.getElementById('delete-username-placeholder').textContent = username;
-            const confirmBtn = document.getElementById('confirm-delete-btn');
-            confirmBtn.onclick = () => deleteUser(username);
-            openModal('deleteModal');
-        }
+        // --- Delete Modal Logic ---
+        function openDeleteModal(username) {
+            document.getElementById('delete-username-placeholder').textContent = username;
+            const confirmBtn = document.getElementById('confirm-delete-btn');
+            confirmBtn.onclick = () => deleteUser(username);
+            openModal('deleteModal');
+        }
 
-        async function deleteUser(username) {
-            closeModal('deleteModal');
-            showStatus(\`正在删除用户 \${username}...\`, true);
-            
-            try {
-                const response = await fetch('/api/users/delete', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username })
-                });
+        async function deleteUser(username) {
+            closeModal('deleteModal');
+            showStatus(\`正在删除用户 \${username}...\`, true);
+            
+            try {
+                const response = await fetch('/api/users/delete', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username })
+                });
 
-                const result = await response.json();
+                const result = await response.json();
 
-                if (response.ok && result.success) {
-                    showStatus(result.message, true);
-                    location.reload();
-                } else {
-                    showStatus('删除失败: ' + result.message, false);
-                }
-            } catch (error) {
-                showStatus('请求失败，请检查面板运行状态。', false);
-            }
-        }
+                if (response.ok && result.success) {
+                    showStatus(result.message, true);
+                    location.reload();
+                } else {
+                    showStatus('删除失败: ' + result.message, false);
+                }
+            } catch (error) {
+                showStatus('请求失败，请检查面板运行状态。', false);
+            }
+        }
 
-        // --- Quota/Rate Limit Modal Logic ---
-        function openQuotaModal(username, quota, rate) {
-            document.getElementById('quota-username-placeholder').textContent = username;
-            document.getElementById('modal-quota-gb').value = quota;
-            document.getElementById('modal-rate-kbps').value = rate;
-            openModal('quotaModal');
-            
-            const form = document.getElementById('set-quota-form');
-            // Remove old listener before adding new one
-            form.onsubmit = (e) => setQuotaAndRate(e, username); 
-        }
+        // --- Quota/Rate Limit Modal Logic ---
+        function openQuotaModal(username, quota, rate) {
+            document.getElementById('quota-username-placeholder').textContent = username;
+            document.getElementById('modal-quota-gb').value = quota;
+            document.getElementById('modal-rate-kbps').value = rate;
+            openModal('quotaModal');
+            
+            const form = document.getElementById('set-quota-form');
+            // Remove old listener before adding new one
+            form.onsubmit = (e) => setQuotaAndRate(e, username); 
+        }
 
-        async function setQuotaAndRate(e, username) {
-            e.preventDefault();
-            closeModal('quotaModal');
-            
-            const quotaGb = document.getElementById('modal-quota-gb').value;
-            const rateKbps = document.getElementById('modal-rate-kbps').value;
+        async function setQuotaAndRate(e, username) {
+            e.preventDefault();
+            closeModal('quotaModal');
+            
+            const quotaGb = document.getElementById('modal-quota-gb').value;
+            const rateKbps = document.getElementById('modal-rate-kbps').value;
 
-            showStatus(\`正在为 \${username} 设置配额和带宽...\`, true);
-            
-            try {
-                const response = await fetch('/api/users/set_rate_limit', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ 
-                        username, 
-                        quota_gb: quotaGb, 
-                        rate_kbps: rateKbps 
-                    })
-                });
+            showStatus(\`正在为 \${username} 设置配额和带宽...\`, true);
+            
+            try {
+                const response = await fetch('/api/users/set_rate_limit', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ 
+                        username, 
+                        quota_gb: quotaGb, 
+                        rate_kbps: rateKbps 
+                    })
+                });
 
-                const result = await response.json();
+                const result = await response.json();
 
-                if (response.ok && result.success) {
-                    showStatus(result.message, true);
-                    location.reload();
-                } else {
-                    showStatus('设置失败: ' + result.message, false);
-                }
-            } catch (error) {
-                showStatus('请求失败，请检查面板运行状态。', false);
-            }
-        }
+                if (response.ok && result.success) {
+                    showStatus(result.message, true);
+                    location.reload();
+                } else {
+                    showStatus('设置失败: ' + result.message, false);
+                }
+            } catch (error) {
+                showStatus('请求失败，请检查面板运行状态。', false);
+            }
+        }
 
-        // --- Reset Usage Modal Logic ---
-        function openResetModal(username) {
-            document.getElementById('reset-username-placeholder').textContent = username;
-            const confirmBtn = document.getElementById('confirm-reset-btn');
-            confirmBtn.onclick = () => resetUsage(username);
-            openModal('resetModal');
-        }
+        // --- Reset Usage Modal Logic ---
+        function openResetModal(username) {
+            document.getElementById('reset-username-placeholder').textContent = username;
+            const confirmBtn = document.getElementById('confirm-reset-btn');
+            confirmBtn.onclick = () => resetUsage(username);
+            openModal('resetModal');
+        }
 
-        async function resetUsage(username) {
-            closeModal('resetModal');
-            showStatus(\`正在重置 \${username} 的用量...\`, true);
-            
-            try {
-                const response = await fetch('/api/users/reset_usage', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ username })
-                });
+        async function resetUsage(username) {
+            closeModal('resetModal');
+            showStatus(\`正在重置 \${username} 的用量...\`, true);
+            
+            try {
+                const response = await fetch('/api/users/reset_usage', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ username })
+                });
 
-                const result = await response.json();
+                const result = await response.json();
 
-                if (response.ok && result.success) {
-                    showStatus(result.message, true);
-                    location.reload();
-                } else {
-                    showStatus('重置失败: ' + result.message, false);
-                }
-            } catch (error) {
-                showStatus('请求失败，请检查面板运行状态。', false);
-            }
-        }
+                if (response.ok && result.success) {
+                    showStatus(result.message, true);
+                    location.reload();
+                } else {
+                    showStatus('重置失败: ' + result.message, false);
+                }
+            } catch (error) {
+                showStatus('请求失败，请检查面板运行状态。', false);
+            }
+        }
 
-        // --- Restart Modal Logic ---
-        function openRestartModal(serviceId, serviceName) {
-            document.getElementById('restart-service-placeholder').textContent = serviceName;
-            const confirmBtn = document.getElementById('confirm-restart-btn');
-            confirmBtn.onclick = () => restartService(serviceId);
-            openModal('restartModal');
-        }
+        // --- Restart Modal Logic ---
+        function openRestartModal(serviceId, serviceName) {
+            document.getElementById('restart-service-placeholder').textContent = serviceName;
+            const confirmBtn = document.getElementById('confirm-restart-btn');
+            confirmBtn.onclick = () => restartService(serviceId);
+            openModal('restartModal');
+        }
 
-        async function restartService(serviceId) {
-            closeModal('restartModal');
-            showStatus(\`正在重启 \${serviceId}...\`, true);
-            
-            try {
-                const response = await fetch('/api/restart', {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ service: serviceId })
-                });
+        async function restartService(serviceId) {
+            closeModal('restartModal');
+            showStatus(\`正在重启 \${serviceId}...\`, true);
+            
+            try {
+                const response = await fetch('/api/restart', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ service: serviceId })
+                });
 
-                const result = await response.json();
-                
-                if (response.ok && result.success) {
-                    showStatus(result.message, true);
-                    setTimeout(refreshMonitorData, 3000); 
-                } else {
-                    showStatus('重启失败: ' + (result.message || '未知错误'), false);
-                    setTimeout(refreshMonitorData, 3000);
-                }
-            } catch (error) {
-                showStatus('请求重启 API 失败，请检查面板运行状态。', false);
-            }
-        }
-        
-        function logout() {
-            window.location.href = '/logout';
-        }
-        
-        // --- Polling Setup ---
-        // Refresh status every 5 seconds (CPU/Memory/Service Status)
-        setInterval(refreshMonitorData, 5000);
-        // Refresh logs every 10 seconds
-        setInterval(fetchLogs, 10000);
-        
-        // Initial load
-        window.onload = () => {
-            refreshMonitorData();
-            fetchLogs();
-        };
-        
-    </script>
+                const result = await response.json();
+                
+                if (response.ok && result.success) {
+                    showStatus(result.message, true);
+                    setTimeout(refreshMonitorData, 3000); 
+                } else {
+                    showStatus('重启失败: ' + (result.message || '未知错误'), false);
+                    setTimeout(refreshMonitorData, 3000);
+                }
+            } catch (error) {
+                showStatus('请求重启 API 失败，请检查面板运行状态。', false);
+            }
+        }
+        
+        function logout() {
+            window.location.href = '/logout';
+        }
+        
+        // --- Polling Setup ---
+        // Refresh status every 5 seconds (CPU/Memory/Service Status)
+        setInterval(refreshMonitorData, 5000);
+        // Refresh logs every 10 seconds
+        setInterval(fetchLogs, 10000);
+        
+        // Initial load
+        window.onload = () => {
+            refreshMonitorData();
+            fetchLogs();
+        };
+        
+    </script>
 </body>
 </html>
 """
@@ -1710,7 +1769,7 @@ echo "SSHD 配置已备份到 ${SSHD_CONFIG}${BACKUP_SUFFIX}"
 # 删除旧的 WSS 配置段
 sed -i '/# WSS_TUNNEL_BLOCK_START/,/# WSS_TUNNEL_BLOCK_END/d' "$SSHD_CONFIG"
 
-# 写入新的 WSS 隧道策略
+# 写入新的 WSS 隧道策略 (使用标准空格)
 cat >> "$SSHD_CONFIG" <<EOF
 
 # WSS_TUNNEL_BLOCK_START -- managed by deploy_wss_panel.sh
