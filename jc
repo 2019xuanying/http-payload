@@ -1,0 +1,398 @@
+#!/usr/bin/env bash
+
+# 设置：遇到错误或使用未定义变量时退出
+set -eu
+
+# ==========================================================
+# WSS 隧道基础设施一键部署脚本 (纯核心功能版)
+# =============================
+# 提示端口配置
+# =============================
+echo "----------------------------------"
+echo "==== WSS 基础设施端口配置 ===="
+
+read -p "请输入 WSS HTTP 监听端口 (默认80): " WSS_HTTP_PORT
+WSS_HTTP_PORT=${WSS_HTTP_PORT:-80}
+
+read -p "请输入 WSS TLS 监听端口 (默认443): " WSS_TLS_PORT
+WSS_TLS_PORT=${WSS_TLS_PORT:-443}
+
+read -p "请输入 Stunnel4 端口 (默认444): " STUNNEL_PORT
+STUNNEL_PORT=${STUNNEL_PORT:-444}
+
+read -p "请输入 UDPGW 端口 (默认7300): " UDPGW_PORT
+UDPGW_PORT=${UDPGW_PORT:-7300}
+
+# === 内部转发端口提示 ===
+read -p "请输入 WSS/Stunnel 内部 SSH 转发端口 (默认48303, 此为 WSS/Stunnel 连接到 SSH 的端口): " INTERNAL_FORWARD_PORT
+INTERNAL_FORWARD_PORT=${INTERNAL_FORWARD_PORT:-48303}
+# ==============================
+
+echo "----------------------------------"
+echo "==== 系统更新与依赖安装 ===="
+# 仅保留核心组件依赖：python3, wget, curl, git, net-tools, cmake, build-essential, openssl, stunnel4, iproute2, iptables
+# 移除 flask, jinja2, uvloop 等面板依赖
+apt update -y
+apt install -y python3 python3-pip wget curl git net-tools cmake build-essential openssl stunnel4 iproute2 iptables
+echo "核心依赖安装完成"
+echo "----------------------------------"
+
+
+# =============================
+# WSS 核心代理脚本
+# =============================
+echo "==== 安装 WSS 核心代理脚本 (/usr/local/bin/wss) ===="
+# 使用 <<'EOF' 避免 Bash 预解析 $INTERNAL_FORWARD_PORT
+tee /usr/local/bin/wss > /dev/null <<EOF
+#!/usr/bin/python3
+# -*- coding: utf-8 -*-
+
+import asyncio, ssl, sys
+import os # 导入 os 检查 uvloop
+try:
+    import uvloop # 导入 uvloop, 用于高性能 event loop (如果已安装)
+    UVLOOP_AVAILABLE = True
+except ImportError:
+    UVLOOP_AVAILABLE = False
+    print("Warning: uvloop not found. Using default asyncio loop.")
+
+
+LISTEN_ADDR = '0.0.0.0'
+
+try:
+    HTTP_PORT = int(sys.argv[1])
+except (IndexError, ValueError):
+    HTTP_PORT = 80
+try:
+    TLS_PORT = int(sys.argv[2])
+except (IndexError, ValueError):
+    TLS_PORT = 443
+
+# 使用用户指定的内部转发端口
+DEFAULT_TARGET = ('127.0.0.1', $INTERNAL_FORWARD_PORT)
+BUFFER_SIZE = 65536
+TIMEOUT = 3600
+CERT_FILE = '/etc/stunnel/certs/stunnel.pem'
+KEY_FILE = '/etc/stunnel/certs/stunnel.key'
+
+FIRST_RESPONSE = b'HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 2\r\n\r\nOK\r\n\r\n'
+SWITCH_RESPONSE = b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n'
+FORBIDDEN_RESPONSE = b'HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n'
+
+async def handle_client(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, tls=False):
+    peer = writer.get_extra_info('peername')
+    print(f"Connection from {peer} {'(TLS)' if tls else ''}")
+    forwarding_started = False
+    full_request = b''
+
+    try:
+        # --- 1. 握手循环 ---
+        while not forwarding_started:
+            # 增加超时处理，避免长连接挂起
+            data = await asyncio.wait_for(reader.read(BUFFER_SIZE), timeout=TIMEOUT)
+            if not data:
+                break
+            
+            full_request += data
+            
+            header_end_index = full_request.find(b'\r\n\r\n')
+            
+            if header_end_index == -1:
+                # 头部不完整，发送 200 OK 并等待下一段 (Payload 兼容性)
+                writer.write(FIRST_RESPONSE)
+                await writer.drain()
+                full_request = b''
+                continue
+
+            # 2. 头部解析
+            headers_raw = full_request[:header_end_index]
+            data_to_forward = full_request[header_end_index + 4:]
+            headers = headers_raw.decode(errors='ignore')
+
+            # 检查是否是 WebSocket 升级请求或自定义 Payload 标记
+            is_websocket_request = 'Upgrade: websocket' in headers or 'Connection: Upgrade' in headers or 'GET-RAY' in headers
+            
+            # 3. 转发触发
+            if is_websocket_request:
+                # 发送 101 切换协议响应
+                writer.write(SWITCH_RESPONSE)
+                await writer.drain()
+                forwarding_started = True
+            else:
+                # 非 WebSocket 请求，发送 200 OK 并继续等待
+                writer.write(FIRST_RESPONSE)
+                await writer.drain()
+                full_request = b''
+                continue
+        
+        # --- 退出握手循环 ---
+
+        # 4. 连接目标服务器 (默认到 Stunnel/SSH 的转发端口)
+        target = DEFAULT_TARGET
+        target_reader, target_writer = await asyncio.open_connection(*target)
+
+        # 5. 转发初始数据 (SSH 握手包)
+        if data_to_forward:
+            target_writer.write(data_to_forward)
+            await target_writer.drain()
+            
+        # 6. 转发后续数据流
+        async def pipe(src_reader, dst_writer):
+            try:
+                while True:
+                    buf = await src_reader.read(BUFFER_SIZE)
+                    if not buf:
+                        break
+                    dst_writer.write(buf)
+                    await dst_writer.drain()
+            except Exception:
+                pass
+            finally:
+                dst_writer.close()
+
+        await asyncio.gather(
+            pipe(reader, target_writer),
+            pipe(target_reader, writer)
+        )
+
+    except Exception as e:
+        print(f"Connection error {peer}: {e}")
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:
+            pass
+        print(f"Closed {peer}")
+
+async def main():
+    # TLS server setup
+    ssl_ctx = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
+    try:
+        ssl_ctx.load_cert_chain(certfile=CERT_FILE, keyfile=KEY_FILE)
+        tls_server = await asyncio.start_server(
+            lambda r, w: handle_client(r, w, tls=True), LISTEN_ADDR, TLS_PORT, ssl=ssl_ctx)
+        print(f"Listening on {LISTEN_ADDR}:{TLS_PORT} (TLS)")
+        tls_task = tls_server.serve_forever()
+    except FileNotFoundError:
+        print(f"WARNING: TLS certificate not found at {CERT_FILE}. TLS server disabled.")
+        tls_task = asyncio.sleep(86400) # Keep task running but effectively disabled
+        
+    http_server = await asyncio.start_server(
+        lambda r, w: handle_client(r, w, tls=False), LISTEN_ADDR, HTTP_PORT)
+    
+    print(f"Listening on {LISTEN_ADDR}:{HTTP_PORT} (HTTP payload)")
+
+    async with http_server:
+        await asyncio.gather(
+            tls_task,
+            http_server.serve_forever())
+
+if __name__ == '__main__':
+    try:
+        if UVLOOP_AVAILABLE:
+            uvloop.install() 
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("WSS Proxy Stopped.")
+        
+EOF
+
+chmod +x /usr/local/bin/wss
+
+# 创建 WSS systemd 服务
+tee /etc/systemd/system/wss.service > /dev/null <<EOF
+[Unit]
+Description=WSS Python Proxy
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/wss $WSS_HTTP_PORT $WSS_TLS_PORT
+Restart=on-failure
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable wss
+systemctl start wss
+echo "WSS 已启动，HTTP端口 $WSS_HTTP_PORT, TLS端口 $WSS_TLS_PORT"
+echo "----------------------------------"
+
+
+# =============================
+# 安装 Stunnel4 并生成证书
+# =============================
+echo "==== 安装 Stunnel4 ===="
+mkdir -p /etc/stunnel/certs
+openssl req -x509 -nodes -newkey rsa:2048 \
+-keyout /etc/stunnel/certs/stunnel.key \
+-out /etc/stunnel/certs/stunnel.crt \
+-days 1095 \
+-subj "/CN=example.com" > /dev/null 2>&1
+sh -c 'cat /etc/stunnel/certs/stunnel.key /etc/stunnel/certs/stunnel.crt > /etc/stunnel/certs/stunnel.pem'
+chmod 644 /etc/stunnel/certs/*.crt
+chmod 644 /etc/stunnel/certs/*.pem
+
+tee /etc/stunnel/ssh-tls.conf > /dev/null <<EOF
+pid=/var/run/stunnel.pid
+setuid=root
+setgid=root
+client = no
+debug = 5
+output = /var/log/stunnel4/stunnel.log
+socket = l:TCP_NODELAY=1
+socket = r:TCP_NODELAY=1
+
+[ssh-tls-gateway]
+accept = 0.0.0.0:$STUNNEL_PORT
+cert = /etc/stunnel/certs/stunnel.pem
+key = /etc/stunnel/certs/stunnel.pem
+connect = 127.0.0.1:$INTERNAL_FORWARD_PORT
+EOF
+
+systemctl enable stunnel4
+systemctl start stunnel4 # 启动服务以便后续检查
+echo "Stunnel4 安装完成，端口 $STUNNEL_PORT"
+echo "----------------------------------"
+
+
+# =============================
+# 安装 UDPGW
+# =============================
+echo "==== 安装 UDPGW ===="
+if [ ! -d "/root/badvpn" ]; then
+    git clone https://github.com/ambrop72/badvpn.git /root/badvpn
+fi
+mkdir -p /root/badvpn/badvpn-build
+cd /root/badvpn/badvpn-build
+cmake .. -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 > /dev/null 2>&1
+make -j$(nproc) > /dev/null 2>&1
+cd - > /dev/null
+
+tee /etc/systemd/system/udpgw.service > /dev/null <<EOF
+[Unit]
+Description=UDP Gateway (Badvpn)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/root/badvpn/badvpn-build/udpgw/badvpn-udpgw --listen-addr 127.0.0.1:$UDPGW_PORT --max-clients 1024 --max-connections-for-client 10
+Restart=on-failure
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable udpgw
+systemctl start udpgw # 启动服务以便后续检查
+echo "UDPGW 已安装并启动，端口: $UDPGW_PORT"
+echo "----------------------------------"
+
+# =============================
+# Traffic Control 基础配置 (简化)
+# =============================
+# 保持基础 HTB 结构，不包含任何用户限制逻辑（该逻辑已随面板代码移除）
+echo "==== 配置 Traffic Control (tc) 基础环境 ===="
+IP_DEV=$(ip route | grep default | sed -n 's/.*dev \([^ ]*\).*/\1/p' | head -1)
+
+if [ -z "$IP_DEV" ]; then
+    echo "警告: 无法找到主网络接口，tc 基础配置跳过。"
+else
+    # 销毁所有现有的 qdisc
+    tc qdisc del dev "$IP_DEV" root || true
+    # 创建 HTB 根 qdisc
+    tc qdisc add dev "$IP_DEV" root handle 1: htb default 10
+    # 默认类别 (无限制)
+    tc class add dev "$IP_DEV" parent 1: classid 1:10 htb rate 1000mbit ceil 1000mbit
+    echo "Traffic Control (tc) 已在 $IP_DEV 上初始化 (无用户限制规则)。"
+fi
+echo "----------------------------------"
+
+
+# =============================
+# 移除所有面板相关代码和配置
+# =============================
+# 面板代码 (wss_panel.py) 已移除，无需在此处操作。
+# 面板 systemd 服务 (wss_panel.service) 已移除，无需在此处操作。
+echo "==== 移除 Web 管理面板残留配置 ===="
+rm -f /usr/local/bin/wss_panel.py || true
+rm -f /etc/systemd/system/wss_panel.service || true
+systemctl daemon-reload || true
+echo "Web 管理面板配置已清理。"
+echo "----------------------------------"
+
+
+# =============================
+# SSHD 安全配置 (统一策略)
+# =============================
+SSHD_CONFIG="/etc/ssh/sshd_config"
+BACKUP_SUFFIX=".bak.wss$(date +%s)"
+SSHD_SERVICE=$(systemctl list-units --full -all | grep -q "sshd.service" && echo "sshd" || echo "ssh")
+
+echo "==== 配置 SSHD 安全策略 (允许本机密码认证) ===="
+# 备份 sshd_config
+cp -a "$SSHD_CONFIG" "${SSHD_CONFIG}${BACKUP_SUFFIX}"
+echo "SSHD 配置已备份到 ${SSHD_CONFIG}${BACKUP_SUFFIX}"
+
+# 删除旧的 WSS 配置段
+sed -i '/# WSS_TUNNEL_BLOCK_START/,/# WSS_TUNNEL_BLOCK_END/d' "$SSHD_CONFIG"
+
+# 写入新的 WSS 隧道策略
+cat >> "$SSHD_CONFIG" <<EOF
+
+# WSS_TUNNEL_BLOCK_START -- managed by deploy_wss_only.sh
+# 统一策略: 允许所有用户通过本机 (127.0.0.1, ::1) 使用密码进行认证。
+Match Address 127.0.0.1,::1
+    # 允许密码认证，用于 WSS/Stunnel 隧道连接
+    PasswordAuthentication yes
+    # 允许 TTY 和转发
+    PermitTTY yes
+    AllowTcpForwarding yes
+# WSS_TUNNEL_BLOCK_END -- managed by deploy_wss_only.sh
+
+EOF
+
+chmod 600 "$SSHD_CONFIG"
+
+# 重载 sshd
+echo "重新加载并重启 ssh 服务 ($SSHD_SERVICE)"
+systemctl daemon-reload
+systemctl restart "$SSHD_SERVICE"
+echo "SSHD 配置更新完成。"
+echo "----------------------------------"
+
+
+# =============================
+# 最终重启所有关键服务
+# =============================
+echo "==== 最终重启所有关键服务，确保配置生效 ===="
+# 移除 wss_panel
+systemctl restart wss stunnel4 udpgw
+echo "所有核心服务重启完成：WSS, Stunnel4, UDPGW。"
+echo "----------------------------------"
+
+
+echo "=================================================="
+echo "✅ 部署完成！"
+
+echo "=================================================="
+echo ""
+echo "🔥 WSS & Stunnel 基础设施已启动。"
+echo "--- 端口信息 ---"
+echo "WSS (HTTP/WebSocket): $WSS_HTTP_PORT"
+echo "WSS (TLS/WebSocket): $WSS_TLS_PORT"
+echo "Stunnel (TLS 隧道): $STUNNEL_PORT"
+echo "UDPGW (内部 UDP 转发): $UDPGW_PORT"
+echo "内部 SSH 转发端口: $INTERNAL_FORWARD_PORT (WSS/Stunnel 代理连接到 SSH 的端口)"
+echo ""
+echo "--- 故障排查 ---"
+echo "WSS 代理状态: sudo systemctl status wss"
+echo "Stunnel 状态: sudo systemctl status stunnel4"
+echo "UDPGW 状态: sudo systemctl status udpgw"
+echo "=================================================="
